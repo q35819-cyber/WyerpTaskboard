@@ -1,0 +1,27 @@
+{
+  "name": "wyerp-taskboard",
+  "version": "0.6.63",
+  "private": true,
+  "type": "module",
+  "description": "Independent local project governance taskboard for AI development/test workflows.",
+  "scripts": {
+    "test": "node scripts/run-tests.mjs",
+    "test:r1r2": "node --test tests/project-registry.test.mjs tests/markdown-adapter.test.mjs tests/task-store.test.mjs tests/recovery.test.mjs",
+    "test:http": "node --test tests/http-server.test.mjs",
+    "test:service": "node --test tests/service-control.test.mjs",
+    "test:integration": "node --test tests/erp-x20-integration.test.mjs",
+    "check": "node --check server/project-registry.mjs && node --check server/adapters/markdown-task-registry-v1.mjs && node --check server/task-store.mjs && node --check server/erp-pass-gate.mjs && node --check server/requirement-store.mjs && node --check server/http-server.mjs && node --check server/service-control.mjs && node --check server/backup-store.mjs && node --check server/scan-store.mjs && node --check server/candidate-evaluator.mjs && node --check server/wake-bridge.mjs && node --check server/chat-browser-wake.mjs && node --check server/automation-control.mjs && node --check server/ai-execution-settings.mjs && node --check server/task-scanner.mjs && node --check server/windows-mcp-client.mjs && node --check server/manual-windows-mcp-client.mjs && node --check server/chatgpt-mcp-executor.mjs && node --check server/chatgpt-health-monitor.mjs && node --check server/system-event-log.mjs && node --check server/runtime-status.mjs && node --check web/plan-index.mjs && node --check web/board-state.mjs && node --check web/app.js && node --check cli/taskctl.mjs && node --check cli/task-scan.mjs && node --check cli/windows-mcp.mjs && node --check cli/manual-windows-mcp.mjs && node --check cli/chatgpt-health.mjs && node --check cli/runtime-status.mjs && node --check cli/maintenance.mjs && node --check browser-extension/chat-wake/content.js && node --check browser-extension/chat-wake/background.js && node --check browser-extension/chat-wake/global-overlay.js && node --check browser-extension/chat-wake/session-policy.mjs",
+    "service": "node cli/service.mjs",
+    "taskctl": "node cli/taskctl.mjs",
+    "maintenance": "node cli/maintenance.mjs",
+    "task-scan": "node cli/task-scan.mjs",
+    "windows-mcp": "node cli/windows-mcp.mjs",
+    "manual-windows-mcp": "node cli/manual-windows-mcp.mjs",
+    "chatgpt-health": "node cli/chatgpt-health.mjs",
+    "runtime-status": "node cli/runtime-status.mjs",
+    "test:external:erp-x20": "node --test tests/erp-x20-integration.test.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

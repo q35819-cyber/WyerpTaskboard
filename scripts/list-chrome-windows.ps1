@@ -1,0 +1,1 @@
+Get-Process chrome | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object Id,MainWindowTitle,MainWindowHandle | ConvertTo-Json -Depth 3

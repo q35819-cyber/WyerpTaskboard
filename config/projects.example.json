@@ -1,0 +1,21 @@
+{
+    "version":  1,
+    "projects":  [
+                     {
+                         "id":  "wyerp-taskboard",
+                         "name":  "WyerpTaskboard",
+                         "root":  "C:\\WyerpTaskboard",
+                         "adapter":  "markdown-task-registry-v1",
+                         "registryFormatVersion":  1,
+                         "workflowProfile":  "wyerp-ai-flow-v1",
+                         "taskRegistry":  "待办任务总清单.md",
+                         "resourceLedger":  "任务执行与资源占用台账.md",
+                         "checkpointDir":  "任务进度断点",
+                         "reportDir":  "测试报告",
+                         "defaultTrack":  "infrastructure",
+                         "trackOverrides":  {
+
+                                            }
+                     }
+                 ]
+}

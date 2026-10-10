@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>WyerpTaskboard 任务看板</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="toast" class="toast" hidden></div>
+  <main id="loginView" class="login-shell">
+    <section class="login-card">
+      <div class="eyebrow">WyerpTaskboard <span id="loginVersion" class="version-badge">v—</span></div>
+      <h1>独立任务看板</h1>
+      <p>本机项目治理服务 · <code>127.0.0.1:47831</code></p>
+      <form id="loginForm">
+        <label for="adminSecret">本机管理员密钥</label>
+        <input id="adminSecret" name="secret" type="password" autocomplete="current-password" required>
+        <button type="submit" class="primary">登录</button>
+      </form>
+      <p class="hint">密钥保存在本机任务看板配置中，不依赖任何外部项目账号或技术会话。</p>
+    </section>
+  </main>
+  <main id="appView" hidden>
+    <header class="topbar">
+      <div><div class="eyebrow">独立项目治理 <span id="appVersion" class="version-badge">v—</span></div><h1>任务看板</h1></div>
+      <div class="top-actions">
+        <select id="projectSelect" aria-label="项目"></select>
+        <button id="addRequirementBtn" class="primary">新增需求</button>
+        <button id="addProjectBtn" class="primary">添加项目</button>
+        <button id="removeProjectBtn" class="danger" disabled>移除项目</button>
+        <button id="adaptProjectBtn" class="ghost" hidden>自动适配当前项目</button>
+        <button id="aiSettingsBtn" class="ghost">AI自动执行设置</button>
+        <button id="refreshBtn" class="ghost">刷新</button>
+        <button id="logoutBtn" class="ghost">退出</button>
+      </div>
+    </header>
+    <section id="projectHealth" class="health-line"></section>
+    <section id="projectService" class="project-service-line">
+      <div>
+        <strong>项目服务</strong>
+        <span id="projectServiceStatus">状态检测中</span>
+      </div>
+      <div class="project-service-actions">
+        <button id="projectStartRestartBtn" class="primary">启动 / 重启</button>
+        <button id="projectStopServiceBtn" class="danger">一键关闭</button>
+      </div>
+    </section>
+    <section id="scanStatus" class="scan-status-line"></section>
+    <section id="summary" class="summary-grid"></section>
+    <section class="toolbar">
+      <input id="searchInput" type="search" placeholder="搜索任务ID、标题、职责、计划或会话">
+      <select id="planFilter"><option value="">全部计划</option></select>
+      <select id="trackFilter"><option value="">全部轨道</option></select>
+      <select id="priorityFilter"><option value="">全部优先级</option></select>
+      <select id="statusFilter"><option value="">全部状态</option></select>
+      <select id="archiveFilter"><option value="all" selected>全部任务</option><option value="active">进行中任务</option><option value="closed">已完成 / 已取消</option></select>
+      <div class="view-toggle">
+        <button id="boardViewBtn" class="active">看板</button>
+        <button id="listViewBtn">列表</button>
+      </div>
+    </section>
+    <section id="boardView" class="board"></section>
+    <section id="listView" class="list-wrap" hidden>
+      <table>
+        <thead><tr><th>任务</th><th>所属计划</th><th>轨道</th><th>优先级</th><th>状态</th><th>负责人</th><th>会话窗口</th><th>最近更新</th></tr></thead>
+        <tbody id="taskTableBody"></tbody>
+      </table>
+    </section>
+  </main>
+  <dialog id="aiSettingsDialog" class="project-dialog">
+    <div class="dialog-head">
+      <div><div class="eyebrow">自动执行</div><h2>AI自动执行设置</h2></div>
+      <button id="closeAiSettingsBtn" class="icon-btn" aria-label="关闭">×</button>
+    </div>
+    <form id="aiSettingsForm" class="project-form">
+      <p class="settings-note">模型与推理强度会作为每次自动候选的开工要求。浏览器不会冒充你切换 ChatGPT 模型；如果当前聊天不符合要求，AI应停止 claim 并提示你手动切换。</p>
+      <div class="form-grid">
+        <label>开发AI模型
+          <input id="developerModel" list="aiModelSuggestions" maxlength="80" required>
+        </label>
+        <label>开发AI推理强度
+          <select id="developerReasoning" required>
+            <option value="instant">Instant</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+            <option value="extra_high">Extra High</option>
+          </select>
+        </label>
+        <label>独立测试AI模型
+          <input id="testModel" list="aiModelSuggestions" maxlength="80" required>
+        </label>
+        <label>独立测试AI推理强度
+          <select id="testReasoning" required>
+            <option value="instant">Instant</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+            <option value="extra_high">Extra High</option>
+          </select>
+        </label>
+      </div>
+      <datalist id="aiModelSuggestions">
+        <option value="GPT-5.6 Sol"></option>
+        <option value="GPT-5.6 Luna"></option>
+        <option value="GPT-5.6 Pro"></option>
+      </datalist>
+      <div class="form-grid">
+        <label>自动扫描间隔（分钟）
+          <input id="scanIntervalMinutes" type="number" min="1" max="1440" required>
+        </label>
+        <label>单个聊天最多自动请求次数
+          <input id="maxRequestsPerChat" type="number" min="1" max="100" required>
+        </label>
+        <label>上下文预警阈值
+          <input id="contextWarningAt" type="number" min="1" max="100" required>
+        </label>
+        <label>单会话超时自动重试次数
+          <input id="timeoutRetryLimit" type="number" min="0" max="10" required>
+        </label>
+        <label>异常统计窗口（分钟）
+          <input id="anomalyWindowMinutes" type="number" min="1" max="240" required>
+        </label>
+        <label>窗口内异常熔断阈值
+          <input id="anomalyLimit" type="number" min="1" max="100" required>
+        </label>
+        <label>同角色连续换会话熔断阈值
+          <input id="roleSwitchLimit" type="number" min="1" max="20" required>
+        </label>
+      </div>
+      <div class="dialog-actions">
+        <button id="cancelAiSettingsBtn" type="button" class="ghost">取消</button>
+        <button type="submit" class="primary">保存并应用</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="requirementDialog" class="requirement-dialog">
+    <div class="dialog-head">
+      <div><div class="eyebrow">需求入口</div><h2>新增需求 / 需求沟通</h2></div>
+      <button id="closeRequirementDialogBtn" class="icon-btn" aria-label="关闭">×</button>
+    </div>
+    <form id="requirementForm" class="project-form">
+      <label>新需求
+        <textarea id="requirementText" rows="4" placeholder="请描述要新增或调整的功能、业务规则或页面需求" required></textarea>
+      </label>
+      <p class="hint">提交后先进入“待AI拆解”。AI会优先判断是否属于已有模块计划；有疑问会在需求线程中直接回复你。</p>
+      <div class="dialog-actions">
+        <button type="submit" class="primary">提交需求</button>
+      </div>
+    </form>
+    <section class="requirement-list-wrap">
+      <div class="panel-title-row"><h3>需求队列</h3><button id="reloadRequirementsBtn" class="ghost">刷新需求</button></div>
+      <div id="requirementList" class="requirement-list"></div>
+    </section>
+  </dialog>
+  <dialog id="addProjectDialog" class="project-dialog">
+    <div class="dialog-head">
+      <div><div class="eyebrow">本机项目</div><h2>添加本机项目</h2></div>
+      <button id="closeAddProjectBtn" class="icon-btn" aria-label="关闭">×</button>
+    </div>
+    <form id="addProjectForm" class="project-form">
+      <label>项目根路径
+        <input id="projectRootInput" type="text" placeholder="例如 D:\WyerpTaskboard" required>
+      </label>
+      <div class="form-grid">
+        <label>项目名称（可留空）
+          <input id="projectNameInput" type="text" placeholder="自动使用文件夹名称">
+        </label>
+        <label>项目ID（可留空）
+          <input id="projectIdInput" type="text" placeholder="自动使用英文/数字文件夹名">
+        </label>
+      </div>
+      <label>任务总清单
+        <input id="projectRegistryInput" type="text" value="待办任务总清单.md" required>
+      </label>
+      <p class="hint">这里只登记本机路径，不上传、不复制、不移动项目。首版按适配器ID <code>markdown-task-registry-v1</code> 与协作流程ID <code>wyerp-ai-flow-v1</code> 验证；格式不支持时不会写入配置。</p>
+      <div class="dialog-actions">
+        <button type="button" id="cancelAddProjectBtn" class="ghost">取消</button>
+        <button type="submit" class="primary">验证并添加</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="planDialog" class="plan-dialog">
+    <div class="dialog-head">
+      <div><div class="eyebrow">计划文档</div><h2 id="planDialogTitle">计划文档</h2><div id="planDialogPath" class="document-path"></div></div>
+      <button id="closePlanDialogBtn" class="icon-btn" aria-label="关闭">×</button>
+    </div>
+    <div class="plan-reader"><aside id="planNavigator" class="plan-navigator"><div id="planLocationStatus" class="plan-location-status"></div><nav id="planIndexList" class="plan-index-list" aria-label="计划索引"></nav></aside><div id="planDocumentContent" class="plan-document-content"></div></div>
+  </dialog>
+  <dialog id="taskDialog">
+    <div class="dialog-head">
+      <div><div id="detailTaskId" class="eyebrow"></div><h2 id="detailTitle"></h2></div>
+      <button id="closeDialogBtn" class="icon-btn" aria-label="关闭">×</button>
+    </div>
+
+    <section class="panel readable-panel">
+      <h3>这项任务在做什么</h3>
+      <div class="readable-grid">
+        <div class="readable-item"><span>所属计划</span><div id="taskPlanList" class="task-plan-list"></div></div>
+        <div class="readable-item"><span>本任务负责</span><p id="responsibilityText"></p></div>
+        <div class="readable-item"><span>当前进展</span><p id="currentProgressText"></p></div>
+        <div class="readable-item user-assistance"><span>需要用户配合</span><p id="userAssistanceText"></p></div>
+        <div class="readable-item"><span>关键文件 / 溯源</span><p id="traceabilityText"></p></div>
+        <div class="readable-item"><span>只读依赖</span><p id="readDependenciesText"></p></div>
+        <div class="readable-item"><span>计划写文件</span><p id="writeTargetsText"></p></div>
+        <div class="readable-item"><span>关联文档 / 报告</span><div id="relatedArtifactsText" class="task-document-list"></div></div>
+      </div>
+    </section>
+    <div id="detailMeta" class="detail-grid"></div>
+    <section class="panel">
+      <h3>执行会话</h3>
+      <div id="sessionInfo" class="session-box"></div>
+    </section>
+    <section class="panel">
+      <h3>测试临时资源</h3>
+      <p class="hint">测试失败/阻断后保留给开发查看的临时服务、进程、端口、目录、浏览器或夹具。这里只展示登记状态，不会自动终止资源。</p>
+      <div id="testResourceSummary" class="test-resource-summary"></div>
+      <div id="testResourceList" class="test-resource-list"></div>
+    </section>
+    <section class="panel two-col">
+      <div><h3>调整优先级</h3><div class="inline-form"><select id="prioritySelect"></select><button id="savePriorityBtn">保存</button></div></div>
+      <div>
+        <h3>任务控制</h3>
+        <div class="inline-form">
+          <button id="stopBtn" class="danger">停止 / 暂停</button>
+          <button id="resumeBtn">恢复</button>
+        </div>
+        <div class="inline-form takeover-actions">
+          <button id="suspectDisconnectBtn">标记疑似失联</button>
+          <button id="allowTakeoverBtn" class="danger">允许异常接管</button>
+          <button id="revokeTakeoverBtn" class="ghost">撤销接管授权</button>
+        </div>
+        <p class="hint">疑似失联不会自动允许接管；允许异常接管必须由用户明确确认，且授权绑定当时负责人、技术会话ID与任务表版本。</p>
+      </div>
+    </section>
+    <section class="panel">
+      <h3>我的审阅意见</h3>
+      <div class="inline-form">
+        <strong id="autoCloseAuthorizationStatus">自动完成授权状态读取中</strong>
+        <button id="authorizeAutoCloseBtn" type="button">授权低风险任务测试通过后自动完成</button>
+        <button id="revokeAutoCloseBtn" type="button" class="ghost">撤销自动完成授权</button>
+      </div>
+      <p class="hint">只有用户明确授权、独测/复测通过且没有候选整合、部署、迁移、正式运行复核等真实交付动作时才允许自动完成；测试AI不能自行授权。</p>
+      <textarea id="reviewNote" rows="4" placeholder="写下审阅意见、问题或退回原因"></textarea>
+      <div class="review-actions">
+        <button id="commentBtn">只留言</button>
+        <button id="acceptBtn" class="primary">通过 / 认可</button>
+        <select id="rejectReason">
+          <option value="defect">原需求缺陷 → 测试失败待修复</option>
+          <option value="evidence">证据不足 → 待准备</option>
+          <option value="decision">需求/规则待决定 → 待确认</option>
+          <option value="hold">暂不继续 → 暂停</option>
+        </select>
+        <button id="rejectBtn" class="danger">打回</button>
+      </div>
+    </section>
+    <section id="userMessagePanel" class="panel user-message-panel" hidden>
+      <div class="panel-title-row"><h3>用户留言</h3><span id="userMessageCount" class="user-message-count"></span></div>
+      <div id="userMessageList" class="user-message-list"></div>
+    </section>    <section class="panel">
+      <div class="panel-title-row"><h3>历史事件</h3><button id="reloadHistoryBtn" class="ghost">刷新历史</button></div>
+      <div id="historyList" class="history-list"></div>
+    </section>
+  </dialog>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
