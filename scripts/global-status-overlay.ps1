@@ -1,4 +1,4 @@
-param([int]$PollMilliseconds = 1500)
+﻿param([int]$PollMilliseconds = 1500)
 $ErrorActionPreference = "Stop"
 $StartupLog = Join-Path (Split-Path -Parent $PSScriptRoot) "data\runtime\automation-control\overlay-startup-error.log"
 try { Remove-Item -LiteralPath $StartupLog -Force -ErrorAction SilentlyContinue } catch { # LOG-IGNORE: stale startup-log cleanup is best-effort

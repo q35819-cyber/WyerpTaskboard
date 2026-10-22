@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { ErpPassGate } from "../server/erp-pass-gate.mjs";
-const SHA="f".repeat(40), B="fix/erp-pass-unit-20261008", ID="ERP-PASS-DEMO-T1", NOW=Date.now();
+const RELEASE="release/p1-p3-integration-20261007", SHA="f".repeat(40), B="fix/erp-pass-unit-20261008", ID="ERP-PASS-DEMO-T1", NOW=Date.now();
 const ENV={WTB_ERP_PASS_DISPATCH_ENABLED:"1",WTB_ERP_PASS_VERIFY_URL:"https://board.example.test/api/erp-release/pass/verify",WTB_ERP_PASS_VERIFY_TOKEN:"v".repeat(48),WTB_ERP_GITHUB_DISPATCH_TOKEN:"g".repeat(48)};
 let nonce=0;
 function ev(type,actor,metadata={},step=0,extra={}){return {event_id:"evt_"+String(++nonce).padStart(10,"0"),event_type:type,actor_type:actor[0],actor_id:actor[1],session_id:actor[2],timestamp:new Date(NOW-100000+step*1000).toISOString(),metadata,...extra};}
@@ -33,7 +33,8 @@ async function setup(t,{enabled=true,fetcher}={}){
   throw Error("unexpected "+url);
  });
  const env=enabled?{...ENV}:{};
- const gate=await new ErpPassGate({rootDir:root,taskStore:store,env,fetchImpl:fake,githubHead:async()=>SHA,now:()=>NOW}).init();
+ const compareAware=async(url,opt)=>url.includes("/compare/")?{ok:true,status:200,json:async()=>({status:"diverged"})}:fake(url,opt);
+ const gate=await new ErpPassGate({rootDir:root,taskStore:store,env,fetchImpl:compareAware,githubHead:async branch=>branch===RELEASE?"a".repeat(40):SHA,now:()=>NOW}).init();
  const payload={project:"erp-x20",task_id:ID,commit_sha:SHA,head_branch:B,evidence_id:history.at(-1).event_id};
  return {gate,history,task,root,payload,calls,env};
 }
@@ -147,4 +148,75 @@ test("audit records accepted/blocked/uncertain states without leaking credential
  const y=await setup(t,{enabled:false}),second=[];y.gate.systemEventLog={append:async e=>second.push(e)};
  await y.gate.enqueue("erp-x20",y.history.at(-1));await y.gate.drain();
  assert.ok(second.some(e=>e.event==="queued"));assert.ok(!second.some(e=>e.event==="accepted"));
+});
+
+test("release submission validates immutable SHA, exact report digest and trusted path before any delivery",async t=>{
+ const x=await setup(t),m=x.history.at(-1).metadata;
+ assert.equal((await x.gate.validateSubmission("qa-report.md",m)).commitSha,SHA);
+ const badDigest={...m,reportSha256:"0".repeat(64)};
+ await assert.rejects(x.gate.validateSubmission("qa-report.md",badDigest),{code:"release_report_hash_mismatch"});
+ await assert.rejects(x.gate.validateSubmission("../outside.md",m),{code:"release_report_outside_trusted_roots"});
+ await assert.rejects(x.gate.validateSubmission("qa-report.md",{...m,commitSha:"bad"}),{code:"release_evidence_incomplete"});
+ await assert.rejects(x.gate.validateSubmission("qa-report.md",{...m,blockers:["P0"]}),{code:"release_evidence_incomplete"});
+ await assert.rejects(x.gate.validateSubmission("qa-report.md",{...m,technicalGatesComplete:false}),{code:"release_evidence_incomplete"});
+ await fs.writeFile(path.join(x.root,"qa-report.md"),"tampered");
+ await assert.rejects(x.gate.validateSubmission("qa-report.md",m),{code:"release_report_hash_mismatch"});
+});
+
+test("legacy taskctl handoff only recovers actual developer identity from claim and session",async t=>{
+ const x=await setup(t),dev=["developer_ai","dev-1","dev-session"];
+ x.history.unshift(ev("claim",dev,{},-1));
+ const handoff=x.history.find(e=>e.event_type==="handoff");
+ handoff.actor_id="taskctl";
+ handoff.metadata={completedFromStatus:"开发中",atomicLifecycle:true,releasedAssignee:"dev-1",releasedSessionId:"dev-session"};
+ assert.equal((await x.gate.verify(x.payload)).developer_actor_id,"dev-1");
+ for(const [name,mutate] of [
+  ["forged developer",h=>h.metadata.releasedAssignee="other"],
+  ["wrong session",h=>h.metadata.releasedSessionId="other-session"],
+  ["not atomic",h=>h.metadata.atomicLifecycle=false],
+  ["missing assignee",h=>h.metadata.releasedAssignee=""],
+  ["generic released assignee",h=>h.metadata.releasedAssignee="taskctl"]
+ ]){
+  const original={...handoff.metadata};mutate(handoff);
+  await assert.rejects(x.gate.verify(x.payload),{code:"developer_handoff_identity_unverifiable"},name);
+  handoff.metadata=original;
+ }
+ x.history.shift();
+ await assert.rejects(x.gate.verify(x.payload),{code:"developer_handoff_identity_unverifiable"});
+});
+
+test("already merged SHA is observed without dispatch or fake accepted status",async t=>{
+ const x=await setup(t),audit=[];
+ x.gate.systemEventLog={append:async e=>audit.push(e)};
+ x.gate.githubHead=async branch=>branch===RELEASE?SHA:SHA;
+ await x.gate.enqueue("erp-x20",x.history.at(-1));
+ await x.gate.drain();
+ const state=x.gate.ledger.entries[x.payload.evidence_id];
+ assert.equal(state.state,"already_in_release");
+ assert.equal(state.attempts,0);
+ assert.equal(x.calls.filter(c=>c.url.endsWith("/dispatches")).length,0);
+ assert.ok(audit.some(e=>e.event==="already_in_release"));
+ await x.gate.drain();
+ assert.equal(x.calls.filter(c=>c.url.endsWith("/dispatches")).length,0);
+});
+
+test("Release descendant is deduplicated; GitHub compare error blocks sending",async t=>{
+ const x=await setup(t),orig=x.gate.fetchImpl;
+ let compared=0;
+ x.gate.fetchImpl=async(url,opt)=>{
+  if(url.includes("/compare/")){compared++;return {ok:true,json:async()=>({status:"ahead"})};}
+  return orig(url,opt);
+ };
+ await x.gate.enqueue("erp-x20",x.history.at(-1));
+ await x.gate.drain();
+ assert.equal(compared,1);
+ assert.equal(x.gate.ledger.entries[x.payload.evidence_id].state,"already_in_release");
+ assert.equal(x.calls.filter(c=>c.url.endsWith("/dispatches")).length,0);
+ const bad=await setup(t),base=bad.gate.fetchImpl;
+ bad.gate.fetchImpl=async(url,opt)=>url.includes("/compare/")?{ok:false,status:503}:base(url,opt);
+ await bad.gate.enqueue("erp-x20",bad.history.at(-1));
+ await bad.gate.drain();
+ assert.equal(bad.gate.ledger.entries[bad.payload.evidence_id].state,"blocked");
+ assert.equal(bad.gate.ledger.entries[bad.payload.evidence_id].reason,"github_release_comparison_unavailable");
+ assert.equal(bad.calls.filter(c=>c.url.endsWith("/dispatches")).length,0);
 });
