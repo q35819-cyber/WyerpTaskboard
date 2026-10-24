@@ -141,6 +141,33 @@ test("taskctl generic event and developer self-test default to developer_ai", as
   assert.equal(started.event.actor_type, "developer_ai");
 });
 
+test("developer self-test retains explicit immutable commit metadata without granting QA PASS", async (t) => {
+  const { fixture, base } = await startFixture(t);
+  const sha = "a".repeat(40), hash = "b".repeat(64);
+  const submitted = JSON.parse((await taskctl(fixture.boardRoot, base, [
+    "test-result", "--project", "fixture", "--task", "B-10",
+    "--result", "pass", "--report", "synthetic/self-test.md",
+    "--actor-type", "developer_ai", "--actor-id", "dev-binding-1",
+    "--commit-sha", sha, "--head-branch", "fix/B-10-self-test",
+    "--report-sha256", hash
+  ])).stdout);
+  assert.equal(submitted.event.actor_type, "developer_ai");
+  assert.equal(submitted.event.metadata.commitSha, sha);
+  assert.equal(submitted.event.metadata.headBranch, "fix/B-10-self-test");
+  assert.equal(submitted.event.metadata.reportSha256, hash);
+  assert.equal(submitted.event.metadata.testResult, "pass");
+  assert.equal(submitted.event.metadata.reportPath, "synthetic/self-test.md");
+  assert.notEqual(submitted.event.metadata.atomicLifecycle, true);
+  await assert.rejects(taskctl(fixture.boardRoot, base, [
+    "test-result", "--project", "fixture", "--task", "B-10",
+    "--result", "pass", "--report", "synthetic/self-test.md",
+    "--actor-type", "developer_ai", "--commit-sha", "invalid"
+  ]), error => {
+    assert.match(error.stderr, /--commit-sha must be a 40-character SHA/);
+    return true;
+  });
+});
+
 test("taskctl independent test identity must be explicit", async (t) => {
   const { fixture, base } = await startFixture(t);
   await assert.rejects(

@@ -10,7 +10,10 @@ const root = path.resolve(import.meta.dirname, "..");
 test("taskboard software and Chat Wake extension keep independent latest-version contracts", async () => {
   const pkg = JSON.parse(await fs.readFile(path.join(root, "package.json"), "utf8"));
   const manifest = JSON.parse(await fs.readFile(path.join(root, "browser-extension", "chat-wake", "manifest.json"), "utf8"));
-  const cfg = JSON.parse(await fs.readFile(path.join(root, "config", "chat-browser-wake.json"), "utf8"));
+  const runtimeConfig = path.join(root, "config", "chat-browser-wake.json");
+  const exampleConfig = path.join(root, "config", "chat-browser-wake.example.json");
+  const cfgPath = await fs.access(runtimeConfig).then(() => runtimeConfig, () => exampleConfig);
+  const cfg = JSON.parse(await fs.readFile(cfgPath, "utf8"));
 
   assert.ok(String(pkg.version || "").trim());
   assert.ok(String(manifest.version || "").trim());
