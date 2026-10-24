@@ -82,6 +82,20 @@ function metadata(args, extra = {}) {
   }
   return { ...parsed, ...extra };
 }
+function releaseMetadata(args) {
+  const data = metadata(args);
+  const fields = [["commit-sha", "commitSha"], ["head-branch", "headBranch"], ["report-sha256", "reportSha256"]];
+  for (const [option, field] of fields) if (args[option] !== undefined) data[field] = String(args[option]);
+  if (args["technical-gates-complete"] !== undefined) {
+    if (!["true", "false"].includes(String(args["technical-gates-complete"]))) throw new Error("--technical-gates-complete must be true or false");
+    data.technicalGatesComplete = args["technical-gates-complete"] === "true";
+  }
+  if (args.blockers !== undefined) data.blockers = String(args.blockers).toLowerCase() === "none" ? [] : String(args.blockers).split(",").map(x => x.trim()).filter(Boolean);
+  if (data.commitSha !== undefined && !/^[a-f0-9]{40}$/.test(data.commitSha)) throw new Error("--commit-sha must be a 40-character SHA");
+  if (data.headBranch !== undefined && !/^(feature|fix|hotfix|codex|integration)\/[A-Za-z0-9][A-Za-z0-9._/-]{0,190}$/.test(data.headBranch)) throw new Error("--head-branch must be an approved task branch");
+  if (data.reportSha256 !== undefined && !/^[a-f0-9]{64}$/.test(data.reportSha256)) throw new Error("--report-sha256 must be a 64-character hex digest");
+  return data;
+}
 function actor(args, defaultType = "developer_ai") {
   return {
     actorType: args["actor-type"] || defaultType,
@@ -139,11 +153,12 @@ try {
         "taskctl release --project PROJECT --task WTB-TEST-001 --session-id ID [--note TEXT]",
         "taskctl reply-user --project PROJECT --task WTB-TEST-001 --message EVENT_ID --note TEXT [--session-id ID]",
         "taskctl priority --project PROJECT --task WTB-TEST-001 --value P1",
-        "taskctl transition --project PROJECT --task WTB-TEST-001 --status 待独测 --event-type handoff",
-        "taskctl complete --project PROJECT --task WTB-TEST-001 --session-id ID --note TEXT",
+        "taskctl transition --project PROJECT --task WTB-TEST-001 --status 待独测 --actor-id ID --session-id SESSION --event-type handoff",
+        "taskctl complete --project PROJECT --task WTB-TEST-001 --actor-id ID --session-id SESSION --note TEXT",
         "taskctl changed --project PROJECT --task WTB-TEST-001 --kind code|doc --paths a,b --note TEXT [--invalidates-test true]",
         "taskctl test-start --project PROJECT --task WTB-TEST-001 --note TEXT [--report path] [--actor-type test_ai --actor-id ID]",
-        "taskctl test-result --project PROJECT --task WTB-TEST-001 --result pass|fail|blocked --report path --note TEXT [--delivery-mode required|user_acceptance|auto_close] [--delivery-actions candidate_merge,deploy_switch,...] [--actor-type test_ai --actor-id ID]",
+        "taskctl test-result --project PROJECT --task TASK --result pass|fail|blocked --report path [--commit-sha SHA --head-branch BRANCH --technical-gates-complete true --blockers list --report-sha256 DIGEST] [--delivery-mode required --delivery-actions candidate_merge] --actor-type test_ai --actor-id ID --session-id SESSION",
+        "taskctl code-published --project erp-x20 --task TASK --commit-sha SHA --head-branch BRANCH --pushed true --actor-id ID --session-id SESSION",
         "taskctl stop --project PROJECT --task WTB-TEST-001 --note TEXT",
         "taskctl suspect-disconnect --project PROJECT --task WTB-TEST-001 --note EVIDENCE",
         "taskctl takeover --project PROJECT --task WTB-TEST-001 --assignee NAME --session-name NAME --session-id ID --note TEXT [--user-quote '用户当前明确允许异常接管的原话' --evidence '原Session/Job/资源实际核查证据' --user-scope task|project --actor-id ID]", 
@@ -404,6 +419,8 @@ try {
       (before.status === "开发中" && targetStatus === "待独测") ||
       (before.status === "修复中" && targetStatus === "待复测");
     if (atomicDeveloperHandoff) {
+      required(args, "actor-id");
+      required(args, "session-id");
       output(await request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task) + "/complete-execution", {
         method: "POST",
         body: {
@@ -426,6 +443,18 @@ try {
         }
       }));
     }
+  } else if (command === "code-published") {
+    const { project, task } = projectTask(args);
+    if (project !== "erp-x20") throw new Error("code-published is restricted to ERP Release evidence");
+    await preflight(project, task, args);
+    if (!args["actor-id"] || !args["session-id"]) throw new Error("--actor-id and --session-id are required");
+    const info = releaseMetadata(args);
+    if (!info.commitSha || !info.headBranch || args.pushed !== "true") throw new Error("code-published requires --commit-sha, --head-branch and --pushed true");
+    output(await request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task) + "/events", {
+      method: "POST",
+      body: { operationId: operationId(args, "code_published"), eventType: "code_published",
+        ...actor(args, "developer_ai"), metadata: { ...info, pushed: true } }
+    }));
   } else if (command === "changed") {
     const { project, task } = projectTask(args);
     await preflight(project, task, args);
@@ -445,6 +474,8 @@ try {
     const { project, task } = projectTask(args);
     await preflight(project, task, args);
     const before = await current(project, task);
+    required(args, "actor-id");
+    required(args, "session-id");
     output(await request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task) + "/complete-execution", {
       method: "POST",
       body: {
@@ -487,7 +518,7 @@ try {
           reportPath,
           deliveryDisposition: args["delivery-mode"] || undefined,
           deliveryActions: args["delivery-actions"] ? args["delivery-actions"].split(",").map((x) => x.trim()).filter(Boolean) : [],
-          metadata: metadata(args)
+          metadata: releaseMetadata(args)
         }
       }));
     } else {
@@ -497,7 +528,7 @@ try {
           operationId: operationId(args, "test_result"),
           eventType: "test_result",
           ...actor(args, "developer_ai"),
-          metadata: metadata(args, { testResult: result, reportPath })
+          metadata: { ...releaseMetadata(args), testResult: result, reportPath }
         }
       }));
     }

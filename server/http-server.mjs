@@ -1165,6 +1165,30 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         const body = await readJson(req);
         requireOperation(body);
         if (!body.eventType) throw new TaskboardError("eventType不能为空", { code: "INVALID_EVENT_TYPE", status: 400 });
+        if (params.projectId === "erp-x20" && body.eventType === "code_published") {
+          const { task } = await contextAndTask(taskStore, params.projectId, params.taskId);
+          const m = body.metadata || {};
+          if (body.actorType !== "developer_ai" || !body.actorId || !body.sessionId ||
+              !/^[a-f0-9]{40}$/.test(m.commitSha || "") ||
+              !/^(feature|fix|hotfix|codex|integration)\/[A-Za-z0-9][A-Za-z0-9._/-]{0,190}$/.test(m.headBranch || "") ||
+              m.headBranch.includes("..") || m.headBranch.includes("//") ||
+              m.pushed !== true) {
+            throw new TaskboardError("ERP代码推送证据必须绑定开发身份、会话、固定提交与分支", {
+              code: "ERP_CODE_PUBLISHED_BINDING_REQUIRED", status: 409
+            });
+          }
+          requireCurrentExecutionSession(task, body, {
+            actorType: "developer_ai", allowedStatuses: ["开发中", "修复中"]
+          });
+          const claims = await taskStore.taskHistory(params.projectId, params.taskId, { limit: 1000 });
+          const activeClaim = [...claims].reverse().find(e => e.event_type === "claim" &&
+            e.actor_type === "developer_ai" && e.session_id === task.sessionId);
+          if (!activeClaim || activeClaim.actor_id !== body.actorId) {
+            throw new TaskboardError("ERP提交证据必须由当前开发认领者本人登记", {
+              code: "ERP_CODE_PUBLISH_ACTOR_MISMATCH", status: 409
+            });
+          }
+        }
         const invalidatesTest = body.eventType === "code_change" || body.metadata?.invalidatesTestEvidence === true;
         if (invalidatesTest) {
           const { context, task, snapshot } = await contextAndTask(taskStore, params.projectId, params.taskId);
@@ -1205,6 +1229,20 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           actorType,
           allowedStatuses: ["开发中", "修复中"]
         });
+        // ERP candidate_merge evidence must preserve the actual developer
+        // who held this execution Session, never a generic CLI actor.
+        if (params.projectId === "erp-x20") {
+          const history = await taskStore.taskHistory(params.projectId, params.taskId, { limit: 1000 });
+          const developerClaim = [...history].reverse().find(event =>
+            event.event_type === "claim" && event.actor_type === "developer_ai" &&
+            event.session_id === task.sessionId);
+          if (!body.actorId || body.actorId === "taskctl" ||
+              !developerClaim || developerClaim.actor_id !== body.actorId) {
+            throw new TaskboardError("ERP开发交接身份必须与当前正式认领者相同", {
+              code: "DEVELOPER_COMPLETION_IDENTITY_MISMATCH", status: 409
+            });
+          }
+        }
         const target = developerCompletionTarget(task.status);
         context.workflow.assertTransition(task.status, target.status);
         const result = await taskStore.updateTask(params.projectId, params.taskId, {
@@ -1253,6 +1291,15 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           allowedStatuses: ["独测中", "复测中"]
         });
         const target = context.workflow.resolveIndependentTestOutcome(task.status, testResult, { deliveryDisposition: body.deliveryDisposition, deliveryActions: body.deliveryActions, autoCloseAuthorized: (await taskStore.autoCloseAuthorizationState(params.projectId, params.taskId)).authorized });
+        if (params.projectId === "erp-x20" && testResult === "pass" && target.deliveryActions.includes("candidate_merge")) {
+          try {
+            await erpPassGate.validateSubmission(reportPath, body.metadata);
+          } catch (error) {
+            throw new TaskboardError("ERP独测可记录通过，但进入Release待交付必须提供固定SHA、分支、无阻断门禁与可信报告SHA256", {
+              code: "ERP_PASS_EVIDENCE_REQUIRED", status: 409, details: { reason: error.code || "evidence_unavailable" }
+            });
+          }
+        }
         context.workflow.assertTransition(task.status, target.status);
         const result = await taskStore.updateTask(params.projectId, params.taskId, {
           status: target.status,

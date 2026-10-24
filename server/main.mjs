@@ -7,6 +7,7 @@ import { listenTaskboard } from "./http-server.mjs";
 import { atomicWriteJson } from "./core/atomic-files.mjs";
 import { TaskScanLoop } from "./task-scan-loop.mjs";
 import { SystemEventLog } from "./system-event-log.mjs";
+import { installTemporaryTestServiceLease } from "./test-instance-lease.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -116,3 +117,15 @@ try {
   console.error("startup task-scan loop failed; service continues:", error?.message || error);
   await systemEventLog.error("task-scan-loop", "startup_failed", error, { service_continues: true });
 }
+
+installTemporaryTestServiceLease({
+  instanceFile, port,
+  shutdown: async () => {
+    // Test fixtures alone expire; a short fallback prevents a hanging socket
+    // from keeping a detached WMI-launched test instance alive indefinitely.
+    const forceExit = setTimeout(() => process.exit(0), 15000);
+    forceExit.unref();
+    await systemEventLog.append({ component: "service", event: "test_fixture_lease_expired", details: { port } });
+    await shutdown();
+  }
+});

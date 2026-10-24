@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { atomicWriteJson } from "./core/atomic-files.mjs";
-const REPO=process.env.WTB_ERP_GITHUB_REPO || "example-owner/example-repo", ROUTE="/api/erp-release/pass/verify";
+const REPO="q35819-cyber/erp-x20", ROUTE="/api/erp-release/pass/verify", RELEASE_BRANCH="release/p1-p3-integration-20261007";
 const SHA=/^[a-f0-9]{40}$/, HASH=/^[a-f0-9]{64}$/, ID=/^[A-Za-z0-9][A-Za-z0-9_.:-]{3,199}$/;
 const BRANCH=/^(?:feature|fix|hotfix|codex|integration)\/[A-Za-z0-9][A-Za-z0-9._/-]{0,190}$/;
 const OK=new Set(["待交付","交付中","待用户验收","已完成"]), HOLD=new Set(["HOLD","阻断","测试失败待修复","待复测","复测中"]);
@@ -25,6 +25,20 @@ export class ErpPassGate{
  async persist(){await fs.mkdir(path.dirname(this.path),{recursive:true});await atomicWriteJson(this.path,this.ledger);}
  async audit(event,p={},reason=null){if(this.systemEventLog)await this.systemEventLog.append({component:"erp-pass-dispatch",event,result:event,details:{task_id:p.task_id||null,evidence_id:p.evidence_id||null,commit_sha:p.commit_sha||null,reason}});}
  async head(branch){if(this.githubHead)return this.githubHead(branch);const u="https://api.github.com/repos/"+REPO+"/branches/"+branch.split("/").map(encodeURIComponent).join("/");const r=await this.fetchImpl(u,{headers:{"User-Agent":"WyerpTaskboard-ERP-PASS","Accept":"application/vnd.github+json"},redirect:"error",signal:AbortSignal.timeout(12000)});if(!r.ok)deny("github_head_unavailable",503);return (await r.json()).commit?.sha;}
+ async validateSubmission(reportPath,metadata){
+  const m=metadata||{};
+  if(!SHA.test(m.commitSha||"")||!branchOk(m.headBranch)||!HASH.test(m.reportSha256||"")||
+     m.technicalGatesComplete!==true||!Array.isArray(m.blockers)||m.blockers.length!==0)deny("release_evidence_incomplete",409);
+  const f=path.resolve(this.rootDir,reportPath||"");
+  const dirs=[this.rootDir,path.resolve("D:/WyerpReleaseEvidence")];
+  if(!dirs.some(d=>{const rel=path.relative(path.resolve(d),f);return !rel.startsWith("..")&&!path.isAbsolute(rel);}))deny("release_report_outside_trusted_roots",409);
+  let resolved;try{resolved=await fs.realpath(f);}catch{deny("release_report_unavailable",409);}
+  const roots=[];for(const d of dirs){try{roots.push(await fs.realpath(d));}catch(error){if(error?.code!=="ENOENT")throw error; /* LOG-IGNORE: optional evidence root need not exist */}}
+  if(!roots.some(d=>{const rel=path.relative(d,resolved);return !rel.startsWith("..")&&!path.isAbsolute(rel);}))deny("release_report_path_escape",409);
+  const bytes=await fs.readFile(resolved);
+  if(digest(bytes)!==m.reportSha256)deny("release_report_hash_mismatch",409);
+  return {commitSha:m.commitSha,headBranch:m.headBranch,reportSha256:m.reportSha256};
+ }
  async verify(input){
   const p=payloadOk(input);if(!this.verifyEnabled)deny("gate_disabled",503);
   const {task}=await this.taskStore.getTask("erp-x20",p.task_id);if(!OK.has(task.status)||HOLD.has(task.status))deny("task_not_ready");
@@ -38,11 +52,25 @@ export class ErpPassGate{
   const prior=h.slice(0,i),claim=last(prior,x=>x.event_type==="claim"&&x.actor_type==="test_ai"&&x.actor_id===e.actor_id);
   if(!claim||claim.session_id!==e.session_id)deny("tester_claim_invalid");
   const developer=last(prior,x=>x.event_type==="handoff"&&x.actor_type==="developer_ai"&&["开发中","修复中"].includes(x.metadata?.completedFromStatus));
-  if(!developer||!developer.actor_id||developer.actor_id===e.actor_id||developer.session_id===e.session_id)deny("not_independent");
-  const self=last(prior,x=>x.event_type==="test_result"&&x.actor_type==="developer_ai"&&x.actor_id===developer.actor_id&&x.session_id===developer.session_id&&x.metadata?.testResult==="pass"&&Date.parse(x.timestamp)<=Date.parse(developer.timestamp));
+  if(!developer||!developer.actor_id)deny("not_independent");
+  // Old taskctl complete calls could stamp a generic CLI actor. Recover
+  // only the real developer recorded in the same atomic claim/session.
+  let developerId=developer.actor_id;
+  if(developerId==="taskctl"){
+   const released=developer.metadata||{},historyBeforeHandoff=prior.slice(0,prior.indexOf(developer));
+   const developerClaim=last(historyBeforeHandoff,x=>x.event_type==="claim"&&x.actor_type==="developer_ai");
+   if(released.atomicLifecycle!==true||typeof released.releasedAssignee!=="string"||
+      !released.releasedAssignee.trim()||released.releasedAssignee==="taskctl"||
+      released.releasedSessionId!==developer.session_id||
+      !developerClaim||developerClaim.actor_id!==released.releasedAssignee||
+      developerClaim.session_id!==developer.session_id)deny("developer_handoff_identity_unverifiable");
+   developerId=released.releasedAssignee;
+  }
+  if(developerId===e.actor_id||developer.session_id===e.session_id)deny("not_independent");
+  const self=last(prior,x=>x.event_type==="test_result"&&x.actor_type==="developer_ai"&&x.actor_id===developerId&&x.session_id===developer.session_id&&x.metadata?.testResult==="pass"&&Date.parse(x.timestamp)<=Date.parse(developer.timestamp));
   if(!self||prior.slice(prior.indexOf(self)+1).some(x=>x.event_type==="code_change"||x.metadata?.invalidatesTestEvidence===true))deny("self_test_invalid");
   const testedSha=self.metadata?.commitSha===p.commit_sha&&self.metadata?.headBranch===p.head_branch;
-  const published=last(prior,x=>x.event_type==="code_published"&&x.actor_type==="developer_ai"&&x.actor_id===developer.actor_id&&x.metadata?.pushed===true&&x.metadata?.commitSha===p.commit_sha&&x.metadata?.headBranch===p.head_branch&&Date.parse(x.timestamp)>=Date.parse(self.timestamp)&&Date.parse(x.timestamp)<=Date.parse(developer.timestamp));
+  const published=last(prior,x=>x.event_type==="code_published"&&x.actor_type==="developer_ai"&&x.actor_id===developerId&&x.session_id===developer.session_id&&x.metadata?.pushed===true&&x.metadata?.commitSha===p.commit_sha&&x.metadata?.headBranch===p.head_branch&&Date.parse(x.timestamp)>=Date.parse(self.timestamp)&&Date.parse(x.timestamp)<=Date.parse(developer.timestamp));
   if(!testedSha&&!published)deny("self_test_commit_unbound");
   const f=path.resolve(this.rootDir,m.reportPath||"");
   const dirs=[this.rootDir,path.resolve("D:/WyerpReleaseEvidence")];
@@ -57,7 +85,22 @@ export class ErpPassGate{
   const snapshot=await this.taskStore.snapshot("erp-x20");
   if(snapshot.tasks.some(x=>x.parent===p.task_id&&x.priority==="P0"&&!["已完成","待用户验收","已取消"].includes(x.status)))deny("unresolved_child_blocker");
   if(await this.head(p.head_branch)!==p.commit_sha)deny("github_head_changed");
-  return {...p,result:"PASS",is_current:true,independent_test:true,development_self_test:"PASS",technical_gates_complete:true,developer_actor_id:developer.actor_id,tester_actor_id:e.actor_id,blockers:[],report_ref:f,tested_at:e.timestamp};
+  return {...p,result:"PASS",is_current:true,independent_test:true,development_self_test:"PASS",technical_gates_complete:true,developer_actor_id:developerId,tester_actor_id:e.actor_id,blockers:[],report_ref:f,tested_at:e.timestamp};
+ }
+
+ // An already-included GitHub Release commit never needs another dispatch.
+ // The ledger outcome is not evidence that repository_dispatch was accepted.
+ async alreadyInRelease(commit){
+  const releaseHead=await this.head(RELEASE_BRANCH);
+  if(!SHA.test(releaseHead||""))deny("github_release_head_invalid",503);
+  if(releaseHead===commit)return true;
+  const url="https://api.github.com/repos/"+REPO+"/compare/"+commit+"..."+releaseHead;
+  const response=await this.fetchImpl(url,{headers:{"User-Agent":"WyerpTaskboard-ERP-PASS","Accept":"application/vnd.github+json"},redirect:"error",signal:AbortSignal.timeout(12000)});
+  if(!response.ok)deny("github_release_comparison_unavailable",503);
+  const status=(await response.json()).status;
+  if(status==="ahead"||status==="identical")return true;
+  if(status==="behind"||status==="diverged")return false;
+  deny("github_release_comparison_invalid",503);
  }
 
  async enqueue(project,e){
@@ -90,7 +133,14 @@ export class ErpPassGate{
   try{for(const entry of Object.values(this.ledger.entries)){
    if(entry.state!=="pending")continue;
    let receipt;
-   try{receipt=await this.verify(entry.payload);await this.defaultWorkflow();}
+   try{
+    if(await this.alreadyInRelease(entry.payload.commit_sha)){
+     entry.state="already_in_release";entry.checkedAt=new Date(this.now()).toISOString();
+     await this.persist();await this.audit("already_in_release",entry.payload);
+     continue;
+    }
+    receipt=await this.verify(entry.payload);await this.defaultWorkflow();
+   }
    catch(e){entry.state="blocked";entry.reason=e.code||"preflight_unavailable";await this.persist();await this.audit("blocked",entry.payload,entry.reason);continue;}
    entry.state="sending";entry.attempts++;entry.sentAt=new Date(this.now()).toISOString();
    await this.persist(); // never auto-replay if network state is unknown
