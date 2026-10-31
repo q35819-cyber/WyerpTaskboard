@@ -6,7 +6,7 @@
 
 - 独测 FAIL：`测试失败待修复 → 修复中 → 待复测 → 复测中`，退回原开发负责人；修复后必须重新独测。
 - 独测 PASS 且要求代码合并：`待交付 → 交付中 → 已完成`。独测结果必须通过 `--commit-sha` 和 `--branch` 把 PASS 绑定到实际测试的唯一候选提交。
-- 独测 PASS 且无需代码交付：按既有用户验收路径进入`待用户验收`。
+- 独测 PASS 且无需代码交付：只有明确标记为 `user_ui_business` 的任务进入待用户验收；未显式标记的任务默认 `system` 并自动完成。为兼容旧任务，已处于`待用户验收`或历史测试事件明确记录`user_acceptance`的任务保留用户验收范围；不得再按 product/bugfix/infrastructure track 推断验收范围。
 - 不允许跳过自测、独测、正式认领或 Git 交付门禁。
 
 ## 责任边界
@@ -74,7 +74,7 @@ node cli/taskctl.mjs delivery-failed --project <项目ID> --task <任务ID> --ac
 ## 禁止事项
 
 - 不设置独立集成开发角色；不把合并责任转交给总控或用户。
-- 不允许通过普通 PATCH/transition 把`交付中`直接改为`待用户验收`或`已完成`。
+- 不允许通过普通 PATCH/transition 直接关闭交付任务。仅 taskctl complete 完成 Git 远端核验与合并后回归后，系统才按 acceptanceScope 自动选择待用户验收或已完成。
 - 不允许独测 PASS 后继续修改代码而复用旧 PASS；代码变化必须重新独测。
 - 不允许只凭本地 commit、PR 已创建、任务状态或口头报告宣称已合并。
 - 不允许在没有远端 SHA 和合并后回归证据时关闭任务。

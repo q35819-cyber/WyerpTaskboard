@@ -109,10 +109,9 @@ test("creating a task in project C remains isolated from A and B regardless of G
    status:"待开发",plannedRole:"开发AI",boundary:"多项目任务创建夹具",
    plan:"任务看板与AI协作控制开发计划.md",traceability:"cp/B-10.md",
    readDependencies:"AGENTS.md",writeTargets:"测试隔离目录",targets:"独立项目C"};
- const response=await fetch(x.base+"/api/projects/C/tasks",{method:"POST",headers:x.headers,
-   body:JSON.stringify({operationId:"multiproject.create."+ ++serial,expectedRevision:snapshot.registryRevision,
-     actorType:"user",actorId:"fixture-owner",task})});
- const created=await response.json();
+  const response=await fetch(x.base+"/api/projects/C/tasks",{method:"POST",headers:{Origin:x.base,"Content-Type":"application/json"},
+    body:JSON.stringify({operationId:"multiproject.create."+ ++serial,expectedRevision:snapshot.registryRevision,
+      actorId:"fixture-owner",task})}); const created=await response.json();
  assert.equal(response.status,201,JSON.stringify(created));
  assert.equal(created.task.id,"C-NEW-TASK");
  assert.equal((await x.get("C","C-NEW-TASK")).status,"待开发");

@@ -77,7 +77,7 @@ async function wakeAck(wake, candidate, role, epoch) {
   assert.equal(ack.state, "acked");
 }
 
-test("unattended core loops developer -> independent test fail -> repair -> retest pass -> user acceptance -> next work", async (t) => {
+test("unattended core loops developer -> independent test fail -> repair -> retest pass -> system auto-close -> next work", async (t) => {
   const { fixture, base } = await startFixture(t);
   const taskStore = await new TaskStore(fixture.boardRoot).init();
   const requirementStore = await new RequirementStore(fixture.boardRoot).init();
@@ -150,11 +150,10 @@ test("unattended core loops developer -> independent test fail -> repair -> rete
   const passed = await taskctl(fixture.boardRoot, base, [
     "test-result", "--project", "fixture", "--task", "B-10",
     "--result", "pass", "--report", "reports/B-10/pass.md", "--note", "canary retest passed",
-    "--delivery-mode", "user_acceptance",
     "--actor-type", "test_ai", "--actor-id", "canary-test-ai", "--session-id", "sess-test-2"
   ]);
-  assert.equal(passed.after.status, "待用户验收");
-  assert.equal(passed.after.plannedRole, "用户");
+  assert.equal(passed.after.status, "已完成");
+  assert.equal(passed.after.plannedRole, "");
   assert.equal(passed.after.assignee, "");
   assert.equal(passed.after.sessionId, "");
 

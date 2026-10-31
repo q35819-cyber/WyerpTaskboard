@@ -219,24 +219,20 @@
       </div>
     </section>
     <section class="panel">
-      <h3>我的审阅意见</h3>
-      <div class="inline-form">
-        <strong id="autoCloseAuthorizationStatus">自动完成授权状态读取中</strong>
-        <button id="authorizeAutoCloseBtn" type="button">授权低风险任务测试通过后自动完成</button>
-        <button id="revokeAutoCloseBtn" type="button" class="ghost">撤销自动完成授权</button>
-      </div>
-      <p class="hint">只有用户明确授权、独测/复测通过且没有候选整合、部署、迁移、正式运行复核等真实交付动作时才允许自动完成；测试AI不能自行授权。</p>
-      <textarea id="reviewNote" rows="4" placeholder="写下审阅意见、问题或退回原因"></textarea>
+      <h3>用户验收</h3>
+      <p class="hint">技术验收、编译、测试、权限、Git交付和回归均由系统自动执行。只有 UI 视觉与交互、业务逻辑需要你确认。</p>
+      <textarea id="reviewNote" rows="4" placeholder="写下 UI / 交互或业务逻辑问题；也可以留言"></textarea>
       <div class="review-actions">
         <button id="commentBtn">只留言</button>
-        <button id="acceptBtn" class="primary">通过 / 认可</button>
-        <select id="rejectReason">
-          <option value="defect">原需求缺陷 → 测试失败待修复</option>
-          <option value="evidence">证据不足 → 待准备</option>
-          <option value="decision">需求/规则待决定 → 待确认</option>
-          <option value="hold">暂不继续 → 暂停</option>
-        </select>
-        <button id="rejectBtn" class="danger">打回</button>
+        <div id="userAcceptanceActions" class="inline-form" hidden>
+          <button id="acceptBtn" class="primary">验收通过</button>
+          <select id="rejectReason">
+            <option value="defect">UI / 业务逻辑问题 → 退回开发修复</option>
+            <option value="evidence">验收材料不足 → 待准备</option>
+            <option value="decision">业务规则需要确认 → 待确认</option>
+          </select>
+          <button id="rejectBtn" class="danger">打回</button>
+        </div>
       </div>
     </section>
     <section id="userMessagePanel" class="panel user-message-panel" hidden>

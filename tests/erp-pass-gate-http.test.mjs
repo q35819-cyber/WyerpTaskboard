@@ -29,14 +29,14 @@ test("disabled verification route is HTTP 503; admin secret cannot bypass dedica
  const origin=await fetch(enabled.base+URL_PATH,{method:"POST",headers:{Origin:"https://evil.example",Authorization:"Bearer "+PASS_TOKEN},body:"{}"});
  assert.equal(origin.status,403);
 });
-test("local browser retry requires CSRF and cannot retry unknown evidence",async t=>{
+test("local browser retry requires same-origin user access but no CSRF token",async t=>{
  const x=await service(t,{env:config()});
  let r=await fetch(x.base+"/api/erp-release/pass/retry",{method:"POST",headers:{Authorization:"Bearer "+PASS_TOKEN,"Content-Type":"application/json"},body:JSON.stringify({evidence_id:"evt_"+"a".repeat(24)})});
  assert.equal(r.status,401);
  r=await fetch(x.base+"/api/auth/session");
- assert.equal(r.status,200);const csrf=(await r.json()).csrfToken,cookie="";
- r=await fetch(x.base+"/api/erp-release/pass/retry",{method:"POST",headers:{Cookie:cookie,Origin:x.base,"Content-Type":"application/json"},body:"{}"});
- assert.equal(r.status,403);
- r=await fetch(x.base+"/api/erp-release/pass/retry",{method:"POST",headers:{Cookie:cookie,Origin:x.base,"X-CSRF-Token":csrf,"Content-Type":"application/json"},body:JSON.stringify({evidence_id:"evt_"+"a".repeat(24)})});
+ assert.equal(r.status,200);await r.json();
+ r=await fetch(x.base+"/api/erp-release/pass/retry",{method:"POST",headers:{Origin:x.base,"Content-Type":"application/json"},body:"{}"});
+  assert.equal(r.status,400);
+ r=await fetch(x.base+"/api/erp-release/pass/retry",{method:"POST",headers:{Origin:x.base,"Content-Type":"application/json"},body:JSON.stringify({evidence_id:"evt_"+"a".repeat(24)})});
  assert.equal(r.status,409);
 });

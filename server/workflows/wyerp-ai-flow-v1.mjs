@@ -36,7 +36,7 @@ const transitions = new Map([
   ["待复测", new Set(["复测中", "测试失败待修复", "待准备", "待确认", "阻断", "HOLD"])],
   ["复测中", new Set(["待交付", "待用户验收", "已完成", "测试失败待修复", "阻断", "HOLD"])],
   ["待交付", new Set(["交付中", "阻断", "HOLD"])],
-  ["交付中", new Set(["已完成", "待复测", "阻断", "HOLD"])],
+  ["交付中", new Set(["已完成", "待用户验收", "待复测", "阻断", "HOLD"])],
   ["待用户验收", new Set(["已完成", "测试失败待修复", "待准备", "待确认", "HOLD"])],
   ["阻断", new Set(["待确认", "待准备", "待开发", "待独测", "待复测", "HOLD", "已取消"])],
   ["HOLD", new Set(["待确认", "待准备", "待开发", "测试失败待修复", "待独测", "待复测", "待交付", "已取消"])],
@@ -140,9 +140,10 @@ export const wyerpAiFlowV1 = {
       const independentStage = ["独测中", "复测中"].includes(task.status);
       if (independentStage && targetStatus !== "HOLD") {
         const result = String(meta.testResult || "");
+        const hasDeliveryActions = Array.isArray(meta.deliveryActions) && meta.deliveryActions.length > 0;
         const expectedTarget = result === "fail" ? "测试失败待修复"
           : result === "blocked" ? "阻断"
-            : result === "pass" ? ({ required: "待交付", user_acceptance: "待用户验收", auto_close: "已完成" })[meta.deliveryDisposition]
+            : result === "pass" ? (hasDeliveryActions ? "待交付" : meta.acceptanceScope === "user_ui_business" ? "待用户验收" : "已完成")
               : "";
         if (eventType !== "test_result" || actorType !== "test_ai" || !sessionId
           || sessionId !== task.sessionId || meta.atomicLifecycle !== true || !meta.reportPath
@@ -158,14 +159,16 @@ export const wyerpAiFlowV1 = {
           code: "DELIVERY_CLAIM_REQUIRED", status: 409
         });
       }
-      if (task.status === "交付中" && targetStatus === "已完成"
-        && (eventType !== "delivery_complete" || actorType !== "developer_ai" || !sessionId
+      if (task.status === "交付中" && ["已完成", "待用户验收"].includes(targetStatus)) {
+        const expectedDeliveryTarget = meta.acceptanceScope === "user_ui_business" ? "待用户验收" : "已完成";
+        if (targetStatus !== expectedDeliveryTarget || eventType !== "delivery_complete" || actorType !== "developer_ai" || !sessionId
           || sessionId !== task.sessionId || meta.deliveryVerified !== true
           || !meta.mergeCommitSha || !meta.remoteMainSha || !meta.postMergeReportSha256
-          || meta.postMergeRegressionResult !== "PASS")) {
-        throw new TaskboardError("交付完成必须通过 taskctl complete 的 Git 远端与合并后回归核验", {
-          code: "DELIVERY_VERIFICATION_REQUIRED", status: 409
-        });
+          || meta.postMergeRegressionResult !== "PASS") {
+          throw new TaskboardError("交付完成必须通过 taskctl complete 的 Git 远端与合并后回归核验，且目标状态必须符合验收范围", {
+            code: "DELIVERY_VERIFICATION_REQUIRED", status: 409
+          });
+        }
       }
       if (task.status === "待用户验收" && targetStatus === "已完成"
         && (eventType !== "user_accept" || actorType !== "user")) {
@@ -210,17 +213,37 @@ export const wyerpAiFlowV1 = {
     return normalized;
   },
   deliveryActionTypes,
-  resolveIndependentTestOutcome(status, result, { deliveryDisposition = "", deliveryActions = [], autoCloseAuthorized = false } = {}) {
+  resolveAcceptanceScope(task, events = []) {
+    const created = [...events].reverse().find((event) => event.event_type === "task_created");
+    const scopedEvent = [...events].reverse().find((event) =>
+      ["test_result", "delivery_complete", "user_accept", "user_reject"].includes(event.event_type) && event.metadata?.acceptanceScope
+    );
+    const explicit = String(created?.metadata?.acceptanceScope || scopedEvent?.metadata?.acceptanceScope || "").trim();
+    if (explicit) {
+      if (!["system", "user_ui_business"].includes(explicit)) throw new TaskboardError("任务验收范围必须为system或user_ui_business", {
+        code: "INVALID_ACCEPTANCE_SCOPE", status: 409, details: { acceptanceScope: explicit }
+      });
+      return explicit;
+    }
+    // Legacy compatibility: preserve tasks already awaiting UI/business acceptance and
+    // historical test results that explicitly selected user_acceptance. New tasks
+    // without an explicit scope always default to system, regardless of track.
+    const legacyUserAcceptance = [...events].reverse().some((event) =>
+      ["user_accept", "user_reject"].includes(event.event_type) ||
+      (["test_result", "delivery_complete"].includes(event.event_type) && event.metadata?.deliveryDisposition === "user_acceptance")
+    );
+    if (legacyUserAcceptance || task?.status === "待用户验收") return "user_ui_business";
+    return "system";
+  },
+  resolveIndependentTestOutcome(status, result, { acceptanceScope = "system", deliveryActions = [] } = {}) {
     if (!["独测中", "复测中"].includes(status)) return null;
     if (result === "fail") return { status: "测试失败待修复", plannedRole: "开发AI", deliveryDisposition: null, deliveryActions: [] };
     if (result === "blocked") return { status: "阻断", plannedRole: "—", deliveryDisposition: null, deliveryActions: [] };
     if (result !== "pass") return null;
-    const disposition = String(deliveryDisposition || "").trim();
-    if (!disposition) throw new TaskboardError("测试通过后必须明确交付必要性判定", { code: "DELIVERY_DISPOSITION_REQUIRED", status: 400 });
-    if (!["required", "user_acceptance", "auto_close"].includes(disposition)) {
-      throw new TaskboardError("未知交付必要性判定: " + disposition, { code: "INVALID_DELIVERY_DISPOSITION", status: 400 });
-    }
-    const actions = Array.isArray(deliveryActions) ? deliveryActions.map((x) => String(x || "").trim()).filter(Boolean) : [];
+    if (!["system", "user_ui_business"].includes(acceptanceScope)) throw new TaskboardError("任务验收范围无效", { code: "INVALID_ACCEPTANCE_SCOPE", status: 409 });
+    if (!Array.isArray(deliveryActions)) throw new TaskboardError("交付动作必须是数组", { code: "INVALID_DELIVERY_ACTION", status: 400 });
+    const actions = deliveryActions.map((x) => typeof x === "string" ? x.trim() : "");
+    const disposition = actions.length ? "required" : acceptanceScope === "user_ui_business" ? "user_acceptance" : "auto_close";
     const invalid = actions.filter((action) => !deliveryActionSet.has(action));
     if (invalid.length) throw new TaskboardError("存在不允许的交付动作: " + invalid.join(", "), { code: "INVALID_DELIVERY_ACTION", status: 400, details: { invalid } });
     if (disposition === "required") {
@@ -229,7 +252,6 @@ export const wyerpAiFlowV1 = {
     }
     if (actions.length) throw new TaskboardError("无交付动作路径不能携带deliveryActions", { code: "DELIVERY_ACTION_NOT_ALLOWED", status: 400 });
     if (disposition === "user_acceptance") return { status: "待用户验收", plannedRole: "用户", deliveryDisposition: disposition, deliveryActions: [] };
-    if (!autoCloseAuthorized) throw new TaskboardError("该任务没有用户明确的低风险自动闭环授权", { code: "AUTO_CLOSE_NOT_AUTHORIZED", status: 409 });
     return { status: "已完成", plannedRole: "", deliveryDisposition: disposition, deliveryActions: [] };
   },
   isExecutableDeliveryDecision(metadata = {}) {

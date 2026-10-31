@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "project": {
+    "id": "python-contract-demo",
+    "name": "Python Contract Demo",
+    "root": "."
+  },
+  "git": {
+    "remoteUrl": null,
+    "defaultBranch": "main",
+    "mergeStrategy": "merge"
+  },
+  "technology": {
+    "language": "python",
+    "runtime": "python >= 3.12",
+    "framework": "unittest",
+    "packageManager": "pip"
+  },
+  "qualityGates": {
+    "build": null,
+    "test": {
+      "executable": "python",
+      "args": ["-m", "unittest", "discover", "-s", "tests"],
+      "cwd": ".",
+      "timeoutSeconds": 30
+    },
+    "lint": null
+  },
+  "workflow": {
+    "templateId": "wyerp-software-project-v1",
+    "templateVersion": "1.0.0",
+    "acceptanceScope": "system"
+  },
+  "projectRules": {
+    "preserveExistingDocs": true,
+    "protectedPaths": ["README.md"],
+    "readOnlyPaths": ["docs/business"],
+    "writePaths": ["src", "tests"]
+  },
+  "environment": {
+    "requiredTools": ["python >= 3.12"],
+    "requiredServices": [],
+    "requiredEnvironmentVariables": []
+  }
+}

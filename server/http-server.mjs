@@ -113,11 +113,14 @@ function routeMatch(pathname, pattern) {
   return params;
 }
 function actorOptions(identity, body) {
+  if (identity.mode !== "session" && body.actorType === "user") throw new TaskboardError("用户身份只能由本机浏览器会话产生", {
+    code: "USER_SESSION_REQUIRED", status: 403
+  });
   return {
     actorType: identity.mode === "session" ? "user" : (body.actorType || "system"),
-    actorId: body.actorId || identity.actorId,
-    sessionWindowName: body.sessionWindowName || "",
-    sessionId: body.sessionId || "",
+    actorId: identity.mode === "session" ? identity.actorId : (body.actorId || identity.actorId),
+    sessionWindowName: identity.mode === "session" ? "" : (body.sessionWindowName || ""),
+    sessionId: identity.mode === "session" ? "" : (body.sessionId || ""),
     note: body.note || ""
   };
 }
@@ -131,6 +134,13 @@ function requireUserSession(identity) {
   if (identity.mode !== "session") {
     throw new TaskboardError("该治理动作必须由用户在浏览器会话中明确执行", {
       code: "USER_SESSION_REQUIRED", status: 403
+    });
+  }
+}
+function requireTrustedApiIdentity(identity) {
+  if (identity.mode !== "bearer") {
+    throw new TaskboardError("该执行动作只能由受信任的AI/CLI Bearer身份提交", {
+      code: "TRUSTED_API_IDENTITY_REQUIRED", status: 403
     });
   }
 }
@@ -220,6 +230,9 @@ function lastResumeTarget(events) {
 }
 
 export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port = 47831, chatgptMcpExecutorFactory = null, erpPassGateOptions = {} } = {}) {
+  if (host !== "127.0.0.1") throw new TaskboardError("任务看板服务只能监听 127.0.0.1", {
+    code: "LOOPBACK_BIND_REQUIRED", status: 400, details: { requestedHost: String(host || "") }
+  });
   const appPackage = JSON.parse(await fs.readFile(path.join(rootDir, "package.json"), "utf8"));
   const appVersion = String(appPackage.version || "").trim();
   if (!appVersion) throw new Error("taskboard package version missing");
@@ -598,7 +611,8 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
       const isWrite = !["GET", "HEAD", "OPTIONS"].includes(req.method);
       if (isWrite && identity.mode === "session") {
         if (!origin) throw new TaskboardError("浏览器写请求必须携带Origin", { code: "ORIGIN_REQUIRED", status: 403 });
-        if (req.headers["x-csrf-token"] !== identity.csrf) throw new TaskboardError("CSRF校验失败", { code: "CSRF_REJECTED", status: 403 });
+        const fetchSite = String(req.headers["sec-fetch-site"] || "").toLowerCase();
+        if (fetchSite && fetchSite !== "same-origin") throw new TaskboardError("浏览器写请求必须来自同源页面", { code: "FETCH_SITE_REJECTED", status: 403 });
       }
 
       if (req.method === "POST" && url.pathname === "/api/erp-release/pass/retry") {
@@ -610,7 +624,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         return send(res, 200, { accepted: true, state: erpPassGate.ledger.entries[body.evidence_id]?.state });
       }
       if (req.method === "GET" && url.pathname === "/api/auth/session") {
-        return send(res, 200, { ok: true, actorId: identity.actorId, csrfToken: identity.csrf || null, mode: identity.mode });
+        return send(res, 200, { ok: true, actorId: identity.actorId, mode: identity.mode, browserLoginRequired: false });
       }
 
       if (req.method === "GET" && url.pathname === "/api/ai-execution/settings") {
@@ -891,15 +905,18 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         taskStore.projects.get(requirementParams.projectId);
         const body = await readJson(req);
         requireOperation(body);
+        if (identity.mode !== "session" && body.actorType === "user") throw new TaskboardError("用户身份只能由本机浏览器会话产生", {
+          code: "USER_SESSION_REQUIRED", status: 403
+        });
         const actorType = identity.mode === "session" ? "user" : (body.actorType || "developer_ai");
         const result = await requirementStore.reply(requirementParams.projectId, requirementParams.requirementId, {
           operationId: body.operationId,
           actorType,
-          actorId: identity.actorId || body.actorId || "taskctl",
+          actorId: identity.mode === "session" ? identity.actorId : (body.actorId || identity.actorId || "taskctl"),
           note: body.note,
           replyToMessageId: body.replyToMessageId || null,
-          sessionId: body.sessionId || "",
-          sessionWindowName: body.sessionWindowName || ""
+          sessionId: identity.mode === "session" ? "" : (body.sessionId || ""),
+          sessionWindowName: identity.mode === "session" ? "" : (body.sessionWindowName || "")
         });
         return send(res, 200, result);
       }
@@ -914,17 +931,20 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
             code: "REQUIREMENT_STATUS_ACTOR_INVALID", status: 403
           });
         }
+        if (identity.mode !== "session" && body.actorType === "user") throw new TaskboardError("用户身份只能由本机浏览器会话产生", {
+          code: "USER_SESSION_REQUIRED", status: 403
+        });
         const result = await requirementStore.setStatus(requirementParams.projectId, requirementParams.requirementId, {
           operationId: body.operationId,
           status: body.status,
           actorType: identity.mode === "session" ? "user" : (body.actorType || "developer_ai"),
-          actorId: identity.actorId || body.actorId || "taskctl",
+          actorId: identity.mode === "session" ? identity.actorId : (body.actorId || identity.actorId || "taskctl"),
           note: body.note || "",
           planPaths: body.planPaths || [],
           taskIds: body.taskIds || [],
           keyFiles: body.keyFiles || [],
-          sessionId: body.sessionId || "",
-          sessionWindowName: body.sessionWindowName || ""
+          sessionId: identity.mode === "session" ? "" : (body.sessionId || ""),
+          sessionWindowName: identity.mode === "session" ? "" : (body.sessionWindowName || "")
         });
         return send(res, 200, result);
       }
@@ -988,7 +1008,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           preclaimReport,
           ...(await taskStore.stopState(params.projectId, params.taskId)),
           takeover: await taskStore.takeoverState(params.projectId, params.taskId),
-          autoCloseAuthorization: await taskStore.autoCloseAuthorizationState(params.projectId, params.taskId),
+
           userMessages,
           requirements: await requirementStore.pending(params.projectId)
         });
@@ -1001,7 +1021,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           ...pair.task, registryRevision: pair.snapshot.registryRevision,
           stop: await taskStore.stopState(params.projectId, params.taskId),
           takeover: await taskStore.takeoverState(params.projectId, params.taskId),
-          autoCloseAuthorization: await taskStore.autoCloseAuthorizationState(params.projectId, params.taskId),
+
           presentation: await taskStore.presentation(params.projectId, params.taskId),
           testResources: await taskStore.testResourceState(params.projectId, params.taskId),
           userMessages: await taskStore.userMessageState(params.projectId, params.taskId, {
@@ -1014,6 +1034,28 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
       if (req.method === "PATCH" && params) {
         const body = await readJson(req);
         requireOperation(body);
+        if (["user_accept", "user_reject"].includes(body.eventType)) throw new TaskboardError("用户验收必须通过正式review入口", {
+          code: "USER_REVIEW_ROUTE_REQUIRED", status: 409
+        });
+        if (body.eventType === "stop_request") throw new TaskboardError("停止请求必须通过正式stop入口", {
+          code: "STOP_ROUTE_REQUIRED", status: 409
+        });
+        if (identity.mode === "session") {
+          const patchKeys = body.patch && typeof body.patch === "object" ? Object.keys(body.patch) : [];
+          // A browser cannot perform acceptance via generic PATCH. Keep the denial,
+          // but direct attempted accept/reject state transitions to the review route.
+          if (body.eventType === "task_update" && patchKeys.length === 1 &&
+              patchKeys[0] === "status" && ["已完成", "待确认"].includes(body.patch.status)) {
+            throw new TaskboardError("用户通过或打回必须通过正式review入口", {
+              code: "USER_REVIEW_ROUTE_REQUIRED", status: 409
+            });
+          }
+          if (body.eventType !== "priority_change" || patchKeys.length !== 1 || patchKeys[0] !== "priority") {
+            throw new TaskboardError("浏览器用户只能通过通用PATCH调整任务优先级；状态、负责人和Session必须走专用治理入口", {
+              code: "USER_PATCH_SCOPE_REJECTED", status: 403
+            });
+          }
+        }
         if (!body.patch || typeof body.patch !== "object") throw new TaskboardError("patch不能为空", { code: "INVALID_PATCH", status: 400 });
         const result = await taskStore.updateTask(params.projectId, params.taskId, body.patch, {
           expectedRevision: body.expectedRevision,
@@ -1027,6 +1069,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
 
       params = routeMatch(url.pathname, "/api/projects/:projectId/tasks/:taskId/ack-user-messages");
       if (req.method === "POST" && params) {
+        requireTrustedApiIdentity(identity);
         const body = await readJson(req);
         requireOperation(body);
         const actorContext = {
@@ -1060,19 +1103,20 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
 
       params = routeMatch(url.pathname, "/api/projects/:projectId/tasks/:taskId/reply-user-message");
       if (req.method === "POST" && params) {
+        requireTrustedApiIdentity(identity);
         const body = await readJson(req);
         requireOperation(body);
         const note = String(body.note || "").trim();
         if (!note) throw new TaskboardError("AI回复内容不能为空", { code: "USER_MESSAGE_REPLY_EMPTY", status: 400 });
         const messageEventId = String(body.messageEventId || "").trim();
         if (!messageEventId) throw new TaskboardError("必须指定要回复的用户留言eventId", { code: "USER_MESSAGE_REPLY_TARGET_REQUIRED", status: 400 });
-        const history = await taskStore.taskHistory(params.projectId, params.taskId, { limit: 1000 });
+        const history = await taskStore.taskHistory(params.projectId, params.taskId, { all: true });
         const target = history.find((event) => event.event_id === messageEventId && event.actor_type === "user" && event.event_type === "user_review");
         if (!target) throw new TaskboardError("找不到对应的用户留言", {
           code: "USER_MESSAGE_REPLY_TARGET_INVALID", status: 404, details: { messageEventId }
         });
         const replyActorType = body.actorType || "developer_ai";
-        if (replyActorType === "user") throw new TaskboardError("用户不能通过AI回复接口回复自己", {
+        if (!["developer_ai", "test_ai"].includes(replyActorType)) throw new TaskboardError("AI回复身份必须为developer_ai或test_ai", {
           code: "USER_MESSAGE_REPLY_ACTOR_INVALID", status: 400
         });
         const result = await taskStore.appendTaskEvent(params.projectId, params.taskId, {
@@ -1148,6 +1192,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
 
       params = routeMatch(url.pathname, "/api/projects/:projectId/tasks/:taskId/events");
       if (req.method === "POST" && params) {
+        requireTrustedApiIdentity(identity);
         const body = await readJson(req);
         requireOperation(body);
         if (!body.eventType) throw new TaskboardError("eventType不能为空", { code: "INVALID_EVENT_TYPE", status: 400 });
@@ -1171,13 +1216,14 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         }
         const result = await taskStore.appendTaskEvent(params.projectId, params.taskId, {
           operationId: body.operationId, eventType: body.eventType,
-          ...actorOptions(identity, body), metadata: body.metadata || null
+          ...actorOptions(identity, body), note: body.note || "", metadata: body.metadata || null
         });
         return send(res, 200, result);
       }
 
       params = routeMatch(url.pathname, "/api/projects/:projectId/tasks/:taskId/complete-execution");
       if (req.method === "POST" && params) {
+        requireTrustedApiIdentity(identity);
         const body = await readJson(req);
         requireOperation(body); requireExpectedRevision(body);
         const { context, task } = await contextAndTask(taskStore, params.projectId, params.taskId);
@@ -1219,6 +1265,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
 
       params = routeMatch(url.pathname, "/api/projects/:projectId/tasks/:taskId/test-result");
       if (req.method === "POST" && params) {
+        requireTrustedApiIdentity(identity);
         const body = await readJson(req);
         requireOperation(body); requireExpectedRevision(body);
         const testResult = String(body.testResult || "").trim();
@@ -1238,7 +1285,9 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           actorType,
           allowedStatuses: ["独测中", "复测中"]
         });
-        const target = context.workflow.resolveIndependentTestOutcome(task.status, testResult, { deliveryDisposition: body.deliveryDisposition, deliveryActions: body.deliveryActions, autoCloseAuthorized: (await taskStore.autoCloseAuthorizationState(params.projectId, params.taskId)).authorized });
+        const taskEvents = await taskStore.taskHistory(params.projectId, params.taskId, { all: true });
+        const acceptanceScope = context.workflow.resolveAcceptanceScope(task, taskEvents);
+        const target = context.workflow.resolveIndependentTestOutcome(task.status, testResult, { acceptanceScope, deliveryActions: body.deliveryActions });
         context.workflow.assertTransition(task.status, target.status);
         const result = await taskStore.updateTask(params.projectId, params.taskId, {
           status: target.status,
@@ -1255,6 +1304,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
             ...(body.metadata || {}),
             atomicLifecycle: true,
             testResult,
+            acceptanceScope,
             deliveryDisposition: target.deliveryDisposition,
             deliveryActions: target.deliveryActions,
             reportPath,
@@ -1321,6 +1371,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
 
       params = routeMatch(url.pathname, "/api/projects/:projectId/tasks/:taskId/delivery-attempt-failed");
       if (req.method === "POST" && params) {
+        requireTrustedApiIdentity(identity);
         const body = await readJson(req);
         requireOperation(body); requireExpectedRevision(body);
         const { context, task, snapshot } = await contextAndTask(taskStore, params.projectId, params.taskId);
@@ -1334,7 +1385,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           });
         }
         requireCurrentExecutionSession(task, body, { actorType, allowedStatuses: ["交付中"] });
-        const history = await taskStore.taskHistory(params.projectId, params.taskId, { limit: 1000 });
+        const history = await taskStore.taskHistory(params.projectId, params.taskId, { all: true });
         const evidence = deliveryEvidence(history, context.workflow);
         if (!evidence.valid) throw new TaskboardError("缺少有效独立PASS，不能登记交付尝试", {
           code: "DELIVERY_INDEPENDENT_PASS_REQUIRED", status: 409
@@ -1383,6 +1434,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
 
       params = routeMatch(url.pathname, "/api/projects/:projectId/tasks/:taskId/claim");
       if (req.method === "POST" && params) {
+        requireTrustedApiIdentity(identity);
         const body = await readJson(req);
         requireOperation(body); requireExpectedRevision(body);
         const { context, task } = await contextAndTask(taskStore, params.projectId, params.taskId);
@@ -1405,7 +1457,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
               code: "DELIVERY_ORIGINAL_DEVELOPER_REQUIRED", status: 409
             });
           }
-          const deliveryHistory = await taskStore.taskHistory(params.projectId, params.taskId, { limit: 1000 });
+          const deliveryHistory = await taskStore.taskHistory(params.projectId, params.taskId, { all: true });
           const evidence = deliveryEvidence(deliveryHistory, context.workflow);
           if (!evidence.valid) throw new TaskboardError("缺少有效的最新独立测试PASS，禁止认领交付任务", {
             code: "DELIVERY_INDEPENDENT_PASS_REQUIRED", status: 409
@@ -1452,7 +1504,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
               code: "TEST_IDENTITY_REQUIRED", status: 400
             });
           }
-          const history = await taskStore.taskHistory(params.projectId, params.taskId, { limit: 1000 });
+          const history = await taskStore.taskHistory(params.projectId, params.taskId, { all: true });
           const conflict = history.find((event) => event.actor_type === "developer_ai"
             && event.event_type === "code_change"
             && (event.actor_id === actorId || event.session_id === body.sessionId));
@@ -1500,36 +1552,23 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         requireOperation(body);
         const { context, task, snapshot } = await contextAndTask(taskStore, params.projectId, params.taskId);
         const action = body.action || "comment";
-        if (["authorize_auto_close", "revoke_auto_close"].includes(action)) {
-          requireUserSession(identity);
-          requireExpectedRevision(body);
-          if (body.expectedRevision !== snapshot.registryRevision) throw new TaskboardError("任务表版本已变化，请刷新后重试", { code: "REGISTRY_REVISION_MISMATCH", status: 409 });
-          const eventType = action === "authorize_auto_close" ? "auto_close_authorized" : "auto_close_revoked";
-          const result = await taskStore.appendTaskEvent(params.projectId, params.taskId, {
-            operationId: body.operationId, eventType,
-            ...actorOptions(identity, { ...body, actorType: "user" }),
-            note: body.note || (action === "authorize_auto_close" ? "用户授权该低风险任务在独测/复测通过且无真实交付动作时自动完成" : "用户撤销自动完成授权"),
-            metadata: { ...(body.metadata || {}), reviewAction: action, registryRevision: snapshot.registryRevision }
-          });
-          return send(res, 200, { ...result, autoCloseAuthorization: await taskStore.autoCloseAuthorizationState(params.projectId, params.taskId) });
-        }
         if (action === "comment") {
           return send(res, 200, await taskStore.appendTaskEvent(params.projectId, params.taskId, {
             operationId: body.operationId, eventType: "user_review",
-            ...actorOptions(identity, body), metadata: body.metadata || null
+            ...actorOptions(identity, body), note: body.note || "", metadata: body.metadata || null
           }));
+        }
+        if (["accept", "reject", "hold"].includes(action)) {
+          requireUserSession(identity);
+          if (task.status !== "待用户验收" || task.acceptanceScope !== "user_ui_business") throw new TaskboardError("只有明确标记为user_ui_business且系统技术验收全部通过的任务，才允许用户通过或打回", {
+            code: "USER_ACCEPTANCE_STAGE_REQUIRED", status: 409,
+            details: { status: task.status, acceptanceScope: task.acceptanceScope || "system" }
+          });
         }
         requireExpectedRevision(body);
         let target;
         let eventType;
         if (action === "accept") {
-          if (task.status !== "待用户验收") {
-            return send(res, 200, await taskStore.appendTaskEvent(params.projectId, params.taskId, {
-              operationId: body.operationId, eventType: "user_review",
-              ...actorOptions(identity, { ...body, note: body.note || "认可当前进度（当前阶段不能直接完成）" }),
-              metadata: { ...(body.metadata || {}), reviewAction: "accept_progress_only", currentStatus: task.status }
-            }));
-          }
           target = "已完成";
           eventType = "user_accept";
         } else if (action === "reject") {
@@ -1553,7 +1592,8 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           operationId: body.operationId,
           eventType,
           ...actorOptions(identity, body),
-          metadata: { ...(body.metadata || {}), reviewAction: action, reason: body.reason || null }
+          note: body.note || "",
+          metadata: { ...(body.metadata || {}), acceptanceScope: task.acceptanceScope, reviewAction: action, reason: body.reason || null }
         });
         return send(res, 200, result);
       }
@@ -1754,7 +1794,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         const body = await readJson(req);
         requireOperation(body);
         const { context, task, snapshot } = await contextAndTask(taskStore, params.projectId, params.taskId);
-        const history = await taskStore.taskHistory(params.projectId, params.taskId, { limit: 500 });
+        const history = await taskStore.taskHistory(params.projectId, params.taskId, { all: true });
         if (task.status !== "HOLD") {
           const state = await taskStore.stopState(params.projectId, params.taskId);
           if (!state.stopRequested) throw new TaskboardError("任务当前既非HOLD也无停止请求", { code: "RESUME_NOT_ALLOWED", status: 409 });
@@ -1765,7 +1805,14 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           return send(res, 200, result);
         }
         requireExpectedRevision(body);
-        const target = body.targetStatus || lastResumeTarget(history) || "待开发";
+        const recordedTarget = lastResumeTarget(history) || "待开发";
+        if (identity.mode === "session" && body.targetStatus && body.targetStatus !== recordedTarget) {
+          throw new TaskboardError("用户恢复任务只能回到系统记录的恢复阶段，不能自行指定技术阶段", {
+            code: "RESUME_TARGET_OVERRIDE_FORBIDDEN", status: 403,
+            details: { recordedTarget, requestedTarget: body.targetStatus }
+          });
+        }
+        const target = identity.mode === "session" ? recordedTarget : (body.targetStatus || recordedTarget);
         context.workflow.assertTransition(task.status, target);
         const result = await taskStore.updateTask(params.projectId, params.taskId, { status: target }, {
           expectedRevision: body.expectedRevision || snapshot.registryRevision,

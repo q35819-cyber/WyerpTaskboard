@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wyerp-taskboard.local/schemas/software-project-config-v1.json",
+  "title": "WyerpTaskboard Software Project Configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "project",
+    "git",
+    "technology",
+    "qualityGates",
+    "workflow",
+    "projectRules",
+    "environment"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "root"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "root": { "type": "string", "minLength": 1, "description": "Project root; '.' means the directory containing this file." }
+      }
+    },
+    "git": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["remoteUrl", "defaultBranch", "mergeStrategy"],
+      "properties": {
+        "remoteUrl": { "type": ["string", "null"], "format": "uri" },
+        "defaultBranch": { "type": "string", "minLength": 1 },
+        "mergeStrategy": { "enum": ["merge", "pull_request"] }
+      }
+    },
+    "technology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["language", "runtime", "framework", "packageManager"],
+      "properties": {
+        "language": { "enum": ["nodejs", "python", "dotnet", "java", "go", "rust", "other"] },
+        "runtime": { "type": "string", "minLength": 1 },
+        "framework": { "type": ["string", "null"] },
+        "packageManager": { "type": ["string", "null"] }
+      }
+    },
+    "qualityGates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["build", "test", "lint"],
+      "properties": {
+        "build": { "$ref": "#/$defs/commandOrNull" },
+        "test": { "$ref": "#/$defs/command" },
+        "lint": { "$ref": "#/$defs/commandOrNull" }
+      }
+    },
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["templateId", "templateVersion", "acceptanceScope"],
+      "properties": {
+        "templateId": { "const": "wyerp-software-project-v1" },
+        "templateVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "acceptanceScope": { "enum": ["system", "user_ui_business"], "default": "system" }
+      }
+    },
+    "projectRules": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["preserveExistingDocs", "protectedPaths", "readOnlyPaths", "writePaths"],
+      "properties": {
+        "preserveExistingDocs": { "const": true },
+        "protectedPaths": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "readOnlyPaths": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "writePaths": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requiredTools", "requiredServices", "requiredEnvironmentVariables"],
+      "properties": {
+        "requiredTools": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "requiredServices": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "requiredEnvironmentVariables": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+          "description": "Names only; never store environment variable values or secrets."
+        }
+      }
+    },
+    "extensions": { "type": "object", "additionalProperties": true }
+  },
+  "$defs": {
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executable", "args", "cwd", "timeoutSeconds"],
+      "properties": {
+        "executable": { "type": "string", "minLength": 1 },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "cwd": { "type": "string", "minLength": 1, "default": "." },
+        "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 600 }
+      }
+    },
+    "commandOrNull": {
+      "anyOf": [
+        { "$ref": "#/$defs/command" },
+        { "type": "null" }
+      ]
+    }
+  }
+}

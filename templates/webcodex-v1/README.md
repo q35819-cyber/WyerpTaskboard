@@ -6,6 +6,10 @@
 - TASK_TEMPLATE.md：任务信息与证据
 - DEV_PROMPT.md：开发入口
 - TEST_PROMPT.md：独立测试入口
+- SOFTWARE_PROJECT_CONTRACT.md：跨技术栈项目配置与接入契约
+- software-project-config.schema.json：版本化项目配置 Schema
+- examples/node-project/、examples/python-project/：两种技术栈的可运行接入样例
+- ONBOARDING_REPORT_TEMPLATE.md：接入自检报告模板
 
 ## 当前 WebCodex 工具映射
 | 需要做的事 | 当前工具 | 使用要求 |
@@ -36,3 +40,9 @@
 
 ## 验收前提
 这些是流程模板，不代表现有任务看板已经实现所有门禁。必须先用独立模拟仓库验证状态机和 Git 闭环，再接入看板。
+
+## 通用项目接入契约（P0 最小交付）
+- 项目差异写入 `wyerp-taskboard.project.json`，统一校验 `software-project-config.schema.json`；不得在项目内复制一套状态机或角色提示词。
+- Node.js 与 Python 样例使用同一模板版本、同一验收范围字段和同一质量门禁结构，仅技术栈与测试命令不同。
+- 示例目录中的命令可直接运行；测试会实际执行两种技术栈的示例测试命令。
+- 本目录交付的是可运行模板与接入契约。自动探测、正式 onboarding API/CLI、配置迁移执行器仍由 `WTB-P1-UNIVERSAL-SOFTWARE-WORKFLOW-TEMPLATE-20261031-T1` 实现；不得把契约文档误报为生产自动接入能力。

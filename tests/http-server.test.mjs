@@ -22,13 +22,25 @@ async function startFixture(t, serverOptions = {}) {
   return { fixture, app, port, base, secret };
 }
 
+test("taskboard refuses non-loopback bind hosts", async (t) => {
+  const fixture = await makeFixture();
+  t.after(() => fs.rm(fixture.boardRoot, { recursive: true, force: true }));
+  for (const host of ["0.0.0.0", "::", "192.168.1.20"]) {
+    await assert.rejects(
+      () => createTaskboardServer({ rootDir: fixture.boardRoot, host, port: 0 }),
+      (error) => error.code === "LOOPBACK_BIND_REQUIRED"
+    );
+  }
+});
+
 async function login(base, secret) {
   const response = await fetch(base + "/api/auth/session");
   assert.equal(response.status, 200);
   const body = await response.json();
   assert.equal(body.mode, "session");
-  assert.ok(body.csrfToken);
-  return { cookie: "", csrf: body.csrfToken };
+  assert.equal(body.browserLoginRequired, false);
+  assert.equal(body.csrfToken, undefined);
+  return { cookie: "" };
 }
 
 let preclaimSequence = 0;
@@ -79,7 +91,7 @@ test("local browser access lists projects without a password and rejects bad ori
 
 test("browser user write is not blocked by stale registry revision", async (t) => {
   const { base, secret } = await startFixture(t);
-  const { cookie, csrf } = await login(base, secret);
+  const { cookie } = await login(base, secret);
 
   const opened = await (await fetch(base + "/api/projects/fixture/tasks/B-10", { headers: { Cookie: cookie } })).json();
   const staleRevision = opened.registryRevision;
@@ -100,7 +112,7 @@ test("browser user write is not blocked by stale registry revision", async (t) =
 
   const userChanged = await fetch(base + "/api/projects/fixture/tasks/B-10", {
     method: "PATCH",
-    headers: { Cookie: cookie, Origin: base, "X-CSRF-Token": csrf, "Content-Type": "application/json" },
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
     body: JSON.stringify({
       operationId: "http.user.stale.never.blocked.0001",
       expectedRevision: staleRevision,
@@ -134,7 +146,7 @@ test("browser user write is not blocked by stale registry revision", async (t) =
 });
 test("browser admin can register a local project path and read it immediately", async (t) => {
   const { base, secret, fixture } = await startFixture(t);
-  const { cookie, csrf } = await login(base, secret);
+  const { cookie } = await login(base, secret);
   const extraRoot = path.join(fixture.boardRoot, "extra-project");
   await fs.mkdir(extraRoot, { recursive: true });
   await fs.writeFile(path.join(extraRoot, "待办任务总清单.md"), registryText(), "utf8");
@@ -149,7 +161,7 @@ test("browser admin can register a local project path and read it immediately", 
 
   const added = await fetch(base + "/api/projects", {
     method: "POST",
-    headers: { Cookie: cookie, Origin: base, "X-CSRF-Token": csrf, "Content-Type": "application/json" },
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
     body: JSON.stringify({ root: extraRoot, id: "extra", name: "Extra Project" })
   });
   assert.equal(added.status, 201);
@@ -168,40 +180,61 @@ test("browser admin can register a local project path and read it immediately", 
   assert.equal((await snapshot.json()).tasks.length, 3);
 });
 
-test("browser PATCH requires CSRF and writes through TaskStore", async (t) => {
-  const { base, secret, app } = await startFixture(t);
-  const { cookie, csrf } = await login(base, secret);
+test("browser PATCH requires same-origin but no login or CSRF token", async (t) => {
+  const { base, app } = await startFixture(t);
+  const { cookie } = await login(base);
   const snap = await (await fetch(base + "/api/projects/fixture/tasks", { headers: { Cookie: cookie } })).json();
 
-  const noCsrf = await fetch(base + "/api/projects/fixture/tasks/B-10", {
+  const noToken = await fetch(base + "/api/projects/fixture/tasks/B-10", {
     method: "PATCH",
-    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      patch: { priority: "P1" },
-      expectedRevision: snap.registryRevision,
-      operationId: "api.patch.no.csrf.001",
-    }),
+    headers: { Origin: base, "Content-Type": "application/json" },
+    body: JSON.stringify({ patch: { priority: "P1" }, expectedRevision: snap.registryRevision, operationId: "api.patch.no.token.001", eventType: "priority_change" })
   });
-  assert.equal(noCsrf.status, 403);
+  assert.equal(noToken.status, 200);
+  assert.ok(await app.taskStore.events.findByOperationId("fixture", "api.patch.no.token.001"));
+  const afterNoToken = await (await fetch(base + "/api/projects/fixture/tasks")).json();
+  const sameOriginFetchSite = await fetch(base + "/api/projects/fixture/tasks/B-10", {
+    method: "PATCH",
+    headers: { Origin: base, "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json" },
+    body: JSON.stringify({ patch: { priority: "P2" }, expectedRevision: afterNoToken.registryRevision, operationId: "api.patch.same.origin.fetch.site.001", eventType: "priority_change" })
+  });
+  assert.equal(sameOriginFetchSite.status, 200);
 
-  const good = await fetch(base + "/api/projects/fixture/tasks/B-10", {
+  const browserFieldWrite = await fetch(base + "/api/projects/fixture/tasks/B-10", {
     method: "PATCH",
-    headers: {
-      Cookie: cookie, Origin: base, "Content-Type": "application/json",
-      "X-CSRF-Token": csrf,
-    },
+    headers: { Origin: base, "Content-Type": "application/json" },
     body: JSON.stringify({
-      patch: { priority: "P1" },
-      expectedRevision: snap.registryRevision,
-      operationId: "api.patch.good.001",
-      eventType: "priority_change",
-      note: "api test",
-    }),
+      operationId: "api.patch.user.field.denied",
+      eventType: "task_update",
+      patch: { description: "不允许的字段修改" }
+    })
   });
-  assert.equal(good.status, 200);
-  const result = await good.json();
-  assert.equal(result.after.priority, "P1");
-  assert.ok(await app.taskStore.events.findByOperationId("fixture", "api.patch.good.001"));
+  assert.equal(browserFieldWrite.status, 403);
+  assert.equal((await browserFieldWrite.json()).error.code, "USER_PATCH_SCOPE_REJECTED");
+
+
+  const badOrigin = await fetch(base + "/api/projects/fixture/tasks/B-10", {
+    method: "PATCH",
+    headers: { Origin: "https://evil.invalid", "Content-Type": "application/json" },
+    body: JSON.stringify({ patch: { priority: "P2" }, operationId: "api.patch.bad.origin.001", eventType: "priority_change" })
+  });
+  assert.equal(badOrigin.status, 403);
+  assert.equal((await badOrigin.json()).error.code, "ORIGIN_REJECTED");
+
+  const missingOrigin = await fetch(base + "/api/projects/fixture/tasks/B-10", {
+    method: "PATCH", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ patch: { priority: "P2" }, operationId: "api.patch.missing.origin.001", eventType: "priority_change" })
+  });
+  assert.equal(missingOrigin.status, 403);
+  assert.equal((await missingOrigin.json()).error.code, "ORIGIN_REQUIRED");
+
+  const badFetchSite = await fetch(base + "/api/projects/fixture/tasks/B-10", {
+    method: "PATCH",
+    headers: { Origin: base, "Sec-Fetch-Site": "cross-site", "Content-Type": "application/json" },
+    body: JSON.stringify({ patch: { priority: "P2" }, operationId: "api.patch.cross.site.001", eventType: "priority_change" })
+  });
+  assert.equal(badFetchSite.status, 403);
+  assert.equal((await badFetchSite.json()).error.code, "FETCH_SITE_REJECTED");
 });
 
 test("bearer auth supports local CLI-style read without ERP auth", async (t) => {
@@ -265,24 +298,24 @@ test("static web and workflow metadata are served from independent service", asy
   assert.equal(body.boardColumns.length, 6);
 });
 
-test("session endpoint restores CSRF token for browser refresh", async (t) => {
-  const { base, secret } = await startFixture(t);
-  const { cookie, csrf } = await login(base, secret);
-  const response = await fetch(base + "/api/auth/session", { headers: { Cookie: cookie } });
+test("session endpoint reports anonymous local browser access without issuing a login or CSRF token", async (t) => {
+  const { base } = await startFixture(t);
+  const response = await fetch(base + "/api/auth/session");
   assert.equal(response.status, 200);
   const body = await response.json();
-  assert.equal(body.csrfToken, csrf);
+  assert.equal(body.browserLoginRequired, false);
   assert.equal(body.mode, "session");
+  assert.equal(body.csrfToken, undefined);
 });
 
 test("user review comment is append-only and does not change registry", async (t) => {
   const { base, secret } = await startFixture(t);
-  const { cookie, csrf } = await login(base, secret);
+  const { cookie } = await login(base, secret);
   const before = await (await fetch(base + "/api/projects/fixture/tasks/A-10", { headers: { Cookie: cookie } })).json();
 
   const response = await fetch(base + "/api/projects/fixture/tasks/A-10/review", {
     method: "POST",
-    headers: { Cookie: cookie, Origin: base, "X-CSRF-Token": csrf, "Content-Type": "application/json" },
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
     body: JSON.stringify({ operationId: "review.comment.001", action: "comment", note: "只记录意见" }),
   });
   assert.equal(response.status, 200);
@@ -292,17 +325,17 @@ test("user review comment is append-only and does not change registry", async (t
   assert.equal(after.registryRevision, before.registryRevision);
 
   const history = await (await fetch(base + "/api/projects/fixture/tasks/A-10/history", { headers: { Cookie: cookie } })).json();
-  assert.ok(history.events.some((event) => event.operation_id === "review.comment.001"));
+  assert.ok(history.events.some((event) => event.operation_id === "review.comment.001" && event.note === "只记录意见"), "用户在浏览器提交的审阅意见必须写入事件历史");
 });
 
 test("active stop is cooperative request and resume cancels request without fake HOLD", async (t) => {
   const { base, secret } = await startFixture(t);
-  const { cookie, csrf } = await login(base, secret);
+  const { cookie } = await login(base, secret);
   const task = await (await fetch(base + "/api/projects/fixture/tasks/B-10", { headers: { Cookie: cookie } })).json();
 
   const stop = await fetch(base + "/api/projects/fixture/tasks/B-10/stop", {
     method: "POST",
-    headers: { Cookie: cookie, Origin: base, "X-CSRF-Token": csrf, "Content-Type": "application/json" },
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
     body: JSON.stringify({
       operationId: "stop.request.001",
       expectedRevision: task.registryRevision,
@@ -319,7 +352,7 @@ test("active stop is cooperative request and resume cancels request without fake
 
   const resume = await fetch(base + "/api/projects/fixture/tasks/B-10/resume", {
     method: "POST",
-    headers: { Cookie: cookie, Origin: base, "X-CSRF-Token": csrf, "Content-Type": "application/json" },
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
     body: JSON.stringify({
       operationId: "stop.resume.001",
       expectedRevision: stillRunning.registryRevision,
@@ -509,6 +542,7 @@ test("claim rejects tasks already occupied by another execution and still allows
 test("direct HTTP claim requires a current preclaim report and rejects stale reports", async (t) => {
   const { base, secret } = await startFixture(t);
   const headers = { Authorization: "Bearer " + secret, "Content-Type": "application/json" };
+  const { cookie } = await login(base, secret);
 
   const initial = await (await fetch(base + "/api/projects/fixture/tasks/A-10", { headers })).json();
   const missing = await fetch(base + "/api/projects/fixture/tasks/A-10/claim", {
@@ -530,6 +564,25 @@ test("direct HTTP claim requires a current preclaim report and rejects stale rep
   await recordPreclaim(base, secret, "A-10", {
     actorType: "developer_ai", actorId: "dev-preclaim-http", sessionId: "sess-preclaim-http"
   });
+  const browserClaim = await fetch(base + "/api/projects/fixture/tasks/A-10/claim", {
+    method: "POST",
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operationId: "claim.preclaim.browser-spoof.denied",
+      expectedRevision: initial.registryRevision,
+      actorType: "developer_ai",
+      actorId: "dev-preclaim-http",
+      assignee: "developer",
+      sessionId: "sess-preclaim-http",
+      sessionWindowName: "开发窗口"
+    })
+  });
+  assert.equal(browserClaim.status, 403);
+  assert.equal((await browserClaim.json()).error.code, "TRUSTED_API_IDENTITY_REQUIRED");
+  const afterBrowserClaim = await (await fetch(base + "/api/projects/fixture/tasks/A-10", { headers })).json();
+  assert.equal(afterBrowserClaim.status, "待开发");
+  assert.equal(afterBrowserClaim.assignee, "");
+
   const guard = await (await fetch(
     base + "/api/projects/fixture/tasks/A-10/guard?actorType=developer_ai&actorId=dev-preclaim-http&sessionId=sess-preclaim-http",
     { headers }
@@ -591,12 +644,12 @@ test("direct HTTP claim requires a current preclaim report and rejects stale rep
 
 test("active stop can be acknowledged to HOLD only after stop_request and then resumed", async (t) => {
   const { base, secret } = await startFixture(t);
-  const { cookie, csrf } = await login(base, secret);
+  const { cookie } = await login(base, secret);
   const task = await (await fetch(base + "/api/projects/fixture/tasks/B-10", { headers: { Cookie: cookie } })).json();
 
   const noRequest = await fetch(base + "/api/projects/fixture/tasks/B-10/ack-stop", {
     method: "POST",
-    headers: { Cookie: cookie, Origin: base, "X-CSRF-Token": csrf, "Content-Type": "application/json" },
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
     body: JSON.stringify({ operationId: "stop.ack.none.001", expectedRevision: task.registryRevision })
   });
   assert.equal(noRequest.status, 409);
@@ -604,14 +657,14 @@ test("active stop can be acknowledged to HOLD only after stop_request and then r
 
   const stop = await fetch(base + "/api/projects/fixture/tasks/B-10/stop", {
     method: "POST",
-    headers: { Cookie: cookie, Origin: base, "X-CSRF-Token": csrf, "Content-Type": "application/json" },
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
     body: JSON.stringify({ operationId: "stop.request.ack.001", expectedRevision: task.registryRevision, note: "request" })
   });
   assert.equal(stop.status, 202);
 
   const acknowledged = await fetch(base + "/api/projects/fixture/tasks/B-10/ack-stop", {
     method: "POST",
-    headers: { Cookie: cookie, Origin: base, "X-CSRF-Token": csrf, "Content-Type": "application/json" },
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
     body: JSON.stringify({ operationId: "stop.ack.001", expectedRevision: task.registryRevision, note: "resources released" })
   });
   assert.equal(acknowledged.status, 200);
@@ -622,9 +675,21 @@ test("active stop can be acknowledged to HOLD only after stop_request and then r
   assert.equal(guard.stopRequested, false);
 
   const held = await (await fetch(base + "/api/projects/fixture/tasks/B-10", { headers: { Cookie: cookie } })).json();
+  const resumeOverride = await fetch(base + "/api/projects/fixture/tasks/B-10/resume", {
+    method: "POST",
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operationId: "stop.resume.override.denied.001",
+      expectedRevision: held.registryRevision,
+      targetStatus: "待独测"
+    })
+  });
+  assert.equal(resumeOverride.status, 403);
+  assert.equal((await resumeOverride.json()).error.code, "RESUME_TARGET_OVERRIDE_FORBIDDEN");
+
   const resumed = await fetch(base + "/api/projects/fixture/tasks/B-10/resume", {
     method: "POST",
-    headers: { Cookie: cookie, Origin: base, "X-CSRF-Token": csrf, "Content-Type": "application/json" },
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
     body: JSON.stringify({ operationId: "stop.resume.after.ack.001", expectedRevision: held.registryRevision })
   });
   assert.equal(resumed.status, 200);
@@ -633,12 +698,12 @@ test("active stop can be acknowledged to HOLD only after stop_request and then r
 
 test("user messages are surfaced by guard and must be acknowledged before claim", async (t) => {
   const { base, secret } = await startFixture(t);
-  const { cookie, csrf } = await login(base, secret);
+  const { cookie } = await login(base, secret);
   const task = await (await fetch(base + "/api/projects/fixture/tasks/A-10", { headers: { Cookie: cookie } })).json();
 
   const review = await fetch(base + "/api/projects/fixture/tasks/A-10/review", {
     method: "POST",
-    headers: { Cookie: cookie, Origin: base, "X-CSRF-Token": csrf, "Content-Type": "application/json" },
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
     body: JSON.stringify({
       operationId: "user.message.review.001",
       action: "comment",
@@ -680,6 +745,19 @@ test("user messages are surfaced by guard and must be acknowledged before claim"
   });
   assert.equal(blocked.status, 409);
   assert.equal((await blocked.json()).error.code, "USER_MESSAGE_ACK_REQUIRED");
+
+  const browserAck = await fetch(base + "/api/projects/fixture/tasks/A-10/ack-user-messages", {
+    method: "POST",
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operationId: "user.message.ack.browser-spoof.denied",
+      actorType: "developer_ai",
+      actorId: "dev-1",
+      sessionId: "sess-1"
+    })
+  });
+  assert.equal(browserAck.status, 403);
+  assert.equal((await browserAck.json()).error.code, "TRUSTED_API_IDENTITY_REQUIRED");
 
   const ack = await fetch(base + "/api/projects/fixture/tasks/A-10/ack-user-messages", {
     method: "POST",
@@ -792,10 +870,10 @@ test("task documents expose checkpoint and report only through registered task t
 
 test("AI reply is explicitly linked to the user question", async (t) => {
   const { base, secret } = await startFixture(t);
-  const { cookie, csrf } = await login(base, secret);
+  const { cookie } = await login(base, secret);
   const review = await fetch(base + "/api/projects/fixture/tasks/A-10/review", {
     method: "POST",
-    headers: { Cookie: cookie, Origin: base, "X-CSRF-Token": csrf, "Content-Type": "application/json" },
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
     body: JSON.stringify({
       operationId: "reply.review.001",
       action: "comment",
@@ -805,6 +883,21 @@ test("AI reply is explicitly linked to the user question", async (t) => {
   assert.equal(review.status, 200);
   const reviewBody = await review.json();
   const messageEventId = reviewBody.event.event_id;
+
+  const browserReply = await fetch(base + "/api/projects/fixture/tasks/A-10/reply-user-message", {
+    method: "POST",
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operationId: "reply.browser-spoof.denied",
+      messageEventId,
+      actorType: "developer_ai",
+      actorId: "dev-1",
+      sessionId: "sess-1",
+      note: "伪造AI回复"
+    })
+  });
+  assert.equal(browserReply.status, 403);
+  assert.equal((await browserReply.json()).error.code, "TRUSTED_API_IDENTITY_REQUIRED");
 
   const replied = await fetch(base + "/api/projects/fixture/tasks/A-10/reply-user-message", {
     method: "POST",
@@ -832,41 +925,167 @@ test("AI reply is explicitly linked to the user question", async (t) => {
   assert.equal(detail.userMessages.messages[0].replies[0].inferred, false);
 });
 
-test("user accept is a decision with state change and is not rendered as a normal message", async (t) => {
-  const { base, secret, fixture } = await startFixture(t);
+test("user accept is limited to user_ui_business tasks and is not rendered as a normal message", async (t) => {
+  const { base, secret, fixture, app } = await startFixture(t);
   const rows = [
-    ["U-01","F-U","product","P0","待用户验收","开发AI","—","—","—","—","用户验收夹具","账号登录与权限开发计划.md","cp/B-10.md"],
+    ["U-01","F-U","product","P0","待用户验收","开发AI","—","—","—","—","旧任务用户验收兼容夹具","账号登录与权限开发计划.md","cp/B-10.md"],
+    ["U-SYSTEM","F-U","product","P0","待用户验收","开发AI","—","—","—","—","系统范围禁止用户验收夹具","账号登录与权限开发计划.md","cp/B-10.md"],
     ["B-10","F-022","infrastructure","P0","开发中","开发AI","worker","B-10窗口","wc_sess_test","2026-09-28T11:30:00Z","看板","任务看板与AI协作控制开发计划.md","cp/B-10.md；reports/B-10/report.md"],
     ["T-01","F-TEST","product","P1","待独测","独立测试AI","—","—","—","—","独立测试夹具","测试计划.md","cp/B-10.md"]
   ];
   await fs.writeFile(fixture.registryPath, registryText(rows), "utf8");
-  const { cookie, csrf } = await login(base, secret);
+  await app.taskStore.appendTaskEvent("fixture", "U-SYSTEM", {
+    operationId: "decision.system.scope.created",
+    eventType: "task_created",
+    actorType: "system",
+    actorId: "fixture",
+    metadata: { acceptanceScope: "system" }
+  });
+  const { cookie } = await login(base, secret);
+  const userScopeEvent = await fetch(base + "/api/projects/fixture/tasks/U-SYSTEM/events", {
+    method: "POST",
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operationId: "decision.system.scope.event.denied",
+      eventType: "task_created",
+      metadata: { acceptanceScope: "user_ui_business" }
+    })
+  });
+  assert.equal(userScopeEvent.status, 403);
+  assert.equal((await userScopeEvent.json()).error.code, "TRUSTED_API_IDENTITY_REQUIRED");
+  const systemBefore = await (await fetch(base + "/api/projects/fixture/tasks/U-SYSTEM", { headers: { Cookie: cookie } })).json();
+  const systemAccept = await fetch(base + "/api/projects/fixture/tasks/U-SYSTEM/review", {
+    method: "POST",
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operationId: "decision.system.accept.denied",
+      expectedRevision: systemBefore.registryRevision,
+      action: "accept",
+      note: "系统任务不应由用户验收"
+    })
+  });
+  assert.equal(systemAccept.status, 409);
+  assert.equal((await systemAccept.json()).error.code, "USER_ACCEPTANCE_STAGE_REQUIRED");
+  const systemAfter = await (await fetch(base + "/api/projects/fixture/tasks/U-SYSTEM", { headers: { Cookie: cookie } })).json();
+  assert.equal(systemAfter.status, "待用户验收");
+  assert.equal(systemAfter.acceptanceScope, "system");
+  await assert.rejects(() => app.taskStore.updateTask("fixture", "U-SYSTEM", { status: "已完成" }, {
+    expectedRevision: systemBefore.registryRevision,
+    operationId: "decision.system.store.accept.denied",
+    eventType: "user_accept",
+    actorType: "user",
+    actorId: "local-user",
+    metadata: { acceptanceScope: "user_ui_business" }
+  }), (error) => error.code === "USER_ACCEPTANCE_STAGE_REQUIRED");
+
+  const bearerSpoof = await fetch(base + "/api/projects/fixture/tasks/U-01", {
+    method: "PATCH",
+    headers: { Authorization: "Bearer " + secret, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operationId: "decision.bearer.spoof.user.denied",
+      expectedRevision: systemBefore.registryRevision,
+      eventType: "priority_change",
+      actorType: "user",
+      patch: { priority: "P2" }
+    })
+  });
+  assert.equal(bearerSpoof.status, 403);
+  assert.equal((await bearerSpoof.json()).error.code, "USER_SESSION_REQUIRED");
+
   const before = await (await fetch(base + "/api/projects/fixture/tasks/U-01", { headers: { Cookie: cookie } })).json();
+  const genericAccept = await fetch(base + "/api/projects/fixture/tasks/U-01", {
+    method: "PATCH",
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operationId: "decision.browser.patch.user.accept.denied",
+      expectedRevision: before.registryRevision,
+      eventType: "user_accept",
+      patch: { status: "已完成" }
+    })
+  });
+  assert.equal(genericAccept.status, 409);
+  assert.equal((await genericAccept.json()).error.code, "USER_REVIEW_ROUTE_REQUIRED");
+
+  const genericReject = await fetch(base + "/api/projects/fixture/tasks/U-01", {
+    method: "PATCH",
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operationId: "decision.browser.patch.user.reject.denied",
+      expectedRevision: before.registryRevision,
+      eventType: "task_update",
+      patch: { status: "待确认" }
+    })
+  });
+  assert.equal(genericReject.status, 409);
+  assert.equal((await genericReject.json()).error.code, "USER_REVIEW_ROUTE_REQUIRED");
+
+  const genericStop = await fetch(base + "/api/projects/fixture/tasks/U-01", {
+    method: "PATCH",
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operationId: "decision.browser.patch.stop.request.denied",
+      expectedRevision: before.registryRevision,
+      eventType: "stop_request",
+      patch: { status: "HOLD" }
+    })
+  });
+  assert.equal(genericStop.status, 409);
+  assert.equal((await genericStop.json()).error.code, "STOP_ROUTE_REQUIRED");
 
   const accepted = await fetch(base + "/api/projects/fixture/tasks/U-01/review", {
     method: "POST",
-    headers: { Cookie: cookie, Origin: base, "X-CSRF-Token": csrf, "Content-Type": "application/json" },
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
     body: JSON.stringify({
       operationId: "decision.accept.001",
       expectedRevision: before.registryRevision,
       action: "accept",
-      note: "用户确认通过"
+      note: "用户确认通过",
+      actorId: "forged-actor",
+      sessionId: "forged-session",
+      sessionWindowName: "forged-window"
     })
   });
   assert.equal(accepted.status, 200);
   const acceptedBody = await accepted.json();
   assert.equal(acceptedBody.before.status, "待用户验收");
   assert.equal(acceptedBody.after.status, "已完成");
+  const acceptedEvent = await app.taskStore.events.findByOperationId("fixture", "decision.accept.001");
+  assert.equal(acceptedEvent.actor_type, "user");
+  assert.equal(acceptedEvent.actor_id, "local-user");
+  assert.equal(acceptedEvent.note, "用户确认通过", "用户验收理由必须写入审核事件");
+  assert.equal(acceptedEvent.session_id, "");
+  assert.equal(acceptedEvent.session_window_name, "");
 
   const detail = await (await fetch(base + "/api/projects/fixture/tasks/U-01", { headers: { Cookie: cookie } })).json();
   assert.equal(detail.userMessages.messages.length, 0);
+  assert.equal(detail.acceptanceScope, "user_ui_business");
+
   assert.equal(detail.presentation.latestUserDecision.type, "user_accept");
   assert.equal(detail.presentation.latestUserDecision.oldStatus, "待用户验收");
   assert.equal(detail.presentation.latestUserDecision.newStatus, "已完成");
 });
 
+test("legacy automatic-close authorization API is removed", async (t) => {
+  const { base } = await startFixture(t);
+  const before = await (await fetch(base + "/api/projects/fixture/tasks/B-10")).json();
+  const response = await fetch(base + "/api/projects/fixture/tasks/B-10/review", {
+    method: "POST",
+    headers: { Origin: base, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operationId: "auto.close.authorization.removed.001",
+      expectedRevision: before.registryRevision,
+      action: "authorize_auto_close"
+    })
+  });
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).error.code, "INVALID_REVIEW_ACTION");
+  const detail = await (await fetch(base + "/api/projects/fixture/tasks/B-10")).json();
+  assert.equal(Object.hasOwn(detail, "autoCloseAuthorization"), false);
+});
+
 test("release rejects active execution and handoff atomically clears ownership", async (t) => {
   const { base, secret } = await startFixture(t);
+  const { cookie } = await login(base, secret);
   const headers = { Authorization: `Bearer ${secret}`, "Content-Type": "application/json" };
   const initial = await (await fetch(base + "/api/projects/fixture/tasks/B-10", {
     headers: { Authorization: `Bearer ${secret}` }
@@ -898,6 +1117,22 @@ test("release rejects active execution and handoff atomically clears ownership",
     })
   });
   assert.equal(genericHandoff.status, 409);
+
+  const browserHandoff = await fetch(base + "/api/projects/fixture/tasks/B-10/complete-execution", {
+    method: "POST",
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operationId: "release.handoff.browser-spoof.denied",
+      expectedRevision: initial.registryRevision,
+      actorType: "developer_ai",
+      actorId: "dev",
+      sessionId: "wc_sess_test"
+    })
+  });
+  assert.equal(browserHandoff.status, 403);
+  assert.equal((await browserHandoff.json()).error.code, "TRUSTED_API_IDENTITY_REQUIRED");
+  const afterBrowserHandoff = await (await fetch(base + "/api/projects/fixture/tasks/B-10", { headers })).json();
+  assert.equal(afterBrowserHandoff.status, "开发中");
 
   const handedOff = await fetch(base + "/api/projects/fixture/tasks/B-10/complete-execution", {
     method: "POST", headers,
@@ -941,7 +1176,7 @@ test("release rejects active execution and handoff atomically clears ownership",
 
 test("requirement intake is browser-created, visible in guard, blocks claim, and can be completed by AI", async (t) => {
   const { base, secret } = await startFixture(t);
-  const { cookie, csrf } = await login(base, secret);
+  const { cookie } = await login(base, secret);
 
   const denied = await fetch(base + "/api/projects/fixture/requirements", {
     method:"POST",
@@ -952,7 +1187,7 @@ test("requirement intake is browser-created, visible in guard, blocks claim, and
 
   const created = await fetch(base + "/api/projects/fixture/requirements", {
     method:"POST",
-    headers:{Cookie:cookie,Origin:base,"X-CSRF-Token":csrf,"Content-Type":"application/json"},
+    headers:{Cookie:cookie,Origin:base,"Content-Type":"application/json"},
     body:JSON.stringify({operationId:"req.http.create.001",text:"新增库存预警入口"})
   });
   assert.equal(created.status,201);
@@ -983,6 +1218,18 @@ test("requirement intake is browser-created, visible in guard, blocks claim, and
     body:JSON.stringify({operationId:"req.http.reply.001",actorType:"developer_ai",actorId:"dev",sessionId:"sess",note:"需要确认阈值"})
   });
   assert.equal(aiReply.status,200);
+  const aiReplyBody=await aiReply.json();
+  assert.equal(aiReplyBody.message.actorType,"developer_ai");
+  assert.equal(aiReplyBody.message.actorId,"dev");
+  assert.equal(aiReplyBody.message.sessionId,"sess");
+
+  const bearerUserSpoof=await fetch(base+"/api/projects/fixture/requirements/"+encodeURIComponent(requirement.id)+"/reply",{
+    method:"POST",
+    headers:{Authorization:`Bearer ${secret}`,"Content-Type":"application/json"},
+    body:JSON.stringify({operationId:"req.http.user.spoof.denied",actorType:"user",actorId:"fake-user",note:"伪造用户身份"})
+  });
+  assert.equal(bearerUserSpoof.status,403);
+  assert.equal((await bearerUserSpoof.json()).error.code,"USER_SESSION_REQUIRED");
 
   const waitUser=await fetch(base+"/api/projects/fixture/requirements/"+encodeURIComponent(requirement.id)+"/status",{
     method:"POST",
@@ -993,11 +1240,15 @@ test("requirement intake is browser-created, visible in guard, blocks claim, and
 
   const userReply=await fetch(base+"/api/projects/fixture/requirements/"+encodeURIComponent(requirement.id)+"/reply",{
     method:"POST",
-    headers:{Cookie:cookie,Origin:base,"X-CSRF-Token":csrf,"Content-Type":"application/json"},
-    body:JSON.stringify({operationId:"req.http.user.reply.001",note:"阈值设为20"})
+    headers:{Cookie:cookie,Origin:base,"Content-Type":"application/json"},
+    body:JSON.stringify({operationId:"req.http.user.reply.001",actorId:"fake-user",sessionId:"fake-session",sessionWindowName:"伪造窗口",note:"阈值设为20"})
   });
   assert.equal(userReply.status,200);
-  assert.equal((await userReply.json()).message.actorType,"user");
+  const userReplyBody=await userReply.json();
+  assert.equal(userReplyBody.message.actorType,"user");
+  assert.equal(userReplyBody.message.actorId,"local-user");
+  assert.equal(userReplyBody.message.sessionId,"");
+  assert.equal(userReplyBody.message.sessionWindowName,"");
 
   const done=await fetch(base+"/api/projects/fixture/requirements/"+encodeURIComponent(requirement.id)+"/status",{
     method:"POST",
@@ -1014,50 +1265,30 @@ test("requirement intake is browser-created, visible in guard, blocks claim, and
 });
 
 
-test("user can reject directly from awaiting-test stages without test AI claiming first", async (t) => {
+test("user cannot reject technical test stages before system acceptance completes", async (t) => {
   const { base, secret, fixture } = await startFixture(t);
   const cases = [
-    ["W-D1","待独测","defect","测试失败待修复","开发AI"],
-    ["W-E1","待独测","evidence","待准备","开发AI"],
-    ["W-Q1","待独测","decision","待确认","用户"],
-    ["W-H1","待独测","hold","HOLD",""],
-    ["R-D1","待复测","defect","测试失败待修复","开发AI"],
-    ["R-E1","待复测","evidence","待准备","开发AI"],
-    ["R-Q1","待复测","decision","待确认","用户"],
-    ["R-H1","待复测","hold","HOLD",""]
+    ["W-D1","待独测"], ["W-E1","待独测"], ["W-Q1","待独测"], ["W-H1","待独测"],
+    ["R-D1","待复测"], ["R-E1","待复测"], ["R-Q1","待复测"], ["R-H1","待复测"]
   ];
   const rows = cases.map(([id,status]) => [
     id,"F-WAIT","infrastructure","P0",status,"独立测试AI","—","—","—","—",
-    "等待测试阶段用户直接打回夹具","任务看板与AI协作控制开发计划.md","cp/B-10.md"
+    "系统技术验收阶段用户不得提前打回夹具","任务看板与AI协作控制开发计划.md","cp/B-10.md"
   ]);
   await fs.writeFile(fixture.registryPath, registryText(rows), "utf8");
-  const { cookie, csrf } = await login(base, secret);
-
-  for (const [id, fromStatus, reason, expectedStatus, expectedRole] of cases) {
-    const before = await (await fetch(base + "/api/projects/fixture/tasks/" + id, {
-      headers: { Cookie: cookie }
-    })).json();
-
+  const { cookie } = await login(base, secret);
+  for (const [id,fromStatus] of cases) {
+    const before = await (await fetch(base + "/api/projects/fixture/tasks/" + id, { headers: { Cookie: cookie } })).json();
     const rejected = await fetch(base + "/api/projects/fixture/tasks/" + id + "/review", {
-      method: "POST",
-      headers: { Cookie: cookie, Origin: base, "X-CSRF-Token": csrf, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        operationId: "waiting-test.reject." + id + "." + reason,
-        expectedRevision: before.registryRevision,
-        action: "reject",
-        reason,
-        note: "用户在等待测试阶段直接打回"
-      })
+      method: "POST", headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
+      body: JSON.stringify({ operationId: "waiting-test.reject." + id, expectedRevision: before.registryRevision, action: "reject", reason: "defect", note: "系统技术验收阶段不应由用户承担" })
     });
-    assert.equal(rejected.status, 200, id + " " + reason);
-    const body = await rejected.json();
-    assert.equal(body.before.status, fromStatus);
-    assert.equal(body.after.status, expectedStatus);
-    assert.equal(body.after.plannedRole, expectedRole);
-    assert.ok(body.eventId);
+    assert.equal(rejected.status, 409, id);
+    assert.equal((await rejected.json()).error.code, "USER_ACCEPTANCE_STAGE_REQUIRED");
+    const after = await (await fetch(base + "/api/projects/fixture/tasks/" + id, { headers: { Cookie: cookie } })).json();
+    assert.equal(after.status, fromStatus);
   }
 });
-
 
 test("task-scan status endpoint reports scheduler and candidate summary", async (t) => {
   const { base, secret, fixture } = await startFixture(t);
@@ -1118,7 +1349,7 @@ test("task-scan status endpoint reports scheduler and candidate summary", async 
 
 test("browser admin can auto-adapt an incompatible project without overwriting legacy text", async (t) => {
   const { base, secret, fixture } = await startFixture(t);
-  const { cookie, csrf } = await login(base, secret);
+  const { cookie } = await login(base, secret);
   const legacyRoot = path.join(fixture.boardRoot, "http-legacy-project");
   await fs.mkdir(legacyRoot, { recursive: true });
   const original = "# legacy\n\nkeep me\n";
@@ -1126,7 +1357,7 @@ test("browser admin can auto-adapt an incompatible project without overwriting l
 
   const added = await fetch(base + "/api/projects", {
     method: "POST",
-    headers: { Cookie: cookie, Origin: base, "X-CSRF-Token": csrf, "Content-Type": "application/json" },
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
     body: JSON.stringify({ root: legacyRoot, id: "http-legacy", name: "HTTP Legacy" })
   });
   assert.equal(added.status, 201);
@@ -1135,7 +1366,7 @@ test("browser admin can auto-adapt an incompatible project without overwriting l
 
   const adapted = await fetch(base + "/api/projects/http-legacy/adapt", {
     method: "POST",
-    headers: { Cookie: cookie, Origin: base, "X-CSRF-Token": csrf, "Content-Type": "application/json" },
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
     body: JSON.stringify({ operationId: "project_adapt.http_test" })
   });
   assert.equal(adapted.status, 200);
@@ -1306,13 +1537,12 @@ test("AI execution settings endpoint exposes shared defaults to authenticated bo
 
 test("AI execution settings endpoint rejects invalid values before scheduler apply", async (t) => {
   const { base, secret } = await startFixture(t);
-  const { cookie, csrf } = await login(base, secret);
+  const { cookie } = await login(base, secret);
   const response = await fetch(base + "/api/ai-execution/settings", {
     method: "PUT",
     headers: {
       Cookie: cookie,
       Origin: base,
-      "X-CSRF-Token": csrf,
       "Content-Type": "application/json"
     },
     body: JSON.stringify({ settings: { max_requests_per_chat: 5, context_warning_at: 6 } })
@@ -1370,7 +1600,7 @@ test("Chat Wake MCP action endpoint delegates GPT mutations to the unified MCP e
 
 test("AI execution settings are shared by admin UI and chat wake bridge", async (t) => {
   const { base, secret, fixture } = await startFixture(t);
-  const { cookie, csrf } = await login(base, secret);
+  const { cookie } = await login(base, secret);
 
   const adminResponse = await fetch(base + "/api/ai-execution/settings", {
     headers: { Cookie: cookie }
@@ -1395,7 +1625,6 @@ test("AI execution settings are shared by admin UI and chat wake bridge", async 
     headers: {
       Cookie: cookie,
       Origin: base,
-      "X-CSRF-Token": csrf,
       "Content-Type": "application/json"
     },
     body: JSON.stringify({ settings: { max_requests_per_chat: 5, context_warning_at: 6 } })
@@ -1406,13 +1635,12 @@ test("AI execution settings are shared by admin UI and chat wake bridge", async 
 
 test("AI execution settings can update model policy without rebuilding scheduler", async (t) => {
   const { base, secret } = await startFixture(t);
-  const { cookie, csrf } = await login(base, secret);
+  const { cookie } = await login(base, secret);
   const response = await fetch(base + "/api/ai-execution/settings", {
     method: "PUT",
     headers: {
       Cookie: cookie,
       Origin: base,
-      "X-CSRF-Token": csrf,
       "Content-Type": "application/json"
     },
     body: JSON.stringify({
@@ -1513,6 +1741,7 @@ test("待交付 can only be claimed by the original developer AI from the origin
 
 test("delivery failure endpoint records the blocker and keeps original developer ownership", async (t) => {
   const { base, secret, fixture } = await startFixture(t);
+  const { cookie } = await login(base, secret);
   await fs.writeFile(fixture.registryPath, registryText([
     ["D-FAILURE", "F-DELIVERY", "product", "P0", "交付中", "开发AI", "developer", "交付窗口", "dev-session", "2026-10-31T00:00:00Z", "交付失败恢复", "测试计划.md", "cp/D-FAILURE.md"]
   ]), "utf8");
@@ -1534,6 +1763,22 @@ test("delivery failure endpoint records the blocker and keeps original developer
   });
   await seed("delivery.failure.developer.claim.001", "claim", "developer_ai", "developer", "dev-session", { claimedFromStatus: "待交付" });
   const before = await (await fetch(base + "/api/projects/fixture/tasks/D-FAILURE", { headers })).json();
+  const browserFailure = await fetch(base + "/api/projects/fixture/tasks/D-FAILURE/delivery-attempt-failed", {
+    method: "POST",
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operationId: "delivery.failure.browser-spoof.denied",
+      expectedRevision: before.registryRevision,
+      actorType: "developer_ai",
+      actorId: "developer",
+      sessionId: "dev-session",
+      failureStage: "push",
+      note: "伪造交付失败",
+      nextAction: "继续执行"
+    })
+  });
+  assert.equal(browserFailure.status, 403);
+  assert.equal((await browserFailure.json()).error.code, "TRUSTED_API_IDENTITY_REQUIRED");
   const response = await fetch(base + "/api/projects/fixture/tasks/D-FAILURE/delivery-attempt-failed", {
     method: "POST", headers,
     body: JSON.stringify({
@@ -1553,7 +1798,7 @@ test("delivery failure endpoint records the blocker and keeps original developer
   assert.match(current.presentation.currentProgress, /fetch origin\/main/);
 });
 
-test("independent test pass requires an explicit delivery disposition and validates real actions", async (t) => {
+test("independent test pass derives delivery need from validated real actions", async (t) => {
   const { base, secret, fixture } = await startFixture(t);
   await fs.writeFile(fixture.registryPath, registryText([
     ["D-REQ","F-DELIVERY","product","P0","独测中","独立测试AI","tester","独测窗口","sess-delivery-required","2026-10-01T00:00:00Z","交付判定夹具","测试计划.md","cp/D-REQ.md"]
@@ -1562,89 +1807,104 @@ test("independent test pass requires an explicit delivery disposition and valida
   const postResult = async (extra = {}) => {
     const before = await current();
     return fetch(base + "/api/projects/fixture/tasks/D-REQ/test-result", {
-      method: "POST",
-      headers: { Authorization: "Bearer " + secret, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        operationId: "delivery.required." + crypto.randomUUID(), expectedRevision: before.registryRevision,
+      method: "POST", headers: { Authorization: "Bearer " + secret, "Content-Type": "application/json" },
+      body: JSON.stringify({ operationId: "delivery.required." + crypto.randomUUID(), expectedRevision: before.registryRevision,
         actorType: "test_ai", actorId: "tester", sessionId: "sess-delivery-required",
-        testResult: "pass", reportPath: "reports/D-REQ/pass.md", ...extra
-      })
+        testResult: "pass", reportPath: "reports/D-REQ/pass.md", ...extra })
     });
   };
-  const missing = await postResult();
-  assert.equal(missing.status, 400);
-  assert.equal((await missing.json()).error.code, "DELIVERY_DISPOSITION_REQUIRED");
-  const empty = await postResult({ deliveryDisposition: "required", deliveryActions: [] });
-  assert.equal(empty.status, 400);
-  assert.equal((await empty.json()).error.code, "DELIVERY_ACTION_REQUIRED");
-  const fake = await postResult({ deliveryDisposition: "required", deliveryActions: ["repeat_test"] });
+  const fake = await postResult({ deliveryActions: ["repeat_test"] });
   assert.equal(fake.status, 400);
   assert.equal((await fake.json()).error.code, "INVALID_DELIVERY_ACTION");
-  const accepted = await postResult({ deliveryDisposition: "required", deliveryActions: ["deploy_switch"] });
+  const accepted = await postResult({ deliveryDisposition: "auto_close", deliveryActions: ["deploy_switch"] });
   assert.equal(accepted.status, 200);
   const body = await accepted.json();
-  assert.equal(body.after.status, "待交付");
+  assert.equal(body.after.status, "待交付", "server derives delivery from real actions and ignores caller-selected disposition");
   assert.equal(body.after.plannedRole, "开发AI");
 });
 
-test("independent test pass with no real delivery goes directly to user acceptance", async (t) => {
-  const { base, secret, fixture } = await startFixture(t);
+test("explicit user_ui_business product task pass goes to UI/business user acceptance", async (t) => {
+  const { base, secret, fixture, app } = await startFixture(t);
+  const { cookie } = await login(base, secret);
   await fs.writeFile(fixture.registryPath, registryText([
     ["D-USER","F-DELIVERY","product","P0","独测中","独立测试AI","tester","独测窗口","sess-delivery-user","2026-10-01T00:00:00Z","无交付动作夹具","测试计划.md","cp/D-USER.md"]
   ]), "utf8");
+  await app.taskStore.appendTaskEvent("fixture", "D-USER", {
+    operationId: "delivery.user.scope.created",
+    eventType: "task_created",
+    actorType: "system",
+    actorId: "fixture",
+    metadata: { acceptanceScope: "user_ui_business" }
+  });
   const before = await (await fetch(base + "/api/projects/fixture/tasks/D-USER", { headers: { Authorization: "Bearer " + secret } })).json();
+  const browserTestResult = await fetch(base + "/api/projects/fixture/tasks/D-USER/test-result", {
+    method: "POST",
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operationId: "delivery.user.browser-test-result.denied",
+      expectedRevision: before.registryRevision,
+      actorType: "test_ai",
+      actorId: "tester",
+      sessionId: "sess-delivery-user",
+      testResult: "pass",
+      reportPath: "reports/D-USER/pass.md",
+      deliveryActions: []
+    })
+  });
+  assert.equal(browserTestResult.status, 403);
+  assert.equal((await browserTestResult.json()).error.code, "TRUSTED_API_IDENTITY_REQUIRED");
   const response = await fetch(base + "/api/projects/fixture/tasks/D-USER/test-result", {
     method: "POST", headers: { Authorization: "Bearer " + secret, "Content-Type": "application/json" },
     body: JSON.stringify({
       operationId: "delivery.user.001", expectedRevision: before.registryRevision,
       actorType: "test_ai", actorId: "tester", sessionId: "sess-delivery-user",
-      testResult: "pass", reportPath: "reports/D-USER/pass.md", deliveryDisposition: "user_acceptance", deliveryActions: []
+      testResult: "pass", reportPath: "reports/D-USER/pass.md", deliveryActions: []
     })
   });
   assert.equal(response.status, 200);
   const body = await response.json();
   assert.equal(body.after.status, "待用户验收");
   assert.equal(body.after.plannedRole, "用户");
+  const detail = await (await fetch(base + "/api/projects/fixture/tasks/D-USER", { headers: { Authorization: "Bearer " + secret } })).json();
+  assert.equal(detail.acceptanceScope, "user_ui_business");
 });
 
-test("automatic close requires a browser-user authorization event", async (t) => {
+test("system-scoped infrastructure task auto-closes after independent PASS without user authorization", async (t) => {
   const { base, secret, fixture } = await startFixture(t);
   await fs.writeFile(fixture.registryPath, registryText([
-    ["D-AUTO","F-DELIVERY","product","P0","独测中","独立测试AI","tester","独测窗口","sess-delivery-auto","2026-10-01T00:00:00Z","低风险自动闭环夹具","测试计划.md","cp/D-AUTO.md"]
+    ["D-AUTO","F-DELIVERY","infrastructure","P0","独测中","独立测试AI","tester","独测窗口","sess-delivery-auto","2026-10-01T00:00:00Z","系统自动验收夹具","测试计划.md","cp/D-AUTO.md"]
   ]), "utf8");
-  const getTask = async () => (await (await fetch(base + "/api/projects/fixture/tasks/D-AUTO", { headers: { Authorization: "Bearer " + secret } })).json());
-  let before = await getTask();
-  const denied = await fetch(base + "/api/projects/fixture/tasks/D-AUTO/test-result", {
-    method: "POST", headers: { Authorization: "Bearer " + secret, "Content-Type": "application/json" },
-    body: JSON.stringify({ operationId: "delivery.auto.denied", expectedRevision: before.registryRevision, actorType: "test_ai", actorId: "tester", sessionId: "sess-delivery-auto", testResult: "pass", reportPath: "reports/D-AUTO/pass.md", deliveryDisposition: "auto_close", deliveryActions: [] })
-  });
-  assert.equal(denied.status, 409);
-  assert.equal((await denied.json()).error.code, "AUTO_CLOSE_NOT_AUTHORIZED");
-
-  const { cookie, csrf } = await login(base, secret);
-  before = await getTask();
-  const authorized = await fetch(base + "/api/projects/fixture/tasks/D-AUTO/review", {
-    method: "POST",
-    headers: { Cookie: cookie, Origin: base, "X-CSRF-Token": csrf, "Content-Type": "application/json" },
-    body: JSON.stringify({ operationId: "delivery.auto.authorize", expectedRevision: before.registryRevision, action: "authorize_auto_close", note: "用户明确授权该低风险任务测试通过后自动完成" })
-  });
-  assert.equal(authorized.status, 200);
-  before = await getTask();
-  assert.equal(before.autoCloseAuthorization.authorized, true);
+  const before = await (await fetch(base + "/api/projects/fixture/tasks/D-AUTO", { headers: { Authorization: "Bearer " + secret } })).json();
   const closed = await fetch(base + "/api/projects/fixture/tasks/D-AUTO/test-result", {
     method: "POST", headers: { Authorization: "Bearer " + secret, "Content-Type": "application/json" },
-    body: JSON.stringify({ operationId: "delivery.auto.closed", expectedRevision: before.registryRevision, actorType: "test_ai", actorId: "tester", sessionId: "sess-delivery-auto", testResult: "pass", reportPath: "reports/D-AUTO/pass.md", deliveryDisposition: "auto_close", deliveryActions: [] })
+    body: JSON.stringify({ operationId: "delivery.auto.closed", expectedRevision: before.registryRevision, actorType: "test_ai", actorId: "tester", sessionId: "sess-delivery-auto", testResult: "pass", reportPath: "reports/D-AUTO/pass.md", deliveryActions: [] })
   });
   assert.equal(closed.status, 200);
   const body = await closed.json();
   assert.equal(body.after.status, "已完成");
+  assert.equal(body.after.plannedRole, "");
 });
 
 test("code changes during delivery invalidate prior test evidence and return to retest", async (t) => {
   const { base, secret, fixture } = await startFixture(t);
+  const { cookie } = await login(base, secret);
   await fs.writeFile(fixture.registryPath, registryText([
     ["D-CHANGE","F-DELIVERY","product","P0","交付中","开发AI","developer","交付窗口","sess-delivery-change","2026-10-01T00:00:00Z","交付变更夹具","测试计划.md","cp/D-CHANGE.md"]
   ]), "utf8");
+  const browserChange = await fetch(base + "/api/projects/fixture/tasks/D-CHANGE/events", {
+    method: "POST",
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operationId: "delivery.change.browser-spoof.denied",
+      eventType: "code_change",
+      actorType: "developer_ai",
+      actorId: "developer",
+      sessionId: "sess-delivery-change",
+      metadata: { changedPaths: ["server/a.mjs"] }
+    })
+  });
+  assert.equal(browserChange.status, 403);
+  assert.equal((await browserChange.json()).error.code, "TRUSTED_API_IDENTITY_REQUIRED");
   const response = await fetch(base + "/api/projects/fixture/tasks/D-CHANGE/events", {
     method: "POST", headers: { Authorization: "Bearer " + secret, "Content-Type": "application/json" },
     body: JSON.stringify({ operationId: "delivery.change.code", eventType: "code_change", actorType: "developer_ai", actorId: "developer", sessionId: "sess-delivery-change", metadata: { changedPaths: ["server/a.mjs"] } })
@@ -1659,7 +1919,7 @@ test("code changes during delivery invalidate prior test evidence and return to 
 
 test("project removal is browser-only, blocks active work/resources, and never deletes project files", async (t) => {
   const { base, secret, fixture, app } = await startFixture(t);
-  const { cookie, csrf } = await login(base, secret);
+  const { cookie } = await login(base, secret);
 
   const bearerDenied = await fetch(base + "/api/projects/fixture", {
     method: "DELETE",
@@ -1671,7 +1931,7 @@ test("project removal is browser-only, blocks active work/resources, and never d
 
   const activeDenied = await fetch(base + "/api/projects/fixture", {
     method: "DELETE",
-    headers: { Cookie: cookie, Origin: base, "X-CSRF-Token": csrf, "Content-Type": "application/json" },
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
     body: JSON.stringify({ operationId: "project.remove.active.denied" })
   });
   assert.equal(activeDenied.status, 409);
@@ -1688,7 +1948,7 @@ test("project removal is browser-only, blocks active work/resources, and never d
   await fs.writeFile(safeRegistryPath, safeRegistry, "utf8");
   const addSafe = await fetch(base + "/api/projects", {
     method: "POST",
-    headers: { Cookie: cookie, Origin: base, "X-CSRF-Token": csrf, "Content-Type": "application/json" },
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
     body: JSON.stringify({ root: safeRoot, id: "safe-remove", name: "Safe Remove" })
   });
   assert.equal(addSafe.status, 201);
@@ -1708,7 +1968,7 @@ test("project removal is browser-only, blocks active work/resources, and never d
   });
   const resourceDenied = await fetch(base + "/api/projects/safe-remove", {
     method: "DELETE",
-    headers: { Cookie: cookie, Origin: base, "X-CSRF-Token": csrf, "Content-Type": "application/json" },
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
     body: JSON.stringify({ operationId: "project.remove.resource.denied" })
   });
   assert.equal(resourceDenied.status, 409);
@@ -1725,7 +1985,7 @@ test("project removal is browser-only, blocks active work/resources, and never d
   });
   const removed = await fetch(base + "/api/projects/safe-remove", {
     method: "DELETE",
-    headers: { Cookie: cookie, Origin: base, "X-CSRF-Token": csrf, "Content-Type": "application/json" },
+    headers: { Cookie: cookie, Origin: base, "Content-Type": "application/json" },
     body: JSON.stringify({ operationId: "project.remove.safe.success" })
   });
   assert.equal(removed.status, 200);

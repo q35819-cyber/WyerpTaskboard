@@ -17,7 +17,7 @@ async function git(cwd, ...args) {
   return String(stdout || "").trim();
 }
 
-async function deliveryFixture(t, { merged = true, deliveryActorId = "developer", deliverySessionId = "dev-session" } = {}) {
+async function deliveryFixture(t, { merged = true, deliveryActorId = "developer", deliverySessionId = "dev-session", acceptanceScope = "user_ui_business" } = {}) {
   const fixture = await makeFixture();
   t.after(() => fs.rm(fixture.boardRoot, { recursive: true, force: true }));
   const taskId = "D-DELIVERY";
@@ -57,6 +57,13 @@ async function deliveryFixture(t, { merged = true, deliveryActorId = "developer"
 
   const store = await new TaskStore(fixture.boardRoot).init();
   await store.appendTaskEvent("fixture", taskId, {
+    operationId: "delivery.task.created.0001",
+    eventType: "task_created",
+    actorType: "system",
+    actorId: "fixture",
+    metadata: { acceptanceScope }
+  });
+  await store.appendTaskEvent("fixture", taskId, {
     operationId: "delivery.developer.handoff.0001",
     eventType: "handoff",
     actorType: "developer_ai",
@@ -81,6 +88,7 @@ async function deliveryFixture(t, { merged = true, deliveryActorId = "developer"
     metadata: {
       atomicLifecycle: true,
       testResult: "pass",
+      acceptanceScope,
       deliveryDisposition: "required",
       deliveryActions: ["candidate_merge"],
       commitSha: candidateSha,
@@ -117,7 +125,7 @@ test("delivery completion is restricted to the original developer identity and S
   assert.equal(current.task.sessionId, "replacement-session");
 });
 
-test("delivery closes only after the independently tested candidate is on remote default branch with a bound post-merge PASS report", async (t) => {
+test("delivery reaches user acceptance only after the independently tested candidate is on remote default branch with a bound post-merge PASS report", async (t) => {
   const x = await deliveryFixture(t);
   const result = await x.store.updateTask("fixture", x.taskId, { status: "已完成" }, {
     expectedRevision: x.snapshot.registryRevision,
@@ -130,7 +138,7 @@ test("delivery closes only after the independently tested candidate is on remote
     note: "已合并、推送并完成合并后回归",
     metadata: { postMergeReportPath: x.reportPath, postMergeRegressionResult: "PASS" }
   });
-  assert.equal(result.after.status, "已完成");
+  assert.equal(result.after.status, "待用户验收");
   assert.equal(result.after.assignee, "");
   assert.equal(result.after.sessionId, "");
   assert.equal(result.after.sessionWindowName, "");
@@ -140,6 +148,25 @@ test("delivery closes only after the independently tested candidate is on remote
   assert.equal(event.metadata.mergeCommitSha, x.mergeSha);
   assert.equal(event.metadata.remoteMainSha, x.mergeSha);
   assert.match(event.metadata.postMergeReportSha256, /^[a-f0-9]{64}$/);
+});
+
+test("system-scoped delivery auto-closes after verified merge without user acceptance", async (t) => {
+  const x = await deliveryFixture(t, { acceptanceScope: "system" });
+  const result = await x.store.updateTask("fixture", x.taskId, { status: "已完成" }, {
+    expectedRevision: x.snapshot.registryRevision,
+    operationId: "delivery.complete.system.0001",
+    eventType: "delivery_complete",
+    actorType: "developer_ai",
+    actorId: "developer",
+    sessionWindowName: "开发窗口",
+    sessionId: "dev-session",
+    note: "系统范围任务已合并并完成合并后回归",
+    metadata: { postMergeReportPath: x.reportPath, postMergeRegressionResult: "PASS" }
+  });
+  assert.equal(result.after.status, "已完成");
+  assert.equal(result.after.plannedRole, "");
+  assert.equal(result.after.assignee, "");
+  assert.equal(result.after.sessionId, "");
 });
 
 test("delivery cannot close by a generic status change or before candidate merge", async (t) => {
@@ -201,7 +228,7 @@ test("delivery cannot close by a generic status change or before candidate merge
     sessionId: "dev-session",
     metadata: { postMergeReportPath: unmerged.reportPath, postMergeRegressionResult: "PASS" }
   });
-  assert.equal(retried.after.status, "已完成");
+  assert.equal(retried.after.status, "待用户验收");
   assert.equal(retried.after.assignee, "");
   assert.equal(retried.after.sessionId, "");
 });

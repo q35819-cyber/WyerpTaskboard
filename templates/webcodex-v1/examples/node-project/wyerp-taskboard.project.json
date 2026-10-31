@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "project": {
+    "id": "node-contract-demo",
+    "name": "Node.js Contract Demo",
+    "root": "."
+  },
+  "git": {
+    "remoteUrl": null,
+    "defaultBranch": "main",
+    "mergeStrategy": "merge"
+  },
+  "technology": {
+    "language": "nodejs",
+    "runtime": "node >= 24",
+    "framework": "node:test",
+    "packageManager": "npm"
+  },
+  "qualityGates": {
+    "build": null,
+    "test": {
+      "executable": "node",
+      "args": ["--test", "tests"],
+      "cwd": ".",
+      "timeoutSeconds": 30
+    },
+    "lint": null
+  },
+  "workflow": {
+    "templateId": "wyerp-software-project-v1",
+    "templateVersion": "1.0.0",
+    "acceptanceScope": "system"
+  },
+  "projectRules": {
+    "preserveExistingDocs": true,
+    "protectedPaths": ["README.md"],
+    "readOnlyPaths": ["docs/business"],
+    "writePaths": ["src", "tests"]
+  },
+  "environment": {
+    "requiredTools": ["node >= 24"],
+    "requiredServices": [],
+    "requiredEnvironmentVariables": []
+  }
+}

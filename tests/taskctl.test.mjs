@@ -63,7 +63,7 @@ test("taskctl reads project list and guard through bearer auth", async (t) => {
   assert.equal(guard.stopRequested, false);
 });
 
-test("taskctl create safely appends a structured 16-column task", async (t) => {
+test("taskctl create defaults to system and supports explicit user UI/business scope", async (t) => {
   const { fixture, base } = await startFixture(t);
   const createArgs = [
     "create", "--project", "fixture", "--task", "SAFE-CREATE-001",
@@ -84,6 +84,35 @@ test("taskctl create safely appends a structured 16-column task", async (t) => {
   ])).stdout);
   assert.equal(loaded.id, "SAFE-CREATE-001");
   assert.equal(loaded.writeTargets, "write/SAFE-CREATE-001.js");
+  assert.equal(loaded.acceptanceScope, "system", "unscoped tasks default to system regardless of track");
+
+  const uiArgs = [...createArgs];
+  uiArgs[uiArgs.indexOf("--task") + 1] = "SAFE-CREATE-UI-001";
+  uiArgs.push("--acceptance-scope", "user_ui_business");
+  await taskctl(fixture.boardRoot, base, uiArgs);
+  const uiLoaded = JSON.parse((await taskctl(fixture.boardRoot, base, [
+    "get", "--project", "fixture", "--task", "SAFE-CREATE-UI-001"
+  ])).stdout);
+  assert.equal(uiLoaded.acceptanceScope, "user_ui_business");
+
+  const waitingArgs = [...createArgs];
+  waitingArgs[waitingArgs.indexOf("--task") + 1] = "SAFE-CREATE-WAITING-UI-001";
+  waitingArgs[waitingArgs.indexOf("--status") + 1] = "待用户验收";
+  waitingArgs[waitingArgs.indexOf("--planned-role") + 1] = "用户";
+  waitingArgs.push("--acceptance-scope", "user_ui_business");
+  await assert.rejects(
+    taskctl(fixture.boardRoot, base, waitingArgs),
+    (error) => { assert.match(error.stderr, /新任务不能直接创建为待用户验收/); return true; }
+  );
+
+  const waitingSystemArgs = [...createArgs];
+  waitingSystemArgs[waitingSystemArgs.indexOf("--task") + 1] = "SAFE-CREATE-WAITING-SYSTEM-001";
+  waitingSystemArgs[waitingSystemArgs.indexOf("--status") + 1] = "待用户验收";
+  waitingSystemArgs[waitingSystemArgs.indexOf("--planned-role") + 1] = "用户";
+  await assert.rejects(
+    taskctl(fixture.boardRoot, base, waitingSystemArgs),
+    (error) => { assert.match(error.stderr, /新任务不能直接创建为待用户验收/); return true; }
+  );
 
   const registry = await fs.readFile(fixture.registryPath, "utf8");
   assert.match(registry, /A \\| B/);
@@ -134,6 +163,7 @@ test("taskctl generic event and developer self-test default to developer_ai", as
     "--event-type", "developer_note", "--note", "hello"
   ])).stdout);
   assert.equal(event.event.actor_type, "developer_ai");
+  assert.equal(event.event.note, "hello", "generic task events must preserve the supplied note");
 
   const started = JSON.parse((await taskctl(fixture.boardRoot, base, [
     "test-start", "--project", "fixture", "--task", "B-10", "--note", "self test"
@@ -157,10 +187,16 @@ test("taskctl independent test identity must be explicit", async (t) => {
 
 test("taskctl ack-user infers test_ai during independent test stages", async (t) => {
   const { fixture, base } = await startFixture(t);
-  await taskctl(fixture.boardRoot, base, [
-    "event", "--project", "fixture", "--task", "T-01",
-    "--event-type", "user_review", "--actor-type", "user", "--actor-id", "local-admin", "--note", "独测前请先阅读"
-  ]);
+  const userComment = await fetch(base + "/api/projects/fixture/tasks/T-01/review", {
+    method: "POST",
+    headers: { Origin: base, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operationId: "test.ack-user.browser-comment",
+      action: "comment",
+      note: "独测前请先阅读"
+    })
+  });
+  assert.equal(userComment.status, 200, "user review must originate from a local browser session");
 
   const acknowledged = JSON.parse((await taskctl(fixture.boardRoot, base, [
     "ack-user", "--project", "fixture", "--task", "T-01",
@@ -348,10 +384,17 @@ test("taskctl generic transition cannot enter execution stage without claim iden
 
 test("taskctl reply-user links an AI reply to a specific user message", async (t) => {
   const { fixture, base } = await startFixture(t);
-  const review = JSON.parse((await taskctl(fixture.boardRoot, base, [
-    "review", "--project", "fixture", "--task", "A-10",
-    "--action", "comment", "--note", "请AI回复这个问题"
-  ])).stdout);
+  const browserReview = await fetch(base + "/api/projects/fixture/tasks/A-10/review", {
+    method: "POST",
+    headers: { Origin: base, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operationId: "test.reply-user.browser-comment",
+      action: "comment",
+      note: "请AI回复这个问题"
+    })
+  });
+  assert.equal(browserReview.status, 200, "user message must originate from the browser review route");
+  const review = await browserReview.json();
   const eventId = review.event.event_id;
 
   const reply = JSON.parse((await taskctl(fixture.boardRoot, base, [
@@ -553,7 +596,7 @@ test("independent test failure atomically returns task to developer and releases
   assert.equal(result.after.sessionId, "");
 });
 
-test("independent test pass can explicitly skip empty delivery and move to user acceptance", async (t) => {
+test("independent test pass defaults to system auto-close for an unscoped task", async (t) => {
   const { fixture, base } = await startFixture(t);
   await preclaim(fixture.boardRoot, base, "T-01", { actorType: "test_ai", actorId: "test-ai-pass", sessionId: "sess-test-pass" });
   await taskctl(fixture.boardRoot, base, [
@@ -564,11 +607,10 @@ test("independent test pass can explicitly skip empty delivery and move to user 
   const result = JSON.parse((await taskctl(fixture.boardRoot, base, [
     "test-result", "--project", "fixture", "--task", "T-01",
     "--result", "pass", "--report", "reports/T-01/pass.md", "--note", "独测通过，无真实交付动作",
-    "--delivery-mode", "user_acceptance",
     "--actor-type", "test_ai", "--actor-id", "test-ai-pass", "--session-id", "sess-test-pass"
   ])).stdout);
-  assert.equal(result.after.status, "待用户验收");
-  assert.equal(result.after.plannedRole, "用户");
+  assert.equal(result.after.status, "已完成");
+  assert.equal(result.after.plannedRole, "");
   assert.equal(result.after.assignee, "");
   assert.equal(result.after.sessionId, "");
 });

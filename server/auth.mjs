@@ -15,7 +15,6 @@ export class AuthManager {
     this.rootDir = rootDir;
     this.secretPath = path.join(rootDir, "config", "admin-secret.json");
     this.adminSecret = null;
-    this.localCsrf = randomBytes(32).toString("base64url");
   }
 
   async init() {
@@ -42,9 +41,9 @@ export class AuthManager {
 
   authenticate({ bearer }) {
     if (bearer) {
-      if (this.verifyAdminSecret(bearer)) return { mode: "bearer", actorId: "local-admin-cli", csrf: null };
+      if (this.verifyAdminSecret(bearer)) return { mode: "bearer", actorId: "local-admin-cli" };
       throw new TaskboardError("本机API令牌无效", { code: "UNAUTHORIZED", status: 401 });
     }
-    return { mode: "session", actorId: "local-user", csrf: this.localCsrf, session: null };
+    return { mode: "session", actorId: "local-user", session: null };
   }
 }

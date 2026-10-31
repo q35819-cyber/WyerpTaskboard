@@ -21,8 +21,8 @@ async function startFixture(t) {
     await fs.rm(fixture.boardRoot, { recursive: true, force: true });
   });
   return {
-    fixture, base, secret: auth.adminSecret, cookie, csrf: loginBody.csrfToken,
-    browserHeaders: { Cookie: cookie, Origin: base, "X-CSRF-Token": loginBody.csrfToken, "Content-Type": "application/json" },
+    fixture, base, secret: auth.adminSecret, cookie,
+    browserHeaders: { Origin: base, "Content-Type": "application/json" },
     bearerHeaders: { Authorization: "Bearer " + auth.adminSecret, "Content-Type": "application/json" }
   };
 }

@@ -93,6 +93,10 @@ function currentProgressText(task, events = []) {
       return `交付受阻（${stage} / ${code}）：${reason}。下一步：${next}`;
     }
   }
+  if (task.status === "已完成") {
+    const userAccepted = events.some((event) => event.event_type === "user_accept");
+    return userAccepted ? "用户已确认UI视觉/交互与业务逻辑，任务已完成。" : "系统自动验收与所需交付门禁均已通过，任务已自动完成。";
+  }
   const map = {
     "待确认": "等待需求或规则确认，确认后才能继续。",
     "待准备": "准备条件尚未完全具备，正在等待进入开发/测试所需条件。",
@@ -106,8 +110,8 @@ function currentProgressText(task, events = []) {
     "复测中": "独立测试AI正在复测修复结果。",
     "待交付": "下一步：原开发AI认领任务，把独测PASS绑定的候选SHA合入origin默认分支。",
     "交付中": "下一步：合并候选SHA并推送；在远端默认分支运行回归，写PASS报告后执行taskctl complete --report关闭任务。",
-    "待用户验收": "已完成交付，等待用户最终确认通过或打回。",
-    "已完成": "用户已明确验收，本任务已关闭。",
+    "待用户验收": "系统技术验收已完成；只需检查UI视觉/交互与业务逻辑，然后通过或打回。",
+    "已完成": "系统验收与所需交付门禁均已通过，任务已完成。",
     "阻断": "当前存在阻断条件，必须先解除阻断才能继续。",
     "HOLD": "任务已暂停，恢复前不会继续执行。",
     "已取消": "任务已取消，不再执行。"
@@ -275,7 +279,7 @@ function activeUserAction(events, task) {
   if (required?.note) return cleanHumanText(required.note);
   const fallback = {
     "待确认": "需要你确认需求、范围或业务规则；确认后任务才能继续。",
-    "待用户验收": "需要你检查交付结果，并在看板中选择“通过/认可”或填写意见后打回。",
+    "待用户验收": "系统技术验收已完成；只需检查UI视觉/交互与业务逻辑，然后通过或打回。",
     "HOLD": "当前无需操作；如果你希望继续，请在看板中恢复任务并说明恢复条件。",
     "阻断": "请查看任务详情中的阻断原因；若涉及账号、权限、业务决策或外部条件，请按阻断说明提供对应条件。"
   };
@@ -371,19 +375,18 @@ export class TaskStore {
       context.workflow.validateTrack(task.track);
       context.workflow.validateStatus(task.status);
     }
-    const projectEvents = await this.events.listTaskEvents(projectId, null, { limit: 1000 });
-    const eventMap = new Map();
-    for (const event of projectEvents) {
-      if (!event.task_id) continue;
-      if (!eventMap.has(event.task_id)) eventMap.set(event.task_id, []);
-      eventMap.get(event.task_id).push(event);
-    }
+    const eventMap = await this.events.listProjectTaskEvents(projectId, parsed.tasks.map((task) => task.id), { all: true });
     const tasks = [...parsed.tasks].sort((a, b) =>
-      context.workflow.sortKey(a) - context.workflow.sortKey(b) || a.id.localeCompare(b)
-    ).map((task) => ({
-      ...task,
-      presentation: presentationForTask(task, eventMap.get(task.id) || [], context.project)
-    }));
+      context.workflow.sortKey(a) - context.workflow.sortKey(b) || a.id.localeCompare(b.id)
+    ).map((task) => {
+      const events = eventMap.get(task.id) || [];
+      const acceptanceScope = context.workflow.resolveAcceptanceScope(task, events);
+      return {
+        ...task,
+        acceptanceScope,
+        presentation: { ...presentationForTask(task, events, context.project), acceptanceScope }
+      };
+    });
     return {
       projectId,
       projectName: context.project.name,
@@ -454,13 +457,28 @@ export class TaskStore {
       const currentTask = parsed.tasks.find((item) => item.id === taskId);
       if (!currentTask) throw new TaskboardError("未知任务ID: " + taskId, { code: "TASK_NOT_FOUND", status: 404 });
       let effectiveMetadata = metadata;
+      let effectivePatchInput = patch;
+      if (["user_accept", "user_reject"].includes(eventType)) {
+        const history = await this.events.listTaskEvents(projectId, taskId, { all: true });
+        const acceptanceScope = context.workflow.resolveAcceptanceScope(currentTask, history);
+        if (actorType !== "user" || currentTask.status !== "待用户验收" || acceptanceScope !== "user_ui_business") {
+          throw new TaskboardError("只有处于待用户验收阶段的user_ui_business任务，才能由用户会话作出验收决定", {
+            code: "USER_ACCEPTANCE_STAGE_REQUIRED", status: 409,
+            details: { status: currentTask.status, acceptanceScope, actorType }
+          });
+        }
+        effectiveMetadata = { ...(effectiveMetadata || {}), acceptanceScope };
+      }
       if (eventType === "delivery_complete") {
-        const history = await this.events.listTaskEvents(projectId, taskId, { limit: 1000 });
+        const history = await this.events.listTaskEvents(projectId, taskId, { all: true });
+        const acceptanceScope = context.workflow.resolveAcceptanceScope(currentTask, history);
         effectiveMetadata = await verifyDeliveryCompletion(context, currentTask, history, patch, {
           actorType, actorId, sessionId, metadata
         });
+        effectiveMetadata = { ...(effectiveMetadata || {}), acceptanceScope };
+        effectivePatchInput = { ...patch, status: acceptanceScope === "user_ui_business" ? "待用户验收" : "已完成" };
       }
-      const effectivePatch = context.workflow.normalizeTaskPatch(currentTask, patch, {
+      const effectivePatch = context.workflow.normalizeTaskPatch(currentTask, effectivePatchInput, {
         eventType, actorType, actorId, sessionId, metadata: effectiveMetadata
       });
       if (parsed.indexes.updatedAt >= 0 && !("updatedAt" in effectivePatch)) {
@@ -572,6 +590,9 @@ export class TaskStore {
       context.workflow.validatePriority(taskInput.priority);
       context.workflow.validateTrack(taskInput.track || context.project.defaultTrack || "product");
       context.workflow.validateStatus(taskInput.status);
+      if (taskInput.status === "待用户验收") throw new TaskboardError("新任务不能直接创建为待用户验收；必须先经过独立测试PASS或受控交付完成", {
+        code: "TASK_CREATE_USER_ACCEPTANCE_FORBIDDEN", status: 409,
+      });
       if (context.workflow.isExecutionStatus(taskInput.status)) throw new TaskboardError("新任务不能直接创建为执行中阶段；请先创建待执行状态，再通过正式claim进入执行态", {
         code: "TASK_CREATE_EXECUTION_STATUS_FORBIDDEN", status: 409, details: { status: taskInput.status },
       });
@@ -587,6 +608,13 @@ export class TaskStore {
         code: "TASK_CREATE_OWNER_FORBIDDEN", status: 409,
       });
       const task = { ...taskInput, plannedRole: expectedRole, assignee: "", sessionWindowName: "", sessionId: "", updatedAt: taskInput.updatedAt || new Date().toISOString() };
+      const creationMetadata = { ...(metadata && typeof metadata === "object" ? metadata : {}) };
+      const requestedAcceptanceScope = creationMetadata.acceptanceScope || taskInput.acceptanceScope || "system";
+      const acceptanceScope = context.workflow.resolveAcceptanceScope(task, [{
+        event_type: "task_created",
+        metadata: { ...creationMetadata, acceptanceScope: requestedAcceptanceScope }
+      }]);
+      const eventMetadata = { ...creationMetadata, acceptanceScope };
       const change = context.adapter.appendRegistryTaskText(fileText, context.project, task);
       const timestamp = new Date().toISOString();
       const event = {
@@ -596,7 +624,7 @@ export class TaskStore {
         old_status: null, new_status: change.task.status,
         old_priority: null, new_priority: change.task.priority,
         old_track: null, new_track: change.task.track,
-        note, metadata,
+        note, metadata: eventMetadata,
         registry_revision_before: change.beforeRevision, registry_revision_after: change.afterRevision,
       };
       const prepared = await this.transactions.prepare({
@@ -683,23 +711,14 @@ export class TaskStore {
       : withProjectLock(this.rootDir, projectId, operationId, append);
   }
 
-  async taskHistory(projectId, taskId, { limit = 200 } = {}) {
+  async taskHistory(projectId, taskId, { limit = 200, all = false } = {}) {
     await this.getTask(projectId, taskId);
-    return this.events.listTaskEvents(projectId, taskId, { limit });
+    return this.events.listTaskEvents(projectId, taskId, { limit, all });
   }
 
 
-  async autoCloseAuthorizationState(projectId, taskId) {
-    const events = await this.taskHistory(projectId, taskId, { limit: 1000 });
-    for (let i = events.length - 1; i >= 0; i--) {
-      const event = events[i];
-      if (event.event_type === "auto_close_authorized") return { authorized: true, eventId: event.event_id, timestamp: event.timestamp, note: event.note || "" };
-      if (event.event_type === "auto_close_revoked") return { authorized: false, eventId: event.event_id, timestamp: event.timestamp, note: event.note || "" };
-    }
-    return { authorized: false, eventId: null, timestamp: null, note: "" };
-  }
   async testResourceState(projectId, taskId) {
-    const events = await this.taskHistory(projectId, taskId, { limit: 1000 });
+    const events = await this.taskHistory(projectId, taskId, { all: true });
     const resources = new Map();
     for (const event of events) {
       const metadata = event.metadata || {};
@@ -770,7 +789,7 @@ export class TaskStore {
   }
 
   async userMessageState(projectId, taskId, actor = {}) {
-    const events = await this.taskHistory(projectId, taskId, { limit: 500 });
+    const events = await this.taskHistory(projectId, taskId, { all: true });
     const messages = events.filter(isUserMessage);
     const scope = messageScope(actor);
     const acknowledged = new Set();
@@ -821,7 +840,7 @@ export class TaskStore {
     if (!actorId || !sessionId) {
       return { valid: false, reason: "identity_missing", eventId: null, timestamp: null };
     }
-    const events = await this.events.listTaskEvents(projectId, taskId, { limit: 1000 });
+    const events = await this.events.listTaskEvents(projectId, taskId, { all: true });
     let latest = null;
     for (let i = events.length - 1; i >= 0; i--) {
       const event = events[i];
@@ -858,7 +877,7 @@ export class TaskStore {
 
   async presentation(projectId, taskId) {
     const { task } = await this.getTask(projectId, taskId);
-    const events = await this.taskHistory(projectId, taskId, { limit: 500 });
+    const events = await this.taskHistory(projectId, taskId, { all: true });
     return presentationForTask(task, events, this.projects.get(projectId));
   }
 
@@ -915,7 +934,7 @@ export class TaskStore {
   }
 
   async stopState(projectId, taskId) {
-    const events = await this.taskHistory(projectId, taskId, { limit: 500 });
+    const events = await this.taskHistory(projectId, taskId, { all: true });
     let pending = null;
     for (const event of events) {
       if (event.event_type === "stop_request") pending = event;
@@ -924,7 +943,7 @@ export class TaskStore {
     return { stopRequested: Boolean(pending), request: pending };
   }
   async takeoverState(projectId, taskId) {
-    const events = await this.taskHistory(projectId, taskId, { limit: 500 });
+    const events = await this.taskHistory(projectId, taskId, { all: true });
     let suspected = null;
     let allowed = null;
     for (const event of events) {

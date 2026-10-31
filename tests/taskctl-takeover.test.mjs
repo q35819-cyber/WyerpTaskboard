@@ -61,7 +61,6 @@ test("taskctl takeover only succeeds after browser user authorization", async (t
     headers: {
       Cookie: cookie,
       Origin: base,
-      "X-CSRF-Token": loginBody.csrfToken,
       "Content-Type": "application/json"
     },
     body: JSON.stringify({

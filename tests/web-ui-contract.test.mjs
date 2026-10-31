@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-const root = "D:\\WyerpTaskboard";
+const root = path.resolve(import.meta.dirname, "..");
 
 test("web UI merges developer pending and claimable states into one board column", async () => {
   const index = await fs.readFile(path.join(root, "web", "index.html"), "utf8");
@@ -30,9 +30,9 @@ test("web UI persists the selected project so refresh does not silently switch a
 
 test("web UI keeps direct progress columns, paginates three cards per column and exposes plan reader", async () => {
   const [html, app, css] = await Promise.all([
-    fs.readFile(root + "\\web\\index.html", "utf8"),
-    fs.readFile(root + "\\web\\app.js", "utf8"),
-    fs.readFile(root + "\\web\\styles.css", "utf8")
+    fs.readFile(path.join(root, "web", "index.html"), "utf8"),
+    fs.readFile(path.join(root, "web", "app.js"), "utf8"),
+    fs.readFile(path.join(root, "web", "styles.css"), "utf8")
   ]);
   assert.match(html, /id="planFilter"/);
   assert.match(html, /id="addRequirementBtn"/);
@@ -80,22 +80,20 @@ test("web UI keeps direct progress columns, paginates three cards per column and
   assert.doesNotMatch(app, /className="plan-group"/);
 });
 
-test("task detail exposes explicit low-risk auto-close authorization without merging delivery and user acceptance semantics", async () => {
+test("user-facing acceptance is limited to UI and business logic after system gates", async () => {
   const [html, app] = await Promise.all([
-    fs.readFile(root + "\\web\\index.html", "utf8"),
-    fs.readFile(root + "\\web\\app.js", "utf8")
+    fs.readFile(path.join(root, "web", "index.html"), "utf8"),
+    fs.readFile(path.join(root, "web", "app.js"), "utf8")
   ]);
-  assert.match(html, /id="autoCloseAuthorizationStatus"/);
-  assert.match(html, /id="authorizeAutoCloseBtn"/);
-  assert.match(html, /id="revokeAutoCloseBtn"/);
-  assert.match(app, /authorize_auto_close/);
-  assert.match(app, /revoke_auto_close/);
-  assert.match(app, /autoCloseAuthorization\?\.authorized/);
-  assert.match(app, /待交付 \/ 待用户/);
+  assert.match(html, /用户验收/);
+  assert.match(html, /技术验收、编译、测试、权限、Git交付和回归均由系统自动执行/);
+  assert.match(html, /id="userAcceptanceActions"/);
+  assert.doesNotMatch(html, /autoCloseAuthorizationStatus|authorizeAutoCloseBtn|revokeAutoCloseBtn/);
+  assert.ok(app.includes('els.userAcceptanceActions.hidden=data.status!=="待用户验收"||data.acceptanceScope!=="user_ui_business";'));
+  assert.doesNotMatch(app, /authorize_auto_close|revoke_auto_close/);
 });
-
 test("user-facing static labels do not retain known English placeholders", async () => {
-  const html = await fs.readFile(root + "\\web\\index.html", "utf8");
+  const html = await fs.readFile(path.join(root, "web", "index.html"), "utf8");
   for (const forbidden of [
     "WYERP TASKBOARD",
     "INDEPENDENT PROJECT GOVERNANCE",
@@ -129,8 +127,8 @@ test("AI replies display the actual developer/test role and preserve a historica
 });
 test("task cards stamp the latest replied user message as visibly replied", async () => {
   const [app, css] = await Promise.all([
-    fs.readFile(root + "\\web\\app.js", "utf8"),
-    fs.readFile(root + "\\web\\styles.css", "utf8")
+    fs.readFile(path.join(root, "web", "app.js"), "utf8"),
+    fs.readFile(path.join(root, "web", "styles.css"), "utf8")
   ]);
   assert.match(app, /latestUserMessage\?\.replied/);
   assert.match(app, /className="reply-stamp"/);
@@ -166,7 +164,7 @@ test("taskboard opens directly without a password login page", async () => {
   assert.doesNotMatch(html, /loginView|loginForm|adminSecret|logoutBtn/);
   assert.match(html, /<main id="appView">/);
   assert.doesNotMatch(app, /showLogin|loginForm|adminSecret|logoutBtn/);
-  assert.match(app, /await restoreSession\(\)/);
+  assert.doesNotMatch(app, /restoreSession|csrfToken|X-CSRF-Token/);
 });
 
 test("web UI displays runtime version from health endpoint", async () => {

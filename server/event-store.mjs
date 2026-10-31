@@ -114,7 +114,7 @@ export class EventStore {
     return { event: normalized, duplicate: false, segment };
   }
 
-  async listTaskEvents(projectId, taskId, { limit = 200 } = {}) {
+  async listTaskEvents(projectId, taskId, { limit = 200, all = false } = {}) {
     const dir = await this.projectDir(projectId);
     const files = (await fs.readdir(dir)).filter((n) => n.endsWith(".jsonl")).sort();
     const events = [];
@@ -131,8 +131,39 @@ export class EventStore {
       }
     }
     events.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
-    return events.slice(-Math.max(1, Math.min(1000, Number(limit) || 200)));
+    return all ? events : events.slice(-Math.max(1, Math.min(1000, Number(limit) || 200)));
   }
+
+  async listProjectTaskEvents(projectId, taskIds, { limit = 1000, all = false } = {}) {
+    const dir = await this.projectDir(projectId);
+    const wanted = Array.isArray(taskIds) ? new Set(taskIds) : null;
+    const eventsByTask = new Map();
+    const files = (await fs.readdir(dir)).filter((name) => name.endsWith(".jsonl")).sort();
+    for (const name of files) {
+      const lines = (await fs.readFile(path.join(dir, name), "utf8")).split(/\r?\n/).filter(Boolean);
+      for (const line of lines) {
+        let event;
+        try { event = JSON.parse(line); }
+        catch (error) {
+          await (await this.logger()).error("event-store", "event_json_invalid", error, {
+            project_id: projectId, segment: name, task_id: null
+          });
+          continue;
+        }
+        const taskId = String(event.task_id || "");
+        if (!taskId || (wanted && !wanted.has(taskId))) continue;
+        if (!eventsByTask.has(taskId)) eventsByTask.set(taskId, []);
+        eventsByTask.get(taskId).push(event);
+      }
+    }
+    const boundedLimit = Math.max(1, Math.min(1000, Number(limit) || 1000));
+    for (const [taskId, events] of eventsByTask) {
+      events.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+      if (!all && events.length > boundedLimit) eventsByTask.set(taskId, events.slice(-boundedLimit));
+    }
+    return eventsByTask;
+  }
+
   async verifyProject(projectId) {
     const dir = await this.projectDir(projectId);
     const files = (await fs.readdir(dir)).filter((n) => n.endsWith(".jsonl")).sort();

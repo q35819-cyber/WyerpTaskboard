@@ -5,7 +5,7 @@ const PAGE_SIZE=3;
 const USER_MESSAGE_PAGE_SIZE=3;
 const DELIVERY_USER_COLUMN_LABEL="待交付 / 待用户";
 const state={
-  csrfToken:null,projects:[],projectId:null,workflow:null,snapshot:null,filtered:[],requirements:[],scanStatus:null,projectServiceStatus:null,
+  projects:[],projectId:null,workflow:null,snapshot:null,filtered:[],requirements:[],scanStatus:null,projectServiceStatus:null,
   selectedTask:null,selectedTaskProjectId:null,projectEpoch:0,projectLoadEpoch:0,projectsLoadEpoch:0,detailEpoch:0,planEpoch:0,view:"board",columnPages:{},userMessages:[],userMessagePage:1
 };
 const $=id=>document.getElementById(id);
@@ -17,8 +17,8 @@ const els=Object.fromEntries([
   "planDialog","planDialogTitle","planDialogPath","planNavigator","planLocationStatus","planIndexList","planDocumentContent","closePlanDialogBtn",
   "taskDialog","closeDialogBtn","detailTaskId","detailTitle","userMessagePanel","userMessageCount","userMessageList",
   "taskPlanList","responsibilityText","currentProgressText","userAssistanceText","traceabilityText","readDependenciesText","writeTargetsText","relatedArtifactsText","detailMeta",
-  "sessionInfo","testResourceSummary","testResourceList","prioritySelect","savePriorityBtn","stopBtn","resumeBtn","suspectDisconnectBtn","allowTakeoverBtn","autoCloseAuthorizationStatus","authorizeAutoCloseBtn","revokeAutoCloseBtn",
-  "revokeTakeoverBtn","reviewNote","commentBtn","acceptBtn","rejectReason","rejectBtn","reloadHistoryBtn","historyList"
+  "sessionInfo","testResourceSummary","testResourceList","prioritySelect","savePriorityBtn","stopBtn","resumeBtn","suspectDisconnectBtn","allowTakeoverBtn",
+  "revokeTakeoverBtn","reviewNote","commentBtn","userAcceptanceActions","acceptBtn","rejectReason","rejectBtn","reloadHistoryBtn","historyList"
 ].map(id=>[id,$(id)]));
 
 const TRACK_LABELS={product:"产品业务",infrastructure:"基础设施"};
@@ -45,14 +45,11 @@ async function api(url,options={}){
   if(options.body&&typeof options.body!=="string"){
     opts.headers["Content-Type"]="application/json";opts.body=JSON.stringify(options.body);
   }
-  const method=(opts.method||"GET").toUpperCase();
-  if(!["GET","HEAD"].includes(method)&&state.csrfToken)opts.headers["X-CSRF-Token"]=state.csrfToken;
   const res=await fetch(url,opts);let data=null;try{data=await res.json()}catch{}
   if(!res.ok){const err=new Error(data?.error?.message||("请求失败（"+res.status+"）"));err.code=data?.error?.code;err.status=res.status;err.details=data?.error?.details||null;throw err}
   return data;
 }
 async function loadAppVersion(){try{const data=await api("/healthz");if(els.appVersion)els.appVersion.textContent="v"+(data.version||"—");state.appVersion=data.version||null;return data.version||null}catch{if(els.appVersion)els.appVersion.textContent="v?";return null}}
-async function restoreSession(){try{const session=await api("/api/auth/session");state.csrfToken=session.csrfToken;return true}catch{return false}}
 function formatTime(value){if(!value)return"—";const d=new Date(value);return Number.isNaN(d.getTime())?value:d.toLocaleString()}
 function trackLabel(value){return TRACK_LABELS[value]||"其它类别"}
 function priorityLabel(value){return PRIORITY_LABELS[value]||value||"—"}
@@ -267,11 +264,6 @@ async function startOrRestartProjectService(){
     }
     await loadAppVersion();
     if(!sameProject(projectId,epoch))return;
-    state.csrfToken=null;
-    if(!await restoreSession()){
-      toast("项目服务已重启，但本机访问令牌刷新失败，请刷新页面",true);
-      return;
-    }
     if(!sameProject(projectId,epoch))return;
     state.projectServiceStatus={supported:true,state:"running",port:47831};
     renderProjectServiceStatus();
@@ -642,10 +634,7 @@ async function openTask(taskId){
     renderTestResources(data.testResources);
     state.userMessages=data.userMessages?.messages||[];
     state.userMessagePage=1;
-    const autoCloseAuthorized=Boolean(data.autoCloseAuthorization?.authorized);
-    els.autoCloseAuthorizationStatus.textContent=autoCloseAuthorized?"已授权：该低风险任务若独测/复测通过且没有真实交付动作，可直接完成":"未授权：测试通过且无真实交付动作时仍进入待用户验收";
-    els.authorizeAutoCloseBtn.disabled=autoCloseAuthorized||["已完成","已取消"].includes(data.status);
-    els.revokeAutoCloseBtn.disabled=!autoCloseAuthorized||["已完成","已取消"].includes(data.status);
+    els.userAcceptanceActions.hidden=data.status!=="待用户验收"||data.acceptanceScope!=="user_ui_business";
     renderUserMessages();
     const meta=[
       ["状态",statusLabel(data.status)],["优先级",priorityLabel(data.priority)],["任务类别",trackLabel(data.track)],
@@ -838,8 +827,6 @@ els.allowTakeoverBtn.addEventListener("click",()=>{
   mutateTask("/takeover/allow",{operationId:opId("takeover_allowed"),note},"已允许异常接管；等待新执行助手显式接管");
 });
 els.revokeTakeoverBtn.addEventListener("click",()=>mutateTask("/takeover/revoke",{operationId:opId("takeover_revoked"),note:els.reviewNote.value.trim()||"用户撤销异常接管授权"},"异常接管授权已撤销"));
-els.authorizeAutoCloseBtn.addEventListener("click",()=>mutateTask("/review",{operationId:opId("authorize_auto_close"),expectedRevision:state.selectedTask.registryRevision,action:"authorize_auto_close",note:els.reviewNote.value.trim()||"用户授权该低风险任务在独测/复测通过且无真实交付动作时自动完成"},"已授权该任务满足条件时自动完成"));
-els.revokeAutoCloseBtn.addEventListener("click",()=>mutateTask("/review",{operationId:opId("revoke_auto_close"),expectedRevision:state.selectedTask.registryRevision,action:"revoke_auto_close",note:els.reviewNote.value.trim()||"用户撤销该任务自动完成授权"},"自动完成授权已撤销"));
 els.savePriorityBtn.addEventListener("click",async()=>{
   const scope=selectedTaskScope();
   if(!scope){toast("项目或任务已切换，请重新打开正确的任务",true);return;}
@@ -858,5 +845,5 @@ els.rejectBtn.addEventListener("click",()=>mutateTask("/review",{operationId:opI
 els.stopBtn.addEventListener("click",()=>mutateTask("/stop",{operationId:opId("stop"),expectedRevision:state.selectedTask.registryRevision,note:els.reviewNote.value||"用户从任务看板请求停止"},"停止请求已登记"));
 els.resumeBtn.addEventListener("click",()=>mutateTask("/resume",{operationId:opId("resume"),expectedRevision:state.selectedTask.registryRevision,note:els.reviewNote.value||"用户从任务看板恢复任务"},"任务已恢复或停止请求已取消"));
 
-(async()=>{await loadAppVersion();if(!await restoreSession()){toast("本机访问初始化失败，请检查任务看板服务",true);return}await refreshAll()})();
+(async()=>{await loadAppVersion();await refreshAll()})();
 setInterval(()=>{if(!document.hidden&&!els.taskDialog.open&&!els.planDialog.open&&!els.requirementDialog.open)refreshAll()},5000);

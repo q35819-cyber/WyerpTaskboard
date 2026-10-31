@@ -145,7 +145,7 @@ try {
       usage: [
         "taskctl projects",
         "taskctl list [--project wyerp-taskboard]",
-        "taskctl create --project PROJECT --task TASK-ID --parent TEXT --track product[/subtrack]|bugfix|infrastructure --priority P0 --status 待开发 --planned-role 开发AI --boundary TEXT --plan PATH --traceability TEXT --read-dependencies TEXT --write-targets TEXT --targets TEXT",
+        "taskctl create --project PROJECT --task TASK-ID --parent TEXT --track product[/subtrack]|bugfix|infrastructure --priority P0 --status 待开发 --planned-role 开发AI --boundary TEXT --plan PATH --traceability TEXT --read-dependencies TEXT --write-targets TEXT --targets TEXT [--acceptance-scope system|user_ui_business]",
         "taskctl get --project PROJECT --task WTB-TEST-001",
         "taskctl guard --project PROJECT --task WTB-TEST-001 [--actor-id ID --session-id ID]",
         "taskctl preclaim-report --project PROJECT --task WTB-TEST-001 --actor-id ID --session-id ID --note TEXT [--actor-type developer_ai|test_ai]",
@@ -165,7 +165,7 @@ try {
         "taskctl delivery-failed --project PROJECT --task WTB-TEST-001 --actor-id ID --session-id ID --failure-stage merge|push|remote_sync|regression|report|verification --failure-code CODE --note REASON --next-action ACTION",
         "taskctl changed --project PROJECT --task WTB-TEST-001 --kind code|doc --paths a,b --note TEXT [--invalidates-test true]",
         "taskctl test-start --project PROJECT --task WTB-TEST-001 --note TEXT [--report path] [--actor-type test_ai --actor-id ID --session-id ID]",
-        "taskctl test-result --project PROJECT --task WTB-TEST-001 --result pass|fail|blocked --report path --note TEXT [--delivery-mode required|user_acceptance|auto_close] [--delivery-actions candidate_merge,...] [--commit-sha SHA --branch feature/name when candidate_merge] [--actor-type test_ai --actor-id ID --session-id ID]",
+        "taskctl test-result --project PROJECT --task WTB-TEST-001 --result pass|fail|blocked --report path --note TEXT [--delivery-actions candidate_merge,...] [--commit-sha SHA --branch feature/name when candidate_merge] [--actor-type test_ai --actor-id ID --session-id ID]",
         "taskctl stop --project PROJECT --task WTB-TEST-001 --note TEXT",
         "taskctl suspect-disconnect --project PROJECT --task WTB-TEST-001 --note EVIDENCE",
         "taskctl takeover --project PROJECT --task WTB-TEST-001 --assignee NAME --session-name NAME --session-id ID --note TEXT [--user-quote '用户当前明确要求接管的原话' --user-scope task|project --actor-id ID] [--evidence '可选：原Session/Job/资源核验记录']",
@@ -187,6 +187,8 @@ try {
   } else if (command === "create") {
     const project = explicitProject(args);
     const snapshot = await request("/api/projects/" + encodeURIComponent(project) + "/tasks");
+    const acceptanceScope = args["acceptance-scope"] ? String(args["acceptance-scope"]).trim() : "";
+    if (acceptanceScope && !["system", "user_ui_business"].includes(acceptanceScope)) throw new Error("--acceptance-scope must be system or user_ui_business");
     const task = {
       id: required(args, "task"),
       parent: required(args, "parent"),
@@ -208,7 +210,7 @@ try {
         expectedRevision: snapshot.registryRevision,
         task,
         ...actor(args, args["actor-type"] || "developer_ai"),
-        metadata: metadata(args)
+        metadata: metadata(args, acceptanceScope ? { acceptanceScope } : {})
       }
     }));
   } else if (command === "get") {
@@ -301,6 +303,7 @@ try {
         operationId: operationId(args, eventType),
         eventType,
         ...actor(args),
+        note: args.note || "",
         metadata: metadata(args)
       }
     }));
@@ -557,7 +560,7 @@ try {
       const before = await current(project, task);
       const deliveryActions = args["delivery-actions"] ? args["delivery-actions"].split(",").map((x) => x.trim()).filter(Boolean) : [];
       const testEvidence = {};
-      if (result === "pass" && (args["delivery-mode"] || "") === "required" && deliveryActions.includes("candidate_merge")) {
+      if (result === "pass" && deliveryActions.includes("candidate_merge")) {
         const commitSha = required(args, "commit-sha");
         const headBranch = required(args, "branch");
         if (!/^[a-f0-9]{40}$/i.test(commitSha)) throw new Error("--commit-sha must be a full 40-character Git commit SHA");
@@ -575,7 +578,6 @@ try {
           ...actor(args, "test_ai"),
           testResult: result,
           reportPath,
-          deliveryDisposition: args["delivery-mode"] || undefined,
           deliveryActions,
           metadata: metadata(args, testEvidence)
         }
