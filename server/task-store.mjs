@@ -146,6 +146,42 @@ async function gitIsAncestor(root, ancestor, descendant) {
   if (result.code === 1) return false;
   throw new TaskboardError("Git无法验证候选提交与main的关系", { code: "DELIVERY_GIT_ANCESTRY_FAILED", status: 409 });
 }
+// A delivery takeover only transfers execution authority; it does not create
+// or replace independent QA evidence. Match it to an explicit, consumed user
+// authorization and preserve the original developer handoff in history.
+export function deliveryTakeoverAuthority(events, evidence) {
+  const current = [...events].reverse().find((event) =>
+    event.event_type === "takeover" && event.metadata?.deliveryTakeover === true);
+  if (!current) return null;
+  const meta = current.metadata || {};
+  const at = events.indexOf(current);
+  const authorization = events.slice(0, at).find((event) =>
+    event.event_type === "takeover_allowed" &&
+    event.operation_id === meta.authorizationOperationId);
+  const authorizationMeta = authorization?.metadata || {};
+  if (!authorization || !["browser_user_session", "chat_user_instruction_cooperative"].includes(authorizationMeta.authorizationSource)
+    || authorizationMeta.authorizedFromStatus !== "待交付"
+    || !meta.generation || !Number.isSafeInteger(meta.generation)
+    || !meta.newDeveloperActorId || !meta.newDeveloperSessionId
+    || meta.newDeveloperActorId === meta.originalDeveloperActorId
+    || meta.newDeveloperSessionId === meta.originalDeveloperSessionId
+    || current.actor_id !== meta.newDeveloperActorId || current.session_id !== meta.newDeveloperSessionId
+    || events.slice(events.indexOf(authorization) + 1, at).some((event) =>
+      event.event_type === "takeover_revoked")) return null;
+  if (evidence?.valid) {
+    const pass = evidence.latestResult;
+    if (meta.requiresIndependentRetest) {
+      if (events.indexOf(pass) <= at) return null;
+    } else if (meta.independentPassEventId !== evidence.eventId
+      || meta.candidateSha !== pass?.metadata?.commitSha
+      || meta.candidateBranch !== pass?.metadata?.headBranch
+      || meta.independentReportPath !== pass?.metadata?.reportPath
+      || meta.originalDeveloperActorId !== evidence.developerActorId
+      || meta.originalDeveloperSessionId !== evidence.developerSessionId) return null;
+  }
+  return { event: current, metadata: meta, authorization };
+}
+
 async function verifyDeliveryCompletion(context, task, events, patch, { actorType, actorId, sessionId, metadata }) {
   if (task.status !== "交付中" || patch?.status !== "已完成") {
     throw new TaskboardError("只有交付中的任务可以提交合并完成", { code: "DELIVERY_STAGE_REQUIRED", status: 409 });
@@ -177,13 +213,18 @@ async function verifyDeliveryCompletion(context, task, events, patch, { actorTyp
       code: "DELIVERY_TEST_INDEPENDENCE_INVALID", status: 409
     });
   }
-  if (developerHandoff.actor_id !== actorId || developerHandoff.session_id !== sessionId) {
-    throw new TaskboardError("合并交付必须由最初提交开发交接的原开发AI和原Session继续执行", {
+  const takeover = deliveryTakeoverAuthority(events, {
+    valid: true, eventId: latestTest.event_id, latestResult: latestTest,
+    developerActorId: developerHandoff.actor_id, developerSessionId: developerHandoff.session_id
+  });
+  const originalOwner = developerHandoff.actor_id === actorId && developerHandoff.session_id === sessionId;
+  const delegatedOwner = takeover?.metadata?.newDeveloperActorId === actorId &&
+    takeover?.metadata?.newDeveloperSessionId === sessionId;
+  if ((!originalOwner && !delegatedOwner) || (takeover && !delegatedOwner)) {
+    throw new TaskboardError("交付必须由当前已授权的开发Session完成；旧Session接管后失权", {
       code: "DELIVERY_ORIGINAL_DEVELOPER_REQUIRED", status: 409,
-      details: {
-        requiredActorId: developerHandoff.actor_id || null,
-        requiredSessionId: developerHandoff.session_id || null
-      }
+      details: { requiredActorId: takeover?.metadata?.newDeveloperActorId || developerHandoff.actor_id,
+        requiredSessionId: takeover?.metadata?.newDeveloperSessionId || developerHandoff.session_id }
     });
   }
   const invalidation = events.slice(passIndex + 1).find((event) =>
@@ -194,7 +235,7 @@ async function verifyDeliveryCompletion(context, task, events, patch, { actorTyp
   const deliveryClaim = [...events].reverse().find((event) =>
     event.event_type === "claim" && event.new_status === "交付中" && event.actor_type === "developer_ai");
   if (!deliveryClaim || deliveryClaim.actor_id !== actorId || deliveryClaim.session_id !== sessionId
-    || deliveryClaim.actor_id !== developerHandoff.actor_id || deliveryClaim.session_id !== developerHandoff.session_id) {
+    || (takeover && !delegatedOwner) || (!takeover && !originalOwner)) {
     throw new TaskboardError("当前执行身份不是原开发AI的正式交付认领", {
       code: "DELIVERY_CLAIM_MISMATCH", status: 409
     });

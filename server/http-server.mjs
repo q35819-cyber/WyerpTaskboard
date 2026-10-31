@@ -4,7 +4,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { URL } from "node:url";
 import { TaskboardError } from "./core/errors.mjs";
-import { TaskStore } from "./task-store.mjs";
+import { TaskStore, deliveryTakeoverAuthority } from "./task-store.mjs";
 import { deliveryEvidence } from "./candidate-evaluator.mjs";
 import { ErpPassGate } from "./erp-pass-gate.mjs";
 import { AuthManager } from "./auth.mjs";
@@ -1196,6 +1196,11 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         const body = await readJson(req);
         requireOperation(body);
         if (!body.eventType) throw new TaskboardError("eventType不能为空", { code: "INVALID_EVENT_TYPE", status: 400 });
+        if (["takeover", "takeover_allowed", "takeover_revoked"].includes(body.eventType)) {
+          throw new TaskboardError("接管治理事件只能通过专用授权/接管路由写入", {
+            code: "TAKEOVER_FORMAL_ROUTE_REQUIRED", status: 409
+          });
+        }
         const invalidatesTest = body.eventType === "code_change" || body.metadata?.invalidatesTestEvidence === true;
         if (invalidatesTest) {
           const { context, task, snapshot } = await contextAndTask(taskStore, params.projectId, params.taskId);
@@ -1397,10 +1402,13 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
             code: "DELIVERY_CLAIM_MISMATCH", status: 409
           });
         }
-        if (body.actorId !== evidence.developerActorId || body.sessionId !== evidence.developerSessionId) {
-          throw new TaskboardError("交付失败必须由原开发AI和原Session记录", {
+        const takeover = deliveryTakeoverAuthority(history, evidence);
+        const requiredActorId = takeover?.metadata?.newDeveloperActorId || evidence.developerActorId;
+        const requiredSessionId = takeover?.metadata?.newDeveloperSessionId || evidence.developerSessionId;
+        if (body.actorId !== requiredActorId || body.sessionId !== requiredSessionId) {
+          throw new TaskboardError("交付失败必须由当前正式接管开发AI和Session记录", {
             code: "DELIVERY_ORIGINAL_DEVELOPER_REQUIRED", status: 409,
-            details: { requiredActorId: evidence.developerActorId, requiredSessionId: evidence.developerSessionId }
+            details: { requiredActorId, requiredSessionId }
           });
         }
         const failureStage = String(body.failureStage || "").trim();
@@ -1462,10 +1470,13 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           if (!evidence.valid) throw new TaskboardError("缺少有效的最新独立测试PASS，禁止认领交付任务", {
             code: "DELIVERY_INDEPENDENT_PASS_REQUIRED", status: 409
           });
-          if (actorId !== evidence.developerActorId || body.sessionId !== evidence.developerSessionId) {
-            throw new TaskboardError("待交付必须由最初开发交接的原开发AI和原Session认领", {
+          const takeover = deliveryTakeoverAuthority(deliveryHistory, evidence);
+          const requiredActorId = takeover?.metadata?.newDeveloperActorId || evidence.developerActorId;
+          const requiredSessionId = takeover?.metadata?.newDeveloperSessionId || evidence.developerSessionId;
+          if (actorId !== requiredActorId || body.sessionId !== requiredSessionId) {
+            throw new TaskboardError("待交付必须由原开发或当前用户授权接管的开发AI/Session认领", {
               code: "DELIVERY_ORIGINAL_DEVELOPER_REQUIRED", status: 409,
-              details: { requiredActorId: evidence.developerActorId, requiredSessionId: evidence.developerSessionId }
+              details: { requiredActorId, requiredSessionId }
             });
           }
         }
@@ -1506,8 +1517,11 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           }
           const history = await taskStore.taskHistory(params.projectId, params.taskId, { all: true });
           const conflict = history.find((event) => event.actor_type === "developer_ai"
-            && event.event_type === "code_change"
-            && (event.actor_id === actorId || event.session_id === body.sessionId));
+            && ((event.event_type === "code_change"
+              && (event.actor_id === actorId || event.session_id === body.sessionId))
+              || (event.event_type === "takeover" && event.metadata?.deliveryTakeover === true
+                && (event.metadata.newDeveloperActorId === actorId
+                  || event.metadata.newDeveloperSessionId === body.sessionId))));
           if (conflict || (task.sessionId && task.sessionId === body.sessionId)) {
             throw new TaskboardError("当前独测身份与历史实现/修复身份冲突，拒绝冒充独立测试", {
               code: "INDEPENDENT_TEST_CONFLICT", status: 409,
@@ -1631,14 +1645,14 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         requireOperation(body);
         const authorizationEvidence = takeoverAuthorizationEvidence(identity, body, params);
         const { context, task, snapshot } = await contextAndTask(taskStore, params.projectId, params.taskId);
-        if (!context.workflow.isExecutionStatus(task.status)) {
-          throw new TaskboardError("只有执行中任务可以授权异常接管", {
+        if (!context.workflow.isExecutionStatus(task.status) && task.status !== "待交付") {
+          throw new TaskboardError("只有执行中或待交付任务可以授权异常接管", {
             code: "TAKEOVER_STAGE_INVALID", status: 409, details: { status: task.status }
           });
         }
         const state = await taskStore.takeoverState(params.projectId, params.taskId);
         const explicitUserOverride = authorizationEvidence.authorizationSource === "chat_user_instruction_cooperative";
-        if ((!state.suspectedDisconnect || !state.suspicion) && !explicitUserOverride) {
+        if ((!state.suspectedDisconnect || !state.suspicion) && !explicitUserOverride && !(task.status === "待交付" && identity.mode === "session")) {
           throw new TaskboardError("必须先记录疑似失联及核验依据，或提供当前用户明确的异常接管指令", {
             code: "TAKEOVER_SUSPICION_REQUIRED", status: 409
           });
@@ -1651,6 +1665,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           ...actorOptions(identity, body),
           metadata: {
             ...(body.metadata || {}),
+            authorizedFromStatus: task.status,
             authorizedFromAssignee: task.assignee || "",
             authorizedFromSessionId: task.sessionId || "",
             authorizedFromSessionWindowName: task.sessionWindowName || "",
@@ -1687,12 +1702,101 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         requireOperation(body);
         requireExpectedRevision(body);
         const { context, task, snapshot } = await contextAndTask(taskStore, params.projectId, params.taskId);
-        if (!context.workflow.isExecutionStatus(task.status)) {
-          throw new TaskboardError("只有执行中任务可以异常接管", {
+        if (!context.workflow.isExecutionStatus(task.status) && task.status !== "待交付") {
+          throw new TaskboardError("只有执行中或待交付任务可以异常接管", {
             code: "TAKEOVER_STAGE_INVALID", status: 409, details: { status: task.status }
           });
         }
         const state = await taskStore.takeoverState(params.projectId, params.taskId);
+        if (task.status === "待交付") {
+          requireTrustedApiIdentity(identity);
+          const authz = state.authorization?.metadata || {};
+          if (!state.takeoverAllowed || !state.authorization) {
+            throw new TaskboardError("待交付接管必须由用户明确授权", { code: "TAKEOVER_NOT_ALLOWED", status: 409 });
+          }
+          if (authz.authorizedFromStatus !== "待交付"
+            || authz.authorizedRegistryRevision !== snapshot.registryRevision
+            || (authz.authorizedFromAssignee || "") !== (task.assignee || "")
+            || (authz.authorizedFromSessionId || "") !== (task.sessionId || "")) {
+            throw new TaskboardError("接管授权与最新注册表/Session不一致", {
+              code: "TAKEOVER_AUTHORIZATION_STALE", status: 409
+            });
+          }
+          if ((body.actorType || "developer_ai") !== "developer_ai"
+            || !body.actorId || !body.assignee || !body.sessionId || !body.sessionWindowName) {
+            throw new TaskboardError("待交付接管必须指定全新的开发AI、负责人及Session", {
+              code: "TAKEOVER_IDENTITY_REQUIRED", status: 400
+            });
+          }
+          const history = await taskStore.taskHistory(params.projectId, params.taskId, { all: true });
+          const evidence = deliveryEvidence(history, context.workflow);
+          const oldActor = evidence.developerActorId ||
+            [...history].reverse().find((event) => event.event_type === "handoff" && event.actor_type === "developer_ai")?.actor_id || "";
+          const oldSession = evidence.developerSessionId ||
+            [...history].reverse().find((event) => event.event_type === "handoff" && event.actor_type === "developer_ai")?.session_id || "";
+          if (body.actorId === oldActor || body.sessionId === oldSession) {
+            throw new TaskboardError("接管必须使用不同于原开发的actor/Session", {
+              code: "TAKEOVER_NEW_IDENTITY_REQUIRED", status: 409
+            });
+          }
+          const sourceWorktree = String(body.previousWorktree || "").trim();
+          const nextWorktree = String(body.nextWorktree || "").trim();
+          const inspection = String(body.liveInspection || "").trim();
+          if (!sourceWorktree || !nextWorktree || !inspection) {
+            throw new TaskboardError("接管必须记录原/新worktree及现场Job/修改核验", {
+              code: "TAKEOVER_WORKTREE_EVIDENCE_REQUIRED", status: 400
+            });
+          }
+          const resources = await taskStore.testResourceState(params.projectId, params.taskId);
+          if (resources.activeCount > 0 && (!body.forceTakeover
+            || !/强制接管/.test(authz.authorizationQuote || state.authorization.note || ""))) {
+            throw new TaskboardError("存在活动资源，需用户明确强制接管授权", {
+              code: "TAKEOVER_ACTIVE_RESOURCES", status: 409
+            });
+          }
+          let validReport = false;
+          if (evidence.valid) {
+            const reportPath = String(evidence.latestResult?.metadata?.reportPath || "").trim();
+            if (reportPath) {
+              try {
+                const resolved = path.resolve(context.rootRealPath, reportPath);
+                const root = path.resolve(context.rootRealPath);
+                if (resolved.startsWith(root + path.sep) && (await fs.stat(resolved)).isFile()) validReport = true;
+              } catch { /* Missing QA report requires new independent testing. */ }
+            }
+          }
+          const preservedPass = evidence.valid && validReport;
+          const generation = history.filter((event) => event.event_type === "takeover").length + 1;
+          const result = await taskStore.updateTask(params.projectId, params.taskId,
+            preservedPass ? { updatedAt: new Date().toISOString() } :
+              { status: "待独测", plannedRole: "独立测试AI" }, {
+              expectedRevision: body.expectedRevision,
+              operationId: body.operationId,
+              eventType: "takeover",
+              ...actorOptions(identity, { ...body, actorType: "developer_ai" }),
+              note: String(body.note || "用户授权待交付异常接管"),
+              metadata: {
+                deliveryTakeover: true, generation, requiresIndependentRetest: !preservedPass,
+                authorizationOperationId: state.authorization.operation_id,
+                authorizationSource: authz.authorizationSource,
+                authorizationQuote: authz.authorizationQuote || state.authorization.note,
+                authorizedRegistryRevision: authz.authorizedRegistryRevision,
+                originalDeveloperActorId: oldActor, originalDeveloperSessionId: oldSession,
+                previousAssignee: task.assignee || "", previousSessionId: task.sessionId || "",
+                previousWorktree: sourceWorktree, newWorktree: nextWorktree,
+                liveInspection: inspection, forced: Boolean(body.forceTakeover),
+                newDeveloperActorId: body.actorId, newDeveloperSessionId: body.sessionId,
+                newAssignee: body.assignee, newSessionWindowName: body.sessionWindowName,
+                independentPassEventId: preservedPass ? evidence.eventId : null,
+                independentReportPath: preservedPass ? evidence.latestResult.metadata.reportPath : null,
+                candidateSha: preservedPass ? evidence.latestResult.metadata.commitSha : null,
+                candidateBranch: preservedPass ? evidence.latestResult.metadata.headBranch : null,
+                preservedHistoryEventCount: history.length
+              }
+            });
+          return send(res, 200, { ...result, takeoverConsumed: true,
+            requiresIndependentRetest: !preservedPass, generation });
+        }
         if (!state.takeoverAllowed || !state.authorization) {
           throw new TaskboardError("用户尚未明确允许异常接管", { code: "TAKEOVER_NOT_ALLOWED", status: 409 });
         }

@@ -35,7 +35,7 @@ const transitions = new Map([
   ["修复中", new Set(["待复测", "阻断", "HOLD"])],
   ["待复测", new Set(["复测中", "测试失败待修复", "待准备", "待确认", "阻断", "HOLD"])],
   ["复测中", new Set(["待交付", "待用户验收", "已完成", "测试失败待修复", "阻断", "HOLD"])],
-  ["待交付", new Set(["交付中", "阻断", "HOLD"])],
+  ["待交付", new Set(["交付中", "待独测", "阻断", "HOLD"])],
   ["交付中", new Set(["已完成", "待用户验收", "待复测", "阻断", "HOLD"])],
   ["待用户验收", new Set(["已完成", "测试失败待修复", "待准备", "待确认", "HOLD"])],
   ["阻断", new Set(["待确认", "待准备", "待开发", "待独测", "待复测", "HOLD", "已取消"])],
@@ -152,6 +152,13 @@ export const wyerpAiFlowV1 = {
             code: "ATOMIC_TEST_RESULT_REQUIRED", status: 409, details: { from: task.status, to: targetStatus }
           });
         }
+      }
+      if (task.status === "待交付" && targetStatus === "待独测"
+        && (eventType !== "takeover" || actorType !== "developer_ai"
+          || meta.deliveryTakeover !== true || meta.requiresIndependentRetest !== true)) {
+        throw new TaskboardError("交付接管缺少可信独测证据时，只能由正式takeover退回独测", {
+          code: "DELIVERY_RETEST_TAKEOVER_REQUIRED", status: 409
+        });
       }
       if (task.status === "待交付" && targetStatus === "交付中"
         && (eventType !== "claim" || actorType !== "developer_ai" || !sessionId)) {

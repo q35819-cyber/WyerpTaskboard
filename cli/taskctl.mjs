@@ -649,6 +649,10 @@ try {
         sessionId: required(args, "session-id"),
         ...who,
         note: required(args, "note"),
+        previousWorktree: args["previous-worktree"] || "",
+        nextWorktree: args["next-worktree"] || "",
+        liveInspection: args["live-inspection"] || args.evidence || "",
+        forceTakeover: args["force-takeover"] === "true",
         metadata: metadata(args)
       }
     }));
