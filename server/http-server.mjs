@@ -4,7 +4,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { URL } from "node:url";
 import { TaskboardError } from "./core/errors.mjs";
-import { TaskStore, deliveryTakeoverAuthority } from "./task-store.mjs";
+import { TaskStore, deliveryTakeoverAuthority, verifiedRemoteTakeoverCandidate } from "./task-store.mjs";
 import { deliveryEvidence } from "./candidate-evaluator.mjs";
 import { ErpPassGate } from "./erp-pass-gate.mjs";
 import { AuthManager } from "./auth.mjs";
@@ -1755,17 +1755,29 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
             });
           }
           let validReport = false;
+          let validGitCandidate = false;
           if (evidence.valid) {
-            const reportPath = String(evidence.latestResult?.metadata?.reportPath || "").trim();
+            const pass = evidence.latestResult?.metadata || {};
+            const reportPath = String(pass.reportPath || "").trim();
+            const passSha = String(pass.commitSha || "").toLowerCase();
             if (reportPath) {
               try {
                 const resolved = path.resolve(context.rootRealPath, reportPath);
                 const root = path.resolve(context.rootRealPath);
-                if (resolved.startsWith(root + path.sep) && (await fs.stat(resolved)).isFile()) validReport = true;
-              } catch { /* Missing QA report requires new independent testing. */ }
+                if (resolved.startsWith(root + path.sep)) {
+                  const stat = await fs.stat(resolved);
+                  if (stat.isFile() && stat.size > 0 && stat.size <= 2 * 1024 * 1024) {
+                    const report = await fs.readFile(resolved, "utf8");
+                    validReport = /PASS|通过/i.test(report) && report.toLowerCase().includes(passSha);
+                  }
+                }
+              } catch { /* Missing or unreadable independent report must be retested. */ }
+            }
+            if (validReport) {
+              validGitCandidate = await verifiedRemoteTakeoverCandidate(context.rootRealPath, pass);
             }
           }
-          const preservedPass = evidence.valid && validReport;
+          const preservedPass = evidence.valid && validReport && validGitCandidate;
           const generation = history.filter((event) => event.event_type === "takeover").length + 1;
           const result = await taskStore.updateTask(params.projectId, params.taskId,
             preservedPass ? { updatedAt: new Date().toISOString() } :

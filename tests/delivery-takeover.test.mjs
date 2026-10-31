@@ -15,7 +15,7 @@ async function createMergedGitFixture(fixture) {
   await fs.mkdir(path.join(fixture.projectRoot, "reports", "D-PENDING"), { recursive: true });
   await fs.writeFile(path.join(fixture.projectRoot, "reports", "D-PENDING", "qa-pass.md"), "独立QA PASS报告");
   // The live task registry is project runtime state, never tracked application source.
-  await fs.writeFile(path.join(fixture.projectRoot, ".gitignore"), "tasks.md\n");
+  await fs.writeFile(path.join(fixture.projectRoot, ".gitignore"), "tasks.md\nreports/\n");
   await git("init", "--initial-branch=main");
   await git("config", "user.name", "Takeover Fixture");
   await git("config", "user.email", "takeover@example.test");
@@ -37,7 +37,7 @@ async function createMergedGitFixture(fixture) {
     { encoding: "utf8", windowsHide: true });
   return sha;
 }
-async function setup(t, { pass = true, missingReport = false, mergedGit = false } = {}) {
+async function setup(t, { pass = true, missingReport = false, mergedGit = true, passShaOverride = null } = {}) {
   const fixture = await makeFixture();
   await fs.writeFile(fixture.registryPath, registryText([
     ["D-PENDING", "F-P0", "infrastructure", "P0", "待交付", "开发AI", "—", "—", "—",
@@ -77,13 +77,15 @@ async function setup(t, { pass = true, missingReport = false, mergedGit = false 
   if (pass) {
     await seed("delivery.qa.test.pass", "test_result", "test_ai", "qa-dev", "wc_sess_qa", {
       atomicLifecycle: true, testResult: "pass", deliveryDisposition: "required",
-      deliveryActions: ["candidate_merge"], commitSha: sha, headBranch: "feature/qa",
+      deliveryActions: ["candidate_merge"], commitSha: passShaOverride ?? sha, headBranch: "feature/qa",
       reportPath: "reports/D-PENDING/qa-pass.md"
     });
   }
   if (!missingReport) {
     await fs.mkdir(path.join(fixture.projectRoot, "reports", "D-PENDING"), { recursive: true });
-    await fs.writeFile(path.join(fixture.projectRoot, "reports", "D-PENDING", "qa-pass.md"), "独立QA PASS报告");
+    await fs.writeFile(path.join(fixture.projectRoot, "reports", "D-PENDING", "qa-pass.md"), "结论：PASS\n候选SHA：" + (passShaOverride ?? sha) + "\n");
+  } else {
+    await fs.rm(path.join(fixture.projectRoot, "reports", "D-PENDING", "qa-pass.md"), { force: true });
   }
   const takeoverBody = (revision) => ({
     operationId: "delivery.takeover.execute.0001", expectedRevision: revision,
@@ -260,4 +262,34 @@ test("authorized replacement completes already-merged candidate; old Session can
   const events = await x.app.taskStore.taskHistory("fixture", "D-PENDING", { all: true });
   assert.equal(events.at(-1).event_type, "delivery_complete");
   assert.equal(events.at(-1).metadata.candidateCommitSha, x.sha);
+});
+test("authorized pending takeover rejects an independent PASS SHA different from real Git candidate", async (t) => {
+  const badSha = "a".repeat(40);
+  const x = await setup(t, { mergedGit: true, passShaOverride: badSha });
+  assert.notEqual(x.sha, badSha, "the real Git candidate must differ from fake PASS evidence");
+  assert.equal((await allowed(x)).status, 200);
+  const takeover = await x.send("/takeover", x.takeoverBody((await x.get()).registryRevision));
+  assert.equal(takeover.status, 200, JSON.stringify(takeover.data));
+  assert.equal(takeover.data.after.status, "待独测");
+  assert.equal(takeover.data.requiresIndependentRetest, true);
+  assert.equal(takeover.data.after.assignee, "");
+});
+
+test("authorized pending takeover rejects zero-byte independent QA report", async (t) => {
+  const x = await setup(t, { mergedGit: true });
+  await fs.writeFile(path.join(x.fixture.projectRoot, "reports/D-PENDING/qa-pass.md"), "");
+  assert.equal((await allowed(x)).status, 200);
+  const takeover = await x.send("/takeover", x.takeoverBody((await x.get()).registryRevision));
+  assert.equal(takeover.status, 200, JSON.stringify(takeover.data));
+  assert.equal(takeover.data.after.status, "待独测");
+  assert.equal(takeover.data.requiresIndependentRetest, true);
+});
+
+test("authorized pending takeover rejects valid-shaped but nonexistent Git commit SHA", async (t) => {
+  const x = await setup(t, { mergedGit: true, passShaOverride: "c".repeat(40) });
+  assert.equal((await allowed(x)).status, 200);
+  const takeover = await x.send("/takeover", x.takeoverBody((await x.get()).registryRevision));
+  assert.equal(takeover.status, 200, JSON.stringify(takeover.data));
+  assert.equal(takeover.data.after.status, "待独测");
+  assert.equal(takeover.data.requiresIndependentRetest, true);
 });

@@ -146,6 +146,39 @@ async function gitIsAncestor(root, ancestor, descendant) {
   if (result.code === 1) return false;
   throw new TaskboardError("Git无法验证候选提交与main的关系", { code: "DELIVERY_GIT_ANCESTRY_FAILED", status: 409 });
 }
+// Fail closed when an independent PASS cannot be matched to a real remote Git
+// candidate. A branch may be deleted after it was merged; in that case only an
+// existing local commit that is an ancestor of remote HEAD can be accepted.
+export async function verifiedRemoteTakeoverCandidate(root, metadata = {}) {
+  const sha = String(metadata.commitSha || "").toLowerCase();
+  const branch = String(metadata.headBranch || "").trim();
+  if (!GIT_SHA.test(sha) || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,190}$/.test(branch)
+    || branch.includes("..") || branch.includes("//") || branch.endsWith("/")) return false;
+  try {
+    const checkRef = await runGit(root, ["check-ref-format", "--branch", branch]);
+    if (checkRef.code !== 0) return false;
+    const remoteBranch = await runGit(root, ["ls-remote", "origin", "refs/heads/" + branch]);
+    if (remoteBranch.code !== 0) return false;
+    const remoteLine = String(remoteBranch.stdout || "").trim();
+    if (remoteLine) {
+      const actual = remoteLine.split(/\s+/)[0].toLowerCase();
+      return GIT_SHA.test(actual) && actual === sha;
+    }
+    const commit = await runGit(root, ["cat-file", "-t", sha]);
+    if (commit.code !== 0 || String(commit.stdout).trim() !== "commit") return false;
+    const defaultRemote = await runGit(root, ["ls-remote", "--symref", "origin", "HEAD"]);
+    if (defaultRemote.code !== 0) return false;
+    const defaultBranch = String(defaultRemote.stdout || "").match(/^ref:\s+refs\/heads\/([A-Za-z0-9._/-]+)\s+HEAD$/m)?.[1];
+    if (!defaultBranch) return false;
+    const mainRef = await runGit(root, ["ls-remote", "origin", "refs/heads/" + defaultBranch]);
+    const actualMainSha = String(mainRef.stdout || "").trim().split(/\s+/)[0].toLowerCase();
+    if (mainRef.code !== 0 || !GIT_SHA.test(actualMainSha)) return false;
+    return await gitIsAncestor(root, sha, actualMainSha);
+  } catch {
+    return false;
+  }
+}
+
 // A delivery takeover only transfers execution authority; it does not create
 // or replace independent QA evidence. Match it to an explicit, consumed user
 // authorization and preserve the original developer handoff in history.
