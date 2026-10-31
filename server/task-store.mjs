@@ -1,4 +1,7 @@
 import fs from "node:fs/promises";
+import crypto from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { TaskboardError } from "./core/errors.mjs";
 import { atomicWriteText } from "./core/atomic-files.mjs";
 import { resolveProjectPath } from "./core/path-safety.mjs";
@@ -76,20 +79,33 @@ function readableTitle(task) {
   }
   return task.id + " 任务";
 }
-function currentProgressText(task) {
+function currentProgressText(task, events = []) {
+  if (task.status === "交付中") {
+    const latestFailure = [...events].reverse().find((event) => event.event_type === "delivery_attempt_failed");
+    const laterClaim = latestFailure && [...events].some((event) =>
+      event.event_type === "claim" && events.indexOf(event) > events.indexOf(latestFailure));
+    if (latestFailure && !laterClaim) {
+      const metadata = latestFailure.metadata || {};
+      const stage = cleanHumanText(metadata.failureStage || "delivery");
+      const code = cleanHumanText(metadata.failureCode || "DELIVERY_ATTEMPT_FAILED");
+      const reason = cleanHumanText(metadata.failureMessage || latestFailure.note || "交付步骤失败");
+      const next = cleanHumanText(metadata.nextAction || "原开发AI保持当前Session继续处理失败原因，修复后重试合并、推送和回归");
+      return `交付受阻（${stage} / ${code}）：${reason}。下一步：${next}`;
+    }
+  }
   const map = {
     "待确认": "等待需求或规则确认，确认后才能继续。",
     "待准备": "准备条件尚未完全具备，正在等待进入开发/测试所需条件。",
     "待开发": "准备条件已确认，尚未开始正式开发。",
     "开发中": "正在开发实现；执行中的会话和负责人会持续回写。",
-    "待独测": "开发方已完成当前范围，等待独立测试AI验证。",
+    "待独测": "下一步：独立测试AI正式认领，从测试流程起点执行完整独测。",
     "独测中": "独立测试AI正在验证当前实现。",
-    "测试失败待修复": "独立测试发现问题，等待开发方修复。",
+    "测试失败待修复": "下一步：退回原开发AI修复、自测，通过后重新交独测。",
     "修复中": "正在修复测试发现的问题，修复后进入复测。",
-    "待复测": "修复已完成，等待独立测试AI复测。",
+    "待复测": "下一步：独立测试AI重新从测试起点复测修复结果。",
     "复测中": "独立测试AI正在复测修复结果。",
-    "待交付": "测试已通过，等待整理交付材料。",
-    "交付中": "正在整理交付证据并同步最终状态。",
+    "待交付": "下一步：原开发AI认领任务，把独测PASS绑定的候选SHA合入origin默认分支。",
+    "交付中": "下一步：合并候选SHA并推送；在远端默认分支运行回归，写PASS报告后执行taskctl complete --report关闭任务。",
     "待用户验收": "已完成交付，等待用户最终确认通过或打回。",
     "已完成": "用户已明确验收，本任务已关闭。",
     "阻断": "当前存在阻断条件，必须先解除阻断才能继续。",
@@ -98,6 +114,155 @@ function currentProgressText(task) {
   };
   return map[task.status] || ("当前状态：" + task.status);
 }
+const execFileAsync = promisify(execFile);
+const GIT_SHA = /^[a-f0-9]{40}$/i;
+async function runGit(root, args) {
+  try {
+    const result = await execFileAsync("git", ["-C", root, ...args], {
+      encoding: "utf8", timeout: 20000, maxBuffer: 2 * 1024 * 1024, windowsHide: true
+    });
+    return { code: 0, stdout: result.stdout || "", stderr: result.stderr || "" };
+  } catch (error) {
+    if (typeof error.code === "number") return { code: error.code, stdout: error.stdout || "", stderr: error.stderr || "" };
+    throw new TaskboardError("无法执行Git交付核验，请确认项目仓库和Git可用", {
+      code: "DELIVERY_GIT_UNAVAILABLE", status: 409
+    });
+  }
+}
+async function gitOutput(root, args, errorCode) {
+  const result = await runGit(root, args);
+  if (result.code !== 0) throw new TaskboardError("Git交付核验失败：" + errorCode, {
+    code: errorCode, status: 409, details: { gitCommand: args[0] }
+  });
+  return String(result.stdout || "").trim();
+}
+async function gitIsAncestor(root, ancestor, descendant) {
+  const result = await runGit(root, ["merge-base", "--is-ancestor", ancestor, descendant]);
+  if (result.code === 0) return true;
+  if (result.code === 1) return false;
+  throw new TaskboardError("Git无法验证候选提交与main的关系", { code: "DELIVERY_GIT_ANCESTRY_FAILED", status: 409 });
+}
+async function verifyDeliveryCompletion(context, task, events, patch, { actorType, actorId, sessionId, metadata }) {
+  if (task.status !== "交付中" || patch?.status !== "已完成") {
+    throw new TaskboardError("只有交付中的任务可以提交合并完成", { code: "DELIVERY_STAGE_REQUIRED", status: 409 });
+  }
+  if (actorType !== "developer_ai" || !sessionId || sessionId !== task.sessionId) {
+    throw new TaskboardError("必须由当前交付负责人在原Session完成合并交付", { code: "DELIVERY_OWNER_MISMATCH", status: 409 });
+  }
+  const latestTest = [...events].reverse().find((event) => event.event_type === "test_result");
+  const pass = latestTest?.metadata || {};
+  if (!latestTest || latestTest.actor_type !== "test_ai" || pass.testResult !== "pass"
+    || pass.atomicLifecycle !== true || pass.deliveryDisposition !== "required"
+    || !Array.isArray(pass.deliveryActions) || !pass.deliveryActions.includes("candidate_merge")
+    || !GIT_SHA.test(String(pass.commitSha || "")) || !String(pass.headBranch || "").trim()) {
+    throw new TaskboardError("缺少绑定固定候选SHA的最新独立测试PASS，不能合并关闭", {
+      code: "DELIVERY_INDEPENDENT_PASS_REQUIRED", status: 409
+    });
+  }
+  const passIndex = events.indexOf(latestTest);
+  const prior = events.slice(0, passIndex);
+  const testerClaim = [...prior].reverse().find((event) =>
+    event.event_type === "claim" && event.actor_type === "test_ai" && event.actor_id === latestTest.actor_id);
+  const developerHandoff = [...prior].reverse().find((event) =>
+    event.event_type === "handoff" && event.actor_type === "developer_ai"
+    && ["开发中", "修复中"].includes(event.metadata?.completedFromStatus));
+  if (!testerClaim || testerClaim.session_id !== latestTest.session_id || !developerHandoff
+    || events.indexOf(developerHandoff) >= events.indexOf(testerClaim)
+    || developerHandoff.actor_id === latestTest.actor_id || developerHandoff.session_id === latestTest.session_id) {
+    throw new TaskboardError("独立测试必须由不同于原开发者的正式test_ai认领并完成", {
+      code: "DELIVERY_TEST_INDEPENDENCE_INVALID", status: 409
+    });
+  }
+  if (developerHandoff.actor_id !== actorId || developerHandoff.session_id !== sessionId) {
+    throw new TaskboardError("合并交付必须由最初提交开发交接的原开发AI和原Session继续执行", {
+      code: "DELIVERY_ORIGINAL_DEVELOPER_REQUIRED", status: 409,
+      details: {
+        requiredActorId: developerHandoff.actor_id || null,
+        requiredSessionId: developerHandoff.session_id || null
+      }
+    });
+  }
+  const invalidation = events.slice(passIndex + 1).find((event) =>
+    event.event_type === "code_change" || event.event_type === "test_result" || event.metadata?.invalidatesTestEvidence === true);
+  if (invalidation) throw new TaskboardError("独立PASS之后又发生代码修改或测试结果变化，必须重新独测", {
+    code: "DELIVERY_PASS_INVALIDATED", status: 409
+  });
+  const deliveryClaim = [...events].reverse().find((event) =>
+    event.event_type === "claim" && event.new_status === "交付中" && event.actor_type === "developer_ai");
+  if (!deliveryClaim || deliveryClaim.actor_id !== actorId || deliveryClaim.session_id !== sessionId
+    || deliveryClaim.actor_id !== developerHandoff.actor_id || deliveryClaim.session_id !== developerHandoff.session_id) {
+    throw new TaskboardError("当前执行身份不是原开发AI的正式交付认领", {
+      code: "DELIVERY_CLAIM_MISMATCH", status: 409
+    });
+  }
+  const root = context.rootRealPath;
+  const symref = await gitOutput(root, ["ls-remote", "--symref", "origin", "HEAD"], "DELIVERY_REMOTE_UNAVAILABLE");
+  const branchMatch = symref.match(/^ref:\s+refs\/heads\/([A-Za-z0-9][A-Za-z0-9._/-]{0,190})\s+HEAD$/m);
+  if (!branchMatch || branchMatch[1].includes("..") || branchMatch[1].includes("//")) {
+    throw new TaskboardError("无法识别origin默认分支，拒绝猜测main分支", { code: "DELIVERY_REMOTE_DEFAULT_BRANCH_UNAVAILABLE", status: 409 });
+  }
+  const mainBranch = branchMatch[1];
+  const localBranch = await gitOutput(root, ["rev-parse", "--abbrev-ref", "HEAD"], "DELIVERY_LOCAL_BRANCH_UNAVAILABLE");
+  if (localBranch !== mainBranch) throw new TaskboardError("请先切换到origin默认分支，再执行交付闭环", {
+    code: "DELIVERY_NOT_ON_MAIN", status: 409, details: { expectedBranch: mainBranch, currentBranch: localBranch }
+  });
+  const mergeCommitSha = (await gitOutput(root, ["rev-parse", "HEAD"], "DELIVERY_LOCAL_HEAD_UNAVAILABLE")).toLowerCase();
+  const remoteLine = await gitOutput(root, ["ls-remote", "origin", "refs/heads/" + mainBranch], "DELIVERY_REMOTE_MAIN_UNAVAILABLE");
+  const remoteMainSha = String(remoteLine.split(/\s+/)[0] || "").toLowerCase();
+  if (!GIT_SHA.test(remoteMainSha)) throw new TaskboardError("无法读取远端默认分支SHA", { code: "DELIVERY_REMOTE_MAIN_UNAVAILABLE", status: 409 });
+  if (mergeCommitSha !== remoteMainSha) throw new TaskboardError("本地main与远端main版本不一致，先同步远端再完成交付", {
+    code: "DELIVERY_REMOTE_SHA_MISMATCH", status: 409, details: { localMainSha: mergeCommitSha, remoteMainSha }
+  });
+  const postMergeReportPath = String(metadata?.postMergeReportPath || "").trim();
+  if (!postMergeReportPath) throw new TaskboardError("必须提供合并后回归PASS报告路径", {
+    code: "DELIVERY_POST_MERGE_REPORT_REQUIRED", status: 400
+  });
+  if (metadata?.postMergeRegressionResult !== "PASS") throw new TaskboardError("合并后回归结果必须为PASS", {
+    code: "DELIVERY_POST_MERGE_REGRESSION_REQUIRED", status: 409
+  });
+  const reportFile = await resolveProjectPath(root, postMergeReportPath, { mustExist: true, rejectReparse: true });
+  const reportStat = await fs.stat(reportFile);
+  if (!reportStat.isFile() || reportStat.size > 2 * 1024 * 1024) throw new TaskboardError("合并后回归报告无效或超过2MB", {
+    code: "DELIVERY_POST_MERGE_REPORT_INVALID", status: 422
+  });
+  const statusText = await gitOutput(root, ["status", "--porcelain", "-z", "--untracked-files=all"], "DELIVERY_WORKTREE_STATUS_UNAVAILABLE");
+  const normalizeGitPath = (value) => String(value || "").replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+  const dirtyEntries = statusText.split("\0").filter(Boolean);
+  const unrelatedChanges = dirtyEntries.filter((entry) =>
+    !(entry.slice(0, 2) === "??" && normalizeGitPath(entry.slice(3)) === normalizeGitPath(postMergeReportPath)));
+  if (unrelatedChanges.length) throw new TaskboardError("合并后回归必须在干净工作区执行；除本次回归报告外仍有未提交修改", {
+    code: "DELIVERY_WORKTREE_DIRTY", status: 409, details: { changedCount: unrelatedChanges.length }
+  });
+  const trackedReport = await runGit(root, ["ls-files", "--error-unmatch", "--", postMergeReportPath]);
+  if (trackedReport.code === 0) throw new TaskboardError("合并后回归报告必须是本次生成的独立证据，不能复用已提交旧报告", {
+    code: "DELIVERY_REPORT_TRACKED", status: 409
+  });
+  if (trackedReport.code !== 1) throw new TaskboardError("无法核验合并后回归报告是否为新报告", {
+    code: "DELIVERY_REPORT_TRACKING_UNAVAILABLE", status: 409
+  });
+  const candidateCommitSha = String(pass.commitSha).toLowerCase();
+  if (!(await gitIsAncestor(root, candidateCommitSha, mergeCommitSha))) {
+    throw new TaskboardError("独测通过的候选提交尚未进入远端main，禁止关闭任务", {
+      code: "DELIVERY_CANDIDATE_NOT_MERGED", status: 409, details: { candidateCommitSha, remoteMainSha }
+    });
+  }
+  const reportText = await fs.readFile(reportFile, "utf8");
+  if (!/^(?:结论|结果|result)\s*[:：]\s*(?:PASS|通过)\s*$/im.test(reportText)
+    || !reportText.toLowerCase().includes(candidateCommitSha)
+    || !reportText.toLowerCase().includes(mergeCommitSha)) {
+    throw new TaskboardError("回归报告必须明确写明PASS、候选SHA和远端main SHA", {
+      code: "DELIVERY_POST_MERGE_REPORT_INVALID", status: 409
+    });
+  }
+  const postMergeReportSha256 = crypto.createHash("sha256").update(reportText).digest("hex");
+  return {
+    ...(metadata || {}), deliveryVerified: true, candidateCommitSha,
+    candidateBranch: String(pass.headBranch), independentPassEventId: latestTest.event_id,
+    mainBranch, mergeCommitSha, remoteMainSha, postMergeReportPath,
+    postMergeReportSha256, postMergeRegressionResult: "PASS"
+  };
+}
+
 function isUserMessage(event) {
   return Boolean(event && event.actor_type === "user" && USER_MESSAGE_TYPES.has(event.event_type) && String(event.note || "").trim());
 }
@@ -141,7 +306,7 @@ function presentationForTask(task, events = [], project = {}) {
   return {
     title: readableTitle(task),
     responsibility: cleanHumanText(task.boundary) || "尚未填写任务职责说明，执行AI需要补充。",
-    currentProgress: currentProgressText(task),
+    currentProgress: currentProgressText(task, events),
     userAssistance: activeUserAction(events, task),
     latestUserMessage: latest ? {
       eventId: latest.event_id,
@@ -288,7 +453,16 @@ export class TaskStore {
 
       const currentTask = parsed.tasks.find((item) => item.id === taskId);
       if (!currentTask) throw new TaskboardError("未知任务ID: " + taskId, { code: "TASK_NOT_FOUND", status: 404 });
-      const effectivePatch = context.workflow.normalizeTaskPatch(currentTask, patch);
+      let effectiveMetadata = metadata;
+      if (eventType === "delivery_complete") {
+        const history = await this.events.listTaskEvents(projectId, taskId, { limit: 1000 });
+        effectiveMetadata = await verifyDeliveryCompletion(context, currentTask, history, patch, {
+          actorType, actorId, sessionId, metadata
+        });
+      }
+      const effectivePatch = context.workflow.normalizeTaskPatch(currentTask, patch, {
+        eventType, actorType, actorId, sessionId, metadata: effectiveMetadata
+      });
       if (parsed.indexes.updatedAt >= 0 && !("updatedAt" in effectivePatch)) {
         effectivePatch.updatedAt = new Date().toISOString();
       }
@@ -312,8 +486,8 @@ export class TaskStore {
         new_track: change.after.track,
         note,
         metadata: userRebased
-          ? { ...(metadata || {}), user_revision_rebased: true, stale_expected_revision: expectedRevision }
-          : metadata,
+          ? { ...(effectiveMetadata || {}), user_revision_rebased: true, stale_expected_revision: expectedRevision }
+          : effectiveMetadata,
         registry_revision_before: change.beforeRevision,
         registry_revision_after: change.afterRevision,
       };
@@ -466,35 +640,47 @@ export class TaskStore {
     sessionWindowName = "",
     sessionId = "",
     note = "",
-    metadata = null
+    metadata = null,
+    expectedRevision = undefined
   } = {}) {
     assertOperationId(operationId);
-    const existing = await this.events.findByOperationId(projectId, operationId);
-    if (existing) return { event: existing, idempotentReplay: true };
-    const { task, snapshot } = await this.getTask(projectId, taskId);
-    const appended = await this.events.append(projectId, {
-      operation_id: operationId,
-      project_id: projectId,
-      task_id: taskId,
-      event_type: eventType,
-      timestamp: new Date().toISOString(),
-      actor_type: actorType,
-      actor_id: actorId,
-      session_window_name: sessionWindowName,
-      session_id: sessionId,
-      old_status: task.status,
-      new_status: task.status,
-      old_priority: task.priority,
-      new_priority: task.priority,
-      old_track: task.track,
-      new_track: task.track,
-      note,
-      metadata,
-      registry_revision_before: snapshot.registryRevision,
-      registry_revision_after: snapshot.registryRevision
-    });
-    if (!appended.duplicate) await this.rearmScanner("task_event", { projectId, taskId, eventType });
-    return { event: appended.event, idempotentReplay: appended.duplicate };
+    const append = async () => {
+      const existing = await this.events.findByOperationId(projectId, operationId);
+      if (existing) return { event: existing, idempotentReplay: true };
+      const { task, snapshot } = await this.getTask(projectId, taskId);
+      if (expectedRevision !== undefined && expectedRevision !== null && snapshot.registryRevision !== expectedRevision) {
+        throw new TaskboardError("任务注册表revision已变化，拒绝追加过期的任务事件", {
+          code: "REVISION_CONFLICT", status: 409,
+          details: { expectedRevision, actualRevision: snapshot.registryRevision }
+        });
+      }
+      const appended = await this.events.append(projectId, {
+        operation_id: operationId,
+        project_id: projectId,
+        task_id: taskId,
+        event_type: eventType,
+        timestamp: new Date().toISOString(),
+        actor_type: actorType,
+        actor_id: actorId,
+        session_window_name: sessionWindowName,
+        session_id: sessionId,
+        old_status: task.status,
+        new_status: task.status,
+        old_priority: task.priority,
+        new_priority: task.priority,
+        old_track: task.track,
+        new_track: task.track,
+        note,
+        metadata,
+        registry_revision_before: snapshot.registryRevision,
+        registry_revision_after: snapshot.registryRevision
+      });
+      if (!appended.duplicate) await this.rearmScanner("task_event", { projectId, taskId, eventType });
+      return { event: appended.event, idempotentReplay: appended.duplicate };
+    };
+    return expectedRevision === undefined || expectedRevision === null
+      ? append()
+      : withProjectLock(this.rootDir, projectId, operationId, append);
   }
 
   async taskHistory(projectId, taskId, { limit = 200 } = {}) {

@@ -8,20 +8,7 @@
 </head>
 <body>
   <div id="toast" class="toast" hidden></div>
-  <main id="loginView" class="login-shell">
-    <section class="login-card">
-      <div class="eyebrow">WyerpTaskboard <span id="loginVersion" class="version-badge">v—</span></div>
-      <h1>独立任务看板</h1>
-      <p>本机项目治理服务 · <code>127.0.0.1:47831</code></p>
-      <form id="loginForm">
-        <label for="adminSecret">本机管理员密钥</label>
-        <input id="adminSecret" name="secret" type="password" autocomplete="current-password" required>
-        <button type="submit" class="primary">登录</button>
-      </form>
-      <p class="hint">密钥保存在本机任务看板配置中，不依赖任何外部项目账号或技术会话。</p>
-    </section>
-  </main>
-  <main id="appView" hidden>
+  <main id="appView">
     <header class="topbar">
       <div><div class="eyebrow">独立项目治理 <span id="appVersion" class="version-badge">v—</span></div><h1>任务看板</h1></div>
       <div class="top-actions">
@@ -32,7 +19,6 @@
         <button id="adaptProjectBtn" class="ghost" hidden>自动适配当前项目</button>
         <button id="aiSettingsBtn" class="ghost">AI自动执行设置</button>
         <button id="refreshBtn" class="ghost">刷新</button>
-        <button id="logoutBtn" class="ghost">退出</button>
       </div>
     </header>
     <section id="projectHealth" class="health-line"></section>

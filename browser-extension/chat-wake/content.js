@@ -184,10 +184,15 @@
   globalThis.addEventListener?.("unhandledrejection", onContentUnhandledRejection);
 
   function validCandidate(x) {
+    const hasOwnerBinding = Boolean(x?.eligible_actor_id || x?.eligible_session_id);
+    const ownerBindingValid = !hasOwnerBinding || [
+      x?.eligible_actor_id, x?.eligible_session_id
+    ].every(v => ref.test(String(v || "")));
     return Boolean(
       x &&
       [x.project_id, x.task_id, x.detection_id, x.eligible_role].every(v => ref.test(String(v || ""))) &&
-      ["developer_ai", "test_ai"].includes(String(x.eligible_role))
+      ["developer_ai", "test_ai"].includes(String(x.eligible_role)) &&
+      ownerBindingValid
     );
   }
 

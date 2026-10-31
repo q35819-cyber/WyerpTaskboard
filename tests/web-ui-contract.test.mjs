@@ -157,11 +157,23 @@ test("automatic scan status is visible in Chinese and kept outside task cards", 
   assert.match(css, /\.scan-status-line\{/);
 });
 
+test("taskboard opens directly without a password login page", async () => {
+  const root = path.resolve(import.meta.dirname, "..");
+  const [html, app] = await Promise.all([
+    fs.readFile(path.join(root, "web", "index.html"), "utf8"),
+    fs.readFile(path.join(root, "web", "app.js"), "utf8")
+  ]);
+  assert.doesNotMatch(html, /loginView|loginForm|adminSecret|logoutBtn/);
+  assert.match(html, /<main id="appView">/);
+  assert.doesNotMatch(app, /showLogin|loginForm|adminSecret|logoutBtn/);
+  assert.match(app, /await restoreSession\(\)/);
+});
+
 test("web UI displays runtime version from health endpoint", async () => {
   const root = path.resolve(import.meta.dirname, "..");
   const html = await fs.readFile(path.join(root, "web", "index.html"), "utf8");
   const js = await fs.readFile(path.join(root, "web", "app.js"), "utf8");
-  assert.match(html, /id="loginVersion"/);
+  assert.doesNotMatch(html, /id="loginVersion"/);
   assert.match(html, /id="appVersion"/);
   assert.match(js, /async function loadAppVersion/);
   assert.match(js, /\/healthz/);

@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import { URL } from "node:url";
 import { TaskboardError } from "./core/errors.mjs";
 import { TaskStore } from "./task-store.mjs";
+import { deliveryEvidence } from "./candidate-evaluator.mjs";
 import { ErpPassGate } from "./erp-pass-gate.mjs";
 import { AuthManager } from "./auth.mjs";
 import { RequirementStore } from "./requirement-store.mjs";
@@ -45,12 +46,6 @@ function launchDetachedServiceAction(rootDir, action) {
   return child.pid;
 }
 
-function parseCookies(header = "") {
-  return Object.fromEntries(header.split(";").map((part) => part.trim()).filter(Boolean).map((part) => {
-    const i = part.indexOf("=");
-    return i < 0 ? [part, ""] : [part.slice(0, i), decodeURIComponent(part.slice(i + 1))];
-  }));
-}
 function isLoopbackAddress(address) {
   return ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(address);
 }
@@ -581,11 +576,8 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         return send(res, 200, { ok: true, service: "WyerpTaskboard", version: appVersion });
       }
       if (req.method === "POST" && url.pathname === "/api/auth/login") {
-        const body = await readJson(req);
-        if (!auth.verifyAdminSecret(body.secret || "")) throw new TaskboardError("管理员密钥错误", { code: "UNAUTHORIZED", status: 401 });
-        const session = auth.createSession();
-        return send(res, 200, { ok: true, csrfToken: session.csrf }, {
-          "Set-Cookie": "wyerp_taskboard_session=" + encodeURIComponent(session.id) + "; HttpOnly; SameSite=Strict; Path=/"
+        throw new TaskboardError("本机任务看板已取消密码登录，请直接访问页面", {
+          code: "LOGIN_DISABLED", status: 410
         });
       }
 
@@ -600,10 +592,9 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           throw error;
         }
       }
-      const cookies = parseCookies(req.headers.cookie);
       const bearerHeader = String(req.headers.authorization || "");
       const bearer = bearerHeader.startsWith("Bearer ") ? bearerHeader.slice(7) : null;
-      const identity = auth.authenticate({ sessionId: cookies.wyerp_taskboard_session, bearer });
+      const identity = auth.authenticate({ bearer });
       const isWrite = !["GET", "HEAD", "OPTIONS"].includes(req.method);
       if (isWrite && identity.mode === "session") {
         if (!origin) throw new TaskboardError("浏览器写请求必须携带Origin", { code: "ORIGIN_REQUIRED", status: 403 });
@@ -620,11 +611,6 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
       }
       if (req.method === "GET" && url.pathname === "/api/auth/session") {
         return send(res, 200, { ok: true, actorId: identity.actorId, csrfToken: identity.csrf || null, mode: identity.mode });
-      }      if (req.method === "POST" && url.pathname === "/api/auth/logout") {
-        if (identity.session) auth.deleteSession(identity.session.id);
-        return send(res, 200, { ok: true }, {
-          "Set-Cookie": "wyerp_taskboard_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/"
-        });
       }
 
       if (req.method === "GET" && url.pathname === "/api/ai-execution/settings") {
@@ -819,7 +805,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         return send(res, 200, { projects });
       }
       if (req.method === "POST" && url.pathname === "/api/projects") {
-        if (identity.mode !== "session") throw new TaskboardError("添加项目只能由已登录的本机管理员页面执行", {
+        if (identity.mode !== "session") throw new TaskboardError("添加项目只能由本机浏览器页面执行", {
           code: "BROWSER_ADMIN_REQUIRED", status: 403
         });
         const body = await readJson(req);
@@ -834,7 +820,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
 
       const removeProjectParams = routeMatch(url.pathname, "/api/projects/:projectId");
       if (req.method === "DELETE" && removeProjectParams) {
-        if (identity.mode !== "session") throw new TaskboardError("移除项目只能由已登录的本机管理员页面执行", {
+        if (identity.mode !== "session") throw new TaskboardError("移除项目只能由本机浏览器页面执行", {
           code: "BROWSER_ADMIN_REQUIRED", status: 403
         });
         const body = await readJson(req);
@@ -1333,6 +1319,68 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         return send(res, 200, result);
       }
 
+      params = routeMatch(url.pathname, "/api/projects/:projectId/tasks/:taskId/delivery-attempt-failed");
+      if (req.method === "POST" && params) {
+        const body = await readJson(req);
+        requireOperation(body); requireExpectedRevision(body);
+        const { context, task, snapshot } = await contextAndTask(taskStore, params.projectId, params.taskId);
+        if (task.status !== "交付中") throw new TaskboardError("只有交付中的任务可以登记合并/推送失败", {
+          code: "DELIVERY_STAGE_REQUIRED", status: 409, details: { status: task.status }
+        });
+        const actorType = body.actorType || "developer_ai";
+        if (actorType !== "developer_ai" || !body.actorId || !body.sessionId) {
+          throw new TaskboardError("交付失败必须由明确的developer_ai身份和Session登记", {
+            code: "DELIVERY_OWNER_MISMATCH", status: 409
+          });
+        }
+        requireCurrentExecutionSession(task, body, { actorType, allowedStatuses: ["交付中"] });
+        const history = await taskStore.taskHistory(params.projectId, params.taskId, { limit: 1000 });
+        const evidence = deliveryEvidence(history, context.workflow);
+        if (!evidence.valid) throw new TaskboardError("缺少有效独立PASS，不能登记交付尝试", {
+          code: "DELIVERY_INDEPENDENT_PASS_REQUIRED", status: 409
+        });
+        const deliveryClaim = [...history].reverse().find((event) =>
+          event.event_type === "claim" && event.new_status === "交付中" && event.actor_type === "developer_ai");
+        if (!deliveryClaim || deliveryClaim.actor_id !== body.actorId || deliveryClaim.session_id !== body.sessionId) {
+          throw new TaskboardError("交付失败必须由当前正式交付认领者登记", {
+            code: "DELIVERY_CLAIM_MISMATCH", status: 409
+          });
+        }
+        if (body.actorId !== evidence.developerActorId || body.sessionId !== evidence.developerSessionId) {
+          throw new TaskboardError("交付失败必须由原开发AI和原Session记录", {
+            code: "DELIVERY_ORIGINAL_DEVELOPER_REQUIRED", status: 409,
+            details: { requiredActorId: evidence.developerActorId, requiredSessionId: evidence.developerSessionId }
+          });
+        }
+        const failureStage = String(body.failureStage || "").trim();
+        const allowedStages = ["merge", "push", "remote_sync", "regression", "report", "verification"];
+        if (!allowedStages.includes(failureStage)) throw new TaskboardError("failureStage必须为merge/push/remote_sync/regression/report/verification", {
+          code: "INVALID_DELIVERY_FAILURE_STAGE", status: 400
+        });
+        const note = String(body.note || "").trim().slice(0, 1000);
+        const nextAction = String(body.nextAction || "").trim().slice(0, 1000);
+        if (!note || !nextAction) throw new TaskboardError("交付失败必须同时记录失败原因和下一步动作", {
+          code: "DELIVERY_FAILURE_DETAILS_REQUIRED", status: 400
+        });
+        const result = await taskStore.appendTaskEvent(params.projectId, params.taskId, {
+          expectedRevision: body.expectedRevision,
+          operationId: body.operationId,
+          eventType: "delivery_attempt_failed",
+          ...actorOptions(identity, { ...body, actorType }),
+          note,
+          metadata: {
+            ...(body.metadata || {}),
+            failureStage,
+            failureCode: String(body.failureCode || "DELIVERY_ATTEMPT_FAILED").trim().slice(0, 100),
+            failureMessage: note,
+            nextAction,
+            candidateSha: evidence.latestResult?.metadata?.commitSha || null,
+            deliveryFailureRecorded: true
+          }
+        });
+        return send(res, 200, result);
+      }
+
       params = routeMatch(url.pathname, "/api/projects/:projectId/tasks/:taskId/claim");
       if (req.method === "POST" && params) {
         const body = await readJson(req);
@@ -1351,6 +1399,24 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           });
         }
         const actorId = body.actorId || identity.actorId || "taskctl";
+        if (task.status === "待交付") {
+          if (actorType !== "developer_ai" || !body.actorId || !body.sessionId) {
+            throw new TaskboardError("待交付只能由原开发AI使用原Session认领", {
+              code: "DELIVERY_ORIGINAL_DEVELOPER_REQUIRED", status: 409
+            });
+          }
+          const deliveryHistory = await taskStore.taskHistory(params.projectId, params.taskId, { limit: 1000 });
+          const evidence = deliveryEvidence(deliveryHistory, context.workflow);
+          if (!evidence.valid) throw new TaskboardError("缺少有效的最新独立测试PASS，禁止认领交付任务", {
+            code: "DELIVERY_INDEPENDENT_PASS_REQUIRED", status: 409
+          });
+          if (actorId !== evidence.developerActorId || body.sessionId !== evidence.developerSessionId) {
+            throw new TaskboardError("待交付必须由最初开发交接的原开发AI和原Session认领", {
+              code: "DELIVERY_ORIGINAL_DEVELOPER_REQUIRED", status: 409,
+              details: { requiredActorId: evidence.developerActorId, requiredSessionId: evidence.developerSessionId }
+            });
+          }
+        }
         const userMessages = await taskStore.userMessageState(params.projectId, params.taskId, {
           actorType,
           actorId,
@@ -1531,8 +1597,9 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           });
         }
         const state = await taskStore.takeoverState(params.projectId, params.taskId);
-        if (!state.suspectedDisconnect || !state.suspicion) {
-          throw new TaskboardError("必须先记录疑似失联及核验依据，才能授权异常接管", {
+        const explicitUserOverride = authorizationEvidence.authorizationSource === "chat_user_instruction_cooperative";
+        if ((!state.suspectedDisconnect || !state.suspicion) && !explicitUserOverride) {
+          throw new TaskboardError("必须先记录疑似失联及核验依据，或提供当前用户明确的异常接管指令", {
             code: "TAKEOVER_SUSPICION_REQUIRED", status: 409
           });
         }
@@ -1548,7 +1615,8 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
             authorizedFromSessionId: task.sessionId || "",
             authorizedFromSessionWindowName: task.sessionWindowName || "",
             authorizedRegistryRevision: snapshot.registryRevision,
-            suspicionOperationId: state.suspicion.operation_id || null,
+            suspicionOperationId: state.suspicion?.operation_id || null,
+            explicitUserOverride,
             ...authorizationEvidence
           }
         });

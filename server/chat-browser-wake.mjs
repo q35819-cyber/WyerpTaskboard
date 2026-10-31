@@ -172,12 +172,19 @@ export class ChatBrowserWake {
 
     for (const item of (candidates || [])) {
       if (!item?.eligible || (role && item.eligible_role !== role)) continue;
+      const eligibleActorId = item.eligible_actor_id ? cleanRef(item.eligible_actor_id) : null;
+      const eligibleSessionId = item.eligible_session_id ? cleanRef(item.eligible_session_id) : null;
+      if (Boolean(eligibleActorId) !== Boolean(eligibleSessionId)) continue;
       const candidate = {
         project_id: cleanRef(item.project_id),
         task_id: cleanRef(item.task_id),
         detection_id: cleanRef(item.detection_id),
         eligible_role: cleanRef(item.eligible_role)
       };
+      if (eligibleActorId && eligibleSessionId) {
+        candidate.eligible_actor_id = eligibleActorId;
+        candidate.eligible_session_id = eligibleSessionId;
+      }
       if (Object.values(candidate).some(value => !value)) continue;
       if (state.acked[candidate.detection_id]) continue;
 

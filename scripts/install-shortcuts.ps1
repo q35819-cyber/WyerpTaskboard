@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$Url = "http://127.0.0.1:47831",
   [string]$DesktopPath = [Environment]::GetFolderPath("Desktop"),
   [string]$StartMenuProgramsPath = (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"),

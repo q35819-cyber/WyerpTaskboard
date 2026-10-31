@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { atomicWriteJson } from "./core/atomic-files.mjs";
-const REPO=process.env.WTB_ERP_GITHUB_REPO || "example-owner/example-repo", ROUTE="/api/erp-release/pass/verify";
+const DEFAULT_REPO="example-owner/example-repo", ROUTE="/api/erp-release/pass/verify";
 const SHA=/^[a-f0-9]{40}$/, HASH=/^[a-f0-9]{64}$/, ID=/^[A-Za-z0-9][A-Za-z0-9_.:-]{3,199}$/;
 const BRANCH=/^(?:feature|fix|hotfix|codex|integration)\/[A-Za-z0-9][A-Za-z0-9._/-]{0,190}$/;
 const OK=new Set(["待交付","交付中","待用户验收","已完成"]), HOLD=new Set(["HOLD","阻断","测试失败待修复","待复测","复测中"]);
@@ -16,7 +16,7 @@ function validUrl(raw){try{const u=new URL(raw);return u.protocol==="https:"&&!u
 function last(a,fn){return [...a].reverse().find(fn);}
 export class ErpPassGate{
  constructor({rootDir,taskStore,systemEventLog=null,env=process.env,fetchImpl=fetch,now=()=>Date.now(),githubHead=null}={}){
- this.rootDir=rootDir;this.taskStore=taskStore;this.systemEventLog=systemEventLog;this.env=env;this.fetchImpl=fetchImpl;this.now=now;this.githubHead=githubHead;
+ this.rootDir=rootDir;this.taskStore=taskStore;this.systemEventLog=systemEventLog;this.env=env;this.repo=String(env.WTB_ERP_GITHUB_REPO || DEFAULT_REPO);this.fetchImpl=fetchImpl;this.now=now;this.githubHead=githubHead;
  this.path=path.join(rootDir,"data","erp-pass-dispatch-gate","ledger.json");this.ledger={version:1,entries:{}};this.busy=false;}
  get verifyEnabled(){return this.env.WTB_ERP_PASS_DISPATCH_ENABLED==="1"&&validUrl(this.env.WTB_ERP_PASS_VERIFY_URL)&&(this.env.WTB_ERP_PASS_VERIFY_TOKEN||"").length>=32;}
  get dispatchEnabled(){return this.verifyEnabled&&(this.env.WTB_ERP_GITHUB_DISPATCH_TOKEN||"").length>=32;}
@@ -24,7 +24,7 @@ export class ErpPassGate{
  async init(){try{const x=JSON.parse(await fs.readFile(this.path,"utf8"));if(x.version!==1||!x.entries||typeof x.entries!=="object")throw Error("ledger_invalid");this.ledger=x;}catch(e){if(e.code!=="ENOENT")throw e;}return this;}
  async persist(){await fs.mkdir(path.dirname(this.path),{recursive:true});await atomicWriteJson(this.path,this.ledger);}
  async audit(event,p={},reason=null){if(this.systemEventLog)await this.systemEventLog.append({component:"erp-pass-dispatch",event,result:event,details:{task_id:p.task_id||null,evidence_id:p.evidence_id||null,commit_sha:p.commit_sha||null,reason}});}
- async head(branch){if(this.githubHead)return this.githubHead(branch);const u="https://api.github.com/repos/"+REPO+"/branches/"+branch.split("/").map(encodeURIComponent).join("/");const r=await this.fetchImpl(u,{headers:{"User-Agent":"WyerpTaskboard-ERP-PASS","Accept":"application/vnd.github+json"},redirect:"error",signal:AbortSignal.timeout(12000)});if(!r.ok)deny("github_head_unavailable",503);return (await r.json()).commit?.sha;}
+ async head(branch){if(this.githubHead)return this.githubHead(branch);const u="https://api.github.com/repos/"+this.repo+"/branches/"+branch.split("/").map(encodeURIComponent).join("/");const r=await this.fetchImpl(u,{headers:{"User-Agent":"WyerpTaskboard-ERP-PASS","Accept":"application/vnd.github+json"},redirect:"error",signal:AbortSignal.timeout(12000)});if(!r.ok)deny("github_head_unavailable",503);return (await r.json()).commit?.sha;}
  async verify(input){
   const p=payloadOk(input);if(!this.verifyEnabled)deny("gate_disabled",503);
   const {task}=await this.taskStore.getTask("erp-x20",p.task_id);if(!OK.has(task.status)||HOLD.has(task.status))deny("task_not_ready");
@@ -77,11 +77,11 @@ export class ErpPassGate{
  async defaultWorkflow(){
   const headers={Authorization:"Bearer "+this.env.WTB_ERP_GITHUB_DISPATCH_TOKEN,Accept:"application/vnd.github+json","User-Agent":"WyerpTaskboard-ERP-PASS"};
   const opts={headers,redirect:"error",signal:AbortSignal.timeout(12000)};
-  const repo=await this.fetchImpl("https://api.github.com/repos/"+REPO,opts);
+  const repo=await this.fetchImpl("https://api.github.com/repos/"+this.repo,opts);
   if(!repo.ok)deny("github_repository_unavailable",503);
   const branch=(await repo.json()).default_branch;
   if(typeof branch!=="string"||!branch)deny("github_default_unknown");
-  const workflow=await this.fetchImpl("https://api.github.com/repos/"+REPO+"/contents/.github/workflows/erp-beta-release-integration.yml?ref="+encodeURIComponent(branch),opts);
+  const workflow=await this.fetchImpl("https://api.github.com/repos/"+this.repo+"/contents/.github/workflows/erp-beta-release-integration.yml?ref="+encodeURIComponent(branch),opts);
   if(!workflow.ok)deny("github_default_workflow_missing");
  }
  async drain(){
@@ -95,7 +95,7 @@ export class ErpPassGate{
    entry.state="sending";entry.attempts++;entry.sentAt=new Date(this.now()).toISOString();
    await this.persist(); // never auto-replay if network state is unknown
    try{
-    const response=await this.fetchImpl("https://api.github.com/repos/"+REPO+"/dispatches",{
+    const response=await this.fetchImpl("https://api.github.com/repos/"+this.repo+"/dispatches",{
      method:"POST",redirect:"error",signal:AbortSignal.timeout(15000),
      headers:{Authorization:"Bearer "+this.env.WTB_ERP_GITHUB_DISPATCH_TOKEN,Accept:"application/vnd.github+json","Content-Type":"application/json","User-Agent":"WyerpTaskboard-ERP-PASS"},
      body:JSON.stringify({event_type:"erp-independent-test-passed",client_payload:{task_id:receipt.task_id,commit_sha:receipt.commit_sha,head_branch:receipt.head_branch,evidence_id:receipt.evidence_id}})

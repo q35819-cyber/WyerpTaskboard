@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { ChatgptMcpExecutor, buildCandidatePrompt, parseSnapshotNodes } from "../server/chatgpt-mcp-executor.mjs";
 
 function snapshot({ extra = "", focused = "全局插件方案 - Google Chrome" } = {}) {
@@ -160,9 +161,23 @@ test("candidate prompt keeps role/model/version handoff contract", () => {
   assert.match(prompt, /不得替开发改业务代码/);
 });
 
+test("WyerpTaskboard role governance docs referenced by wake prompt exist", async () => {
+  const [developer, tester] = await Promise.all([
+    readFile(new URL("../docs/governance/开发AI工作规范.md", import.meta.url), "utf8"),
+    readFile(new URL("../docs/governance/测试AI工作规范.md", import.meta.url), "utf8")
+  ]);
+  assert.match(developer, /delivery-failed/);
+  assert.match(developer, /原开发actor-id/);
+  assert.match(tester, /独立测试 AI/);
+  assert.match(tester, /不得修改业务实现/);
+});
+
 test("WyerpTaskboard developer candidate prompt hard-requires role doc and self-test after code changes", () => {
   const prompt = buildCandidatePrompt({
-    candidate: { project_id: "wyerp-taskboard", task_id: "WTB-X", detection_id: "det-dev", eligible_role: "developer_ai" },
+    candidate: {
+      project_id: "wyerp-taskboard", task_id: "WTB-X", detection_id: "det-dev", eligible_role: "developer_ai",
+      eligible_actor_id: "developer_1", eligible_session_id: "wc_sess_original_1"
+    },
     role: "developer_ai",
     execution_settings: { developer: { model: "GPT-5.6 Sol", reasoning_effort: "high" } },
     taskboard_version: "0.6.37"
@@ -171,4 +186,8 @@ test("WyerpTaskboard developer candidate prompt hard-requires role doc and self-
   assert.match(prompt, /每完成一个成功逻辑代码修改事务\/可验证代码批次后立即执行相关开发自测/);
   assert.match(prompt, /自测失败必须继续修复或登记真实阻断/);
   assert.match(prompt, /禁止taskctl complete/);
+  assert.match(prompt, /required_actor_id=developer_1/);
+  assert.match(prompt, /required_session_id=wc_sess_original_1/);
+  assert.match(prompt, /不得把候选提供的值冒充为自己的身份/);
+  assert.match(prompt, /taskctl delivery-failed/);
 });

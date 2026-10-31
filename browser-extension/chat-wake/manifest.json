@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "WyerpTaskboard Chat Wake",
-  "version": "0.6.37",
+  "version": "0.6.38",
   "description": "Role-isolated ChatGPT wake bridge for WyerpTaskboard.",
   "permissions": [
     "tabs",

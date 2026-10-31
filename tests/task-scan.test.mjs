@@ -93,25 +93,50 @@ test("delivery candidates require a recorded non-empty real delivery action", as
   ]), "utf8");
   const taskStore = await new TaskStore(fixture.boardRoot).init();
   await taskStore.appendTaskEvent("fixture", "D-REAL", {
+    operationId: "delivery.candidate.handoff.001",
+    eventType: "handoff",
+    actorType: "developer_ai",
+    actorId: "developer",
+    sessionId: "developer-session",
+    metadata: { atomicLifecycle: true, completedFromStatus: "开发中", handoffTarget: "待独测" }
+  });
+  await taskStore.appendTaskEvent("fixture", "D-REAL", {
+    operationId: "delivery.candidate.claim.001",
+    eventType: "claim",
+    actorType: "test_ai",
+    actorId: "tester",
+    sessionId: "tester-session",
+    metadata: { claimedFromStatus: "待独测" }
+  });
+  await taskStore.appendTaskEvent("fixture", "D-REAL", {
     operationId: "delivery.candidate.real.001",
     eventType: "test_result",
     actorType: "test_ai",
     actorId: "tester",
+    sessionId: "tester-session",
     metadata: {
+      atomicLifecycle: true,
       testResult: "pass",
       deliveryDisposition: "required",
-      deliveryActions: ["deploy_switch"],
+      deliveryActions: ["candidate_merge"],
+      commitSha: "a".repeat(40),
+      headBranch: "feature/delivery-candidate",
       handoffTarget: "待交付"
     }
   });
   const requirementStore = await new RequirementStore(fixture.boardRoot).init();
   const evaluator = new CandidateEvaluator(fixture.boardRoot, { taskStore, requirementStore });
   const evaluated = await evaluator.evaluateProject("fixture");
-  assert.equal(evaluated.candidates.some((item) => item.task_id === "D-EMPTY"), false);
+  const empty = evaluated.candidates.find((item) => item.task_id === "D-EMPTY");
+  assert.ok(empty, "待交付任务不能因缺少证据而从看板消失");
+  assert.equal(empty.eligible, false);
+  assert.ok(empty.blockers.some((item) => item.includes("缺少有效的最新独立测试PASS")));
   const real = evaluated.candidates.find((item) => item.task_id === "D-REAL");
   assert.ok(real);
   assert.equal(real.eligible_role, "developer_ai");
   assert.equal(real.eligible, true);
+  assert.equal(real.eligible_actor_id, "developer");
+  assert.equal(real.eligible_session_id, "developer-session");
   assert.match(real.reason, /真实交付动作/);
 });
 
@@ -342,8 +367,24 @@ test("developer candidate queue order prefers delivery then failures then waitin
   ]), "utf8");
   const taskStore = await new TaskStore(fixture.boardRoot).init();
   await taskStore.appendTaskEvent("fixture", "DEV-DELIVERY", {
-    operationId: "delivery.queue.real.001", eventType: "test_result", actorType: "test_ai", actorId: "tester",
-    metadata: { testResult: "pass", deliveryDisposition: "required", deliveryActions: ["deploy_switch"], handoffTarget: "待交付" }
+    operationId: "delivery.queue.handoff.001",
+    eventType: "handoff",
+    actorType: "developer_ai",
+    actorId: "developer",
+    sessionId: "developer-session",
+    metadata: { atomicLifecycle: true, completedFromStatus: "开发中", handoffTarget: "待独测" }
+  });
+  await taskStore.appendTaskEvent("fixture", "DEV-DELIVERY", {
+    operationId: "delivery.queue.claim.001",
+    eventType: "claim",
+    actorType: "test_ai",
+    actorId: "tester",
+    sessionId: "tester-session",
+    metadata: { claimedFromStatus: "待独测" }
+  });
+  await taskStore.appendTaskEvent("fixture", "DEV-DELIVERY", {
+    operationId: "delivery.queue.real.001", eventType: "test_result", actorType: "test_ai", actorId: "tester", sessionId: "tester-session",
+    metadata: { atomicLifecycle: true, testResult: "pass", deliveryDisposition: "required", deliveryActions: ["candidate_merge"], commitSha: "b".repeat(40), headBranch: "feature/delivery", handoffTarget: "待交付" }
   });
   const requirementStore = await new RequirementStore(fixture.boardRoot).init();
   const scanStore = await new ScanStore(fixture.boardRoot).init();

@@ -6,7 +6,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { ErpPassGate } from "../server/erp-pass-gate.mjs";
 const SHA="f".repeat(40), B="fix/erp-pass-unit-20261008", ID="ERP-PASS-DEMO-T1", NOW=Date.now();
-const ENV={WTB_ERP_PASS_DISPATCH_ENABLED:"1",WTB_ERP_PASS_VERIFY_URL:"https://board.example.test/api/erp-release/pass/verify",WTB_ERP_PASS_VERIFY_TOKEN:"v".repeat(48),WTB_ERP_GITHUB_DISPATCH_TOKEN:"g".repeat(48)};
+const ENV={WTB_ERP_PASS_DISPATCH_ENABLED:"1",WTB_ERP_PASS_VERIFY_URL:"https://board.example.test/api/erp-release/pass/verify",WTB_ERP_PASS_VERIFY_TOKEN:"v".repeat(48),WTB_ERP_GITHUB_DISPATCH_TOKEN:"g".repeat(48),WTB_ERP_GITHUB_REPO:"example-owner/erp-x20"};
 let nonce=0;
 function ev(type,actor,metadata={},step=0,extra={}){return {event_id:"evt_"+String(++nonce).padStart(10,"0"),event_type:type,actor_type:actor[0],actor_id:actor[1],session_id:actor[2],timestamp:new Date(NOW-100000+step*1000).toISOString(),metadata,...extra};}
 async function setup(t,{enabled=true,fetcher}={}){

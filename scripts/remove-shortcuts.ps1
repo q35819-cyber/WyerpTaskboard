@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$DesktopPath = [Environment]::GetFolderPath("Desktop"),
   [string]$StartMenuProgramsPath = (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"),
   [switch]$DesktopOnly,

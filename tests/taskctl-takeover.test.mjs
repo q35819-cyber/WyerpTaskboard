@@ -53,13 +53,9 @@ test("taskctl takeover only succeeds after browser user authorization", async (t
   );
 
   const auth = JSON.parse(await fs.readFile(path.join(fixture.boardRoot, "config", "admin-secret.json"), "utf8"));
-  const login = await fetch(base + "/api/auth/login", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ secret: auth.adminSecret })
-  });
+  const login = await fetch(base + "/api/auth/session");
   const loginBody = await login.json();
-  const cookie = login.headers.get("set-cookie").split(";")[0];
+  const cookie = "";
   const allow = await fetch(base + "/api/projects/fixture/tasks/B-10/takeover/allow", {
     method: "POST",
     headers: {

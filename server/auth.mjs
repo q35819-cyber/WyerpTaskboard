@@ -11,12 +11,11 @@ function safeEqual(a, b) {
 }
 
 export class AuthManager {
-  constructor(rootDir, { sessionTtlMs = 12 * 60 * 60 * 1000 } = {}) {
+  constructor(rootDir) {
     this.rootDir = rootDir;
     this.secretPath = path.join(rootDir, "config", "admin-secret.json");
-    this.sessionTtlMs = sessionTtlMs;
-    this.sessions = new Map();
     this.adminSecret = null;
+    this.localCsrf = randomBytes(32).toString("base64url");
   }
 
   async init() {
@@ -40,31 +39,12 @@ export class AuthManager {
 
   verifyAdminSecret(secret) { return safeEqual(secret, this.adminSecret); }
 
-  createSession() {
-    const id = randomBytes(24).toString("base64url");
-    const csrf = randomBytes(24).toString("base64url");
-    const now = Date.now();
-    this.sessions.set(id, { id, csrf, createdAt: now, lastSeenAt: now });
-    return { id, csrf };
-  }
 
-  getSession(id) {
-    const session = this.sessions.get(id);
-    if (!session) return null;
-    if (Date.now() - session.lastSeenAt > this.sessionTtlMs) {
-      this.sessions.delete(id);
-      return null;
+  authenticate({ bearer }) {
+    if (bearer) {
+      if (this.verifyAdminSecret(bearer)) return { mode: "bearer", actorId: "local-admin-cli", csrf: null };
+      throw new TaskboardError("本机API令牌无效", { code: "UNAUTHORIZED", status: 401 });
     }
-    session.lastSeenAt = Date.now();
-    return session;
-  }
-
-  deleteSession(id) { this.sessions.delete(id); }
-
-  authenticate({ sessionId, bearer }) {
-    if (bearer && this.verifyAdminSecret(bearer)) return { mode: "bearer", actorId: "local-admin-cli", csrf: null };
-    const session = sessionId ? this.getSession(sessionId) : null;
-    if (!session) throw new TaskboardError("未登录或会话已过期", { code: "UNAUTHORIZED", status: 401 });
-    return { mode: "session", actorId: "local-admin", csrf: session.csrf, session };
+    return { mode: "session", actorId: "local-user", csrf: this.localCsrf, session: null };
   }
 }

@@ -123,12 +123,19 @@ export function buildCandidatePrompt({
   const roleGate = targetRole === "test_ai"
     ? "角色门禁：开始测试前必须实际阅读测试AI工作规范，并核对固定被测版本及最后一次代码修改之后的开发自测证据；缺证据进入待准备/补证据，不得替开发改业务代码或补开发自测后冒充开发证据。"
     : "角色门禁：第一次代码写入前必须实际阅读开发AI工作规范；每完成一个成功逻辑代码修改事务/可验证代码批次后立即执行相关开发自测。自测失败必须继续修复或登记真实阻断；最后一次代码修改之后没有有效自测证据时，禁止taskctl complete、禁止进入待独测/待复测、禁止宣称开发完成。";
+  const requiredActorId = String(candidate.eligible_actor_id || "");
+  const requiredSessionId = String(candidate.eligible_session_id || "");
+  const deliveryIdentityGate = requiredActorId || requiredSessionId
+    ? "交付身份门禁：此候选只允许原开发AI认领。required_actor_id和required_session_id必须同时与当前WebCodex实际actor-id及Session ID完全一致；不得把候选提供的值冒充为自己的身份。任一不一致或无法确认，禁止claim，保留任务给原开发会话。"
+    : null;
   return [
     "WyerpTaskboard candidate_ready",
     "project_id=" + candidate.project_id,
     "task_id=" + candidate.task_id,
     "detection_id=" + candidate.detection_id,
     "eligible_role=" + candidate.eligible_role,
+    "required_actor_id=" + (requiredActorId || "none"),
+    "required_session_id=" + (requiredSessionId || "none"),
     "chat_role=" + targetRole,
     "chat_request=" + count + "/" + maxRequests,
     "required_model=" + String(required?.model || "unspecified"),
@@ -138,12 +145,13 @@ export function buildCandidatePrompt({
     "taskboard_version=" + String(taskboard_version || "unknown"),
     "role_governance=" + roleDoc,
     roleGate,
+    deliveryIdentityGate,
     warning,
     recovery_after_timeout ? "timeout_takeover_authorized=1" : null,
     recovery_after_timeout
       ? "这是超时后的新会话恢复：用户已授权因连续超时切换会话。请用WebCodex重新核对原任务claim、所有权、guard和断点；若仍属于当前ChatGPT角色则继续原任务，不要重新创建平行任务。"
       : null,
-    "请先核对当前聊天实际模型和推理强度是否满足required_model/required_reasoning_effort；不满足则不要claim，并提示用户手动切换。版本只做各自项目内核对：extension_version必须等于extension_latest_version；taskboard_version由当前看板服务自身package版本提供。扩展版与看板版允许不同，不得因二者不同停止。然后使用WebCodex核对当前项目真值、用户留言、guard、资源冲突和角色资格；满足条件后继续执行，不要仅总结。无人值守交接规则：developer_ai完成实现、自测和开发报告后必须调用taskctl complete，由服务端原子切到待独测/待复测并释放开发占用；test_ai完成独测/复测报告后必须调用taskctl test-result --result pass|fail|blocked，由服务端原子回流开发或进入待交付并释放测试占用。禁止再用手工transition+release代替这两个原子动作。"
+    "请先核对当前聊天实际模型和推理强度是否满足required_model/required_reasoning_effort；不满足则不要claim，并提示用户手动切换。版本只做各自项目内核对：extension_version必须等于extension_latest_version；taskboard_version由当前看板服务自身package版本提供。扩展版与看板版允许不同，不得因二者不同停止。然后使用WebCodex核对当前项目真值、用户留言、guard、资源冲突和角色资格；满足条件后继续执行，不要仅总结。无人值守交接规则：developer_ai完成实现、自测和开发报告后必须调用taskctl complete，由服务端原子切到待独测/待复测并释放开发占用；test_ai完成独测/复测报告后必须沿用正式claim时相同的--actor-id和--session-id调用taskctl test-result --result pass|fail|blocked，由服务端原子回流开发或进入待交付并释放测试占用；若delivery-actions包含candidate_merge，必须同时传--commit-sha和--branch，把独测PASS绑定到实际测试的唯一候选提交。待交付候选会携带required_actor_id和required_session_id，只有原开发AI在原Session中才能认领，不匹配不得尝试或伪造身份；认领后进入交付中。必须把独测PASS绑定的candidate_merge提交合入origin默认分支并推送，切回默认分支确认本地HEAD与远端SHA完全一致，完成合并后回归并生成包含“结论：PASS”、候选SHA和main SHA的报告，最后必须使用原actor-id和当前交付claim的原session-id调用taskctl complete --actor-id 原actor --session-id 原Session --report 报告路径，自动核验Git与报告并关闭任务。任何merge/push/remote_sync/regression/report/verification失败，都必须调用taskctl delivery-failed登记failure-stage、failure-code、note和next-action；不得只在聊天里汇报或让任务无错误信息地停在交付中。交付中禁止手动transition到待用户验收/已完成；不得长期停留交付中。独测PASS后若发生代码修改，必须重新独测。禁止再用手工transition+release代替原子流程。"
   ].filter(Boolean).join(" | ");
 }
 

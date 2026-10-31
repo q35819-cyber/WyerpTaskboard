@@ -10,9 +10,9 @@ const state={
 };
 const $=id=>document.getElementById(id);
 const els=Object.fromEntries([
-  "toast","loginView","appView","loginForm","adminSecret","projectSelect","addRequirementBtn","requirementDialog","requirementForm","requirementText","closeRequirementDialogBtn","reloadRequirementsBtn","requirementList","addProjectBtn","removeProjectBtn","adaptProjectBtn","addProjectDialog",
+  "toast","appView","projectSelect","addRequirementBtn","requirementDialog","requirementForm","requirementText","closeRequirementDialogBtn","reloadRequirementsBtn","requirementList","addProjectBtn","removeProjectBtn","adaptProjectBtn","addProjectDialog",
   "addProjectForm","closeAddProjectBtn","cancelAddProjectBtn","projectRootInput","projectNameInput","projectIdInput",
-  "projectRegistryInput","refreshBtn","logoutBtn","aiSettingsBtn","aiSettingsDialog","aiSettingsForm","closeAiSettingsBtn","cancelAiSettingsBtn","developerModel","developerReasoning","testModel","testReasoning","scanIntervalMinutes","maxRequestsPerChat","contextWarningAt","timeoutRetryLimit","anomalyWindowMinutes","anomalyLimit","roleSwitchLimit","loginVersion","appVersion","projectHealth","projectService","projectServiceStatus","projectStartRestartBtn","projectStopServiceBtn","scanStatus","summary","searchInput","planFilter","trackFilter",
+  "projectRegistryInput","refreshBtn","aiSettingsBtn","aiSettingsDialog","aiSettingsForm","closeAiSettingsBtn","cancelAiSettingsBtn","developerModel","developerReasoning","testModel","testReasoning","scanIntervalMinutes","maxRequestsPerChat","contextWarningAt","timeoutRetryLimit","anomalyWindowMinutes","anomalyLimit","roleSwitchLimit","appVersion","projectHealth","projectService","projectServiceStatus","projectStartRestartBtn","projectStopServiceBtn","scanStatus","summary","searchInput","planFilter","trackFilter",
   "priorityFilter","statusFilter","archiveFilter","boardViewBtn","listViewBtn","boardView","listView","taskTableBody",
   "planDialog","planDialogTitle","planDialogPath","planNavigator","planLocationStatus","planIndexList","planDocumentContent","closePlanDialogBtn",
   "taskDialog","closeDialogBtn","detailTaskId","detailTitle","userMessagePanel","userMessageCount","userMessageList",
@@ -51,7 +51,7 @@ async function api(url,options={}){
   if(!res.ok){const err=new Error(data?.error?.message||("请求失败（"+res.status+"）"));err.code=data?.error?.code;err.status=res.status;err.details=data?.error?.details||null;throw err}
   return data;
 }
-async function loadAppVersion(){try{const data=await api("/healthz");const label="v"+(data.version||"—");if(els.loginVersion)els.loginVersion.textContent=label;if(els.appVersion)els.appVersion.textContent=label;state.appVersion=data.version||null;return data.version||null}catch{if(els.loginVersion)els.loginVersion.textContent="v?";if(els.appVersion)els.appVersion.textContent="v?";return null}}
+async function loadAppVersion(){try{const data=await api("/healthz");if(els.appVersion)els.appVersion.textContent="v"+(data.version||"—");state.appVersion=data.version||null;return data.version||null}catch{if(els.appVersion)els.appVersion.textContent="v?";return null}}
 async function restoreSession(){try{const session=await api("/api/auth/session");state.csrfToken=session.csrfToken;return true}catch{return false}}
 function formatTime(value){if(!value)return"—";const d=new Date(value);return Number.isNaN(d.getTime())?value:d.toLocaleString()}
 function trackLabel(value){return TRACK_LABELS[value]||"其它类别"}
@@ -268,10 +268,14 @@ async function startOrRestartProjectService(){
     await loadAppVersion();
     if(!sameProject(projectId,epoch))return;
     state.csrfToken=null;
+    if(!await restoreSession()){
+      toast("项目服务已重启，但本机访问令牌刷新失败，请刷新页面",true);
+      return;
+    }
+    if(!sameProject(projectId,epoch))return;
     state.projectServiceStatus={supported:true,state:"running",port:47831};
     renderProjectServiceStatus();
-    showLogin();
-    toast("项目服务已"+(result.action==="restart"?"重启":"启动")+"，请重新登录");
+    await refreshAll("项目服务已"+(result.action==="restart"?"重启":"启动"));
   }catch(error){
     toast("项目启动/重启失败："+error.message,true);
     await loadProjectServiceStatus();
@@ -484,10 +488,8 @@ async function refreshAll(message=null){
     if(await loadProject()===false)return;
     await loadProjectServiceStatus();
     if(message)toast(message);
-  }catch(error){if(error.status===401)return showLogin();toast(error.message,true)}
+  }catch(error){toast(error.message,true)}
 }
-function showLogin(){state.csrfToken=null;els.appView.hidden=true;els.loginView.hidden=false}
-function showApp(){els.loginView.hidden=true;els.appView.hidden=false}
 function jumpToPlanLine(lineNumber){
   const target=els.planDocumentContent.querySelector('[data-plan-line="'+String(lineNumber)+'"]');
   if(!target)return;
@@ -820,12 +822,6 @@ els.addProjectForm.addEventListener("submit",async event=>{
     await refreshAll(adaptationRequired?"项目已登记，但格式不满足任务看板要求；可点击“自动适配当前项目”继续":"项目已验证并添加");
   }catch(error){toast(error.message,true)}
 });
-els.loginForm.addEventListener("submit",async event=>{
-  event.preventDefault();
-  try{const result=await api("/api/auth/login",{method:"POST",body:{secret:els.adminSecret.value}});state.csrfToken=result.csrfToken;els.adminSecret.value="";showApp();await refreshAll("已登录")}
-  catch(error){toast(error.message,true)}
-});
-els.logoutBtn.addEventListener("click",async()=>{try{await api("/api/auth/logout",{method:"POST",body:{}})}catch{}showLogin()});
 els.projectSelect.addEventListener("change",async()=>{switchProject(els.projectSelect.value);await loadProject();await loadProjectServiceStatus()});
 els.refreshBtn.addEventListener("click",()=>refreshAll("已刷新"));
 for(const input of[els.searchInput,els.planFilter,els.trackFilter,els.priorityFilter,els.statusFilter,els.archiveFilter]){
@@ -862,5 +858,5 @@ els.rejectBtn.addEventListener("click",()=>mutateTask("/review",{operationId:opI
 els.stopBtn.addEventListener("click",()=>mutateTask("/stop",{operationId:opId("stop"),expectedRevision:state.selectedTask.registryRevision,note:els.reviewNote.value||"用户从任务看板请求停止"},"停止请求已登记"));
 els.resumeBtn.addEventListener("click",()=>mutateTask("/resume",{operationId:opId("resume"),expectedRevision:state.selectedTask.registryRevision,note:els.reviewNote.value||"用户从任务看板恢复任务"},"任务已恢复或停止请求已取消"));
 
-(async()=>{await loadAppVersion();if(await restoreSession()){showApp();await refreshAll()}else showLogin()})();
-setInterval(()=>{if(!els.appView.hidden&&!document.hidden&&!els.taskDialog.open&&!els.planDialog.open&&!els.requirementDialog.open)refreshAll()},5000);
+(async()=>{await loadAppVersion();if(!await restoreSession()){toast("本机访问初始化失败，请检查任务看板服务",true);return}await refreshAll()})();
+setInterval(()=>{if(!document.hidden&&!els.taskDialog.open&&!els.planDialog.open&&!els.requirementDialog.open)refreshAll()},5000);

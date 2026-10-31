@@ -373,6 +373,34 @@ test("chat browser wake leases one eligible candidate and acks it", async (t) =>
   assert.equal(done.state, "no_candidate");
 });
 
+test("chat wake carries delivery ownership identity without exposing unrelated candidate fields", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "wyerp-chat-wake-owner-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await fs.mkdir(path.join(root, "config"), { recursive: true });
+  await fs.writeFile(path.join(root, "package.json"), JSON.stringify({ version: "0.6.63" }));
+  await fs.writeFile(path.join(root, "config", "chat-browser-wake.json"), JSON.stringify({
+    version: 1, enabled: true, token: "c".repeat(64), lease_ms: 30000
+  }));
+  const wake = await new ChatBrowserWake(root).init();
+  const candidates = [{
+    eligible: true, project_id: "wyerp-taskboard", task_id: "WTB-DELIVERY-1",
+    detection_id: "det_delivery_1", eligible_role: "developer_ai",
+    eligible_actor_id: "developer_1", eligible_session_id: "wc_sess_original_1",
+    private_report_path: "must_not_leak"
+  }];
+  const result = await wake.claim(candidates, "client-owner", "developer_ai", 200);
+  assert.equal(result.state, "candidate");
+  assert.deepEqual(Object.keys(result.candidate).sort(), [
+    "detection_id", "eligible_actor_id", "eligible_role", "eligible_session_id", "project_id", "task_id"
+  ]);
+  assert.equal(result.candidate.eligible_actor_id, "developer_1");
+  assert.equal(result.candidate.eligible_session_id, "wc_sess_original_1");
+  const partial = await wake.claim([{
+    ...candidates[0], detection_id: "det_delivery_partial", eligible_session_id: null
+  }], "client-owner", "developer_ai", 201);
+  assert.equal(partial.state, "no_candidate");
+});
+
 test("newer dispatcher epoch immediately supersedes an active stale lease", async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "wyerp-chat-wake-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -395,7 +423,8 @@ test("browser extension contract is chatgpt-only and uses minimal candidate fiel
   assert.deepEqual(manifest.content_scripts[0].matches, ["https://chatgpt.com/*"]);
   const content = await fs.readFile(path.join(root, "browser-extension", "chat-wake", "content.js"), "utf8");
   const executor = await fs.readFile(path.join(root, "server", "chatgpt-mcp-executor.mjs"), "utf8");
-  for (const field of ["project_id","task_id","detection_id","eligible_role"]) assert.match(content, new RegExp(field));
+  for (const field of ["project_id","task_id","detection_id","eligible_role","eligible_actor_id","eligible_session_id"]) assert.match(content, new RegExp(field));
+  assert.match(content, /ownerBindingValid/);
   for (const forbidden of ["cookie","localStorage","document.body.innerText","测试报告","源码"]) assert.equal(content.includes(forbidden), false);
   assert.match(content, /dispatcher_epoch/);
   assert.match(content, /addEventListener\("superseded"/);

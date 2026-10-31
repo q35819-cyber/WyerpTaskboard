@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import { createTaskboardServer } from "../server/http-server.mjs";
 import { makeFixture } from "./helpers.mjs";
 
-test("board state module is public static while project API remains authenticated", async (t) => {
+test("board state module and local browser project list are available without a bearer token", async (t) => {
   const fixture=await makeFixture();
   await fs.copyFile("web/board-state.mjs", fixture.boardRoot+"/web/board-state.mjs");
   const app=await createTaskboardServer({rootDir:fixture.boardRoot,host:"127.0.0.1",port:0});
@@ -22,5 +22,5 @@ test("board state module is public static while project API remains authenticate
   assert.match(await moduleResponse.text(),/export function tasksForColumn/);
 
   const denied=await fetch(base+"/api/projects");
-  assert.equal(denied.status,401);
+  assert.equal(denied.status,200);
 });

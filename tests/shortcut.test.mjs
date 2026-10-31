@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
-const root = "D:\\WyerpTaskboard";
+const root = path.resolve(import.meta.dirname, "..");
 const install = path.join(root, "scripts", "install-shortcuts.ps1");
 const remove = path.join(root, "scripts", "remove-shortcuts.ps1");
 

@@ -23,15 +23,12 @@ async function startFixture(t, serverOptions = {}) {
 }
 
 async function login(base, secret) {
-  const response = await fetch(base + "/api/auth/login", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Origin: base },
-    body: JSON.stringify({ secret }),
-  });
+  const response = await fetch(base + "/api/auth/session");
   assert.equal(response.status, 200);
   const body = await response.json();
-  const cookie = response.headers.get("set-cookie").split(";")[0];
-  return { cookie, csrf: body.csrfToken };
+  assert.equal(body.mode, "session");
+  assert.ok(body.csrfToken);
+  return { cookie: "", csrf: body.csrfToken };
 }
 
 let preclaimSequence = 0;
@@ -53,14 +50,21 @@ async function recordPreclaim(base, secret, taskId, {
   return response.json();
 }
 
-test("health endpoint is loopback service and auth is required for projects", async (t) => {
+test("taskboard opens without a password and retires the legacy login endpoint", async (t) => {
   const { base } = await startFixture(t);
   assert.equal((await fetch(base + "/healthz")).status, 200);
-  const denied = await fetch(base + "/api/projects");
-  assert.equal(denied.status, 401);
+  const projects = await fetch(base + "/api/projects");
+  assert.equal(projects.status, 200);
+  assert.equal((await projects.json()).projects[0].id, "fixture");
+  const legacyLogin = await fetch(base + "/api/auth/login", {
+    method: "POST", headers: { "Content-Type": "application/json", Origin: base },
+    body: JSON.stringify({ secret: "not-used" })
+  });
+  assert.equal(legacyLogin.status, 410);
+  assert.equal((await legacyLogin.json()).error.code, "LOGIN_DISABLED");
 });
 
-test("session auth lists projects and rejects bad origin", async (t) => {
+test("local browser access lists projects without a password and rejects bad origin", async (t) => {
   const { base, secret } = await startFixture(t);
   const { cookie } = await login(base, secret);
   const ok = await fetch(base + "/api/projects", { headers: { Cookie: cookie } });
@@ -881,16 +885,28 @@ test("release rejects active execution and handoff atomically clears ownership",
   assert.equal(activeRelease.status, 409);
   assert.equal((await activeRelease.json()).error.code, "RELEASE_EXECUTION_STAGE_INVALID");
 
-  const handedOff = await fetch(base + "/api/projects/fixture/tasks/B-10", {
+  const genericHandoff = await fetch(base + "/api/projects/fixture/tasks/B-10", {
     method: "PATCH", headers,
     body: JSON.stringify({
-      operationId: "release.handoff.001",
+      operationId: "release.handoff.generic.001",
       expectedRevision: initial.registryRevision,
       eventType: "handoff",
       actorType: "developer_ai",
       actorId: "dev",
       sessionId: "wc_sess_test",
       patch: { status: "待独测" }
+    })
+  });
+  assert.equal(genericHandoff.status, 409);
+
+  const handedOff = await fetch(base + "/api/projects/fixture/tasks/B-10/complete-execution", {
+    method: "POST", headers,
+    body: JSON.stringify({
+      operationId: "release.handoff.001",
+      expectedRevision: initial.registryRevision,
+      actorType: "developer_ai",
+      actorId: "dev",
+      sessionId: "wc_sess_test"
     })
   });
   assert.equal(handedOff.status, 200);
@@ -1436,6 +1452,105 @@ test("project service status endpoint exposes safe state without instance secret
   const unsupportedBody = await unsupported.json();
   assert.equal(unsupportedBody.supported, false);
   assert.equal(unsupportedBody.state, "unsupported");
+});
+
+test("待交付 can only be claimed by the original developer AI from the original Session", async (t) => {
+  const { base, secret, fixture } = await startFixture(t);
+  await fs.writeFile(fixture.registryPath, registryText([
+    ["D-ORIGINAL", "F-DELIVERY", "product", "P0", "待交付", "开发AI", "—", "—", "—", "2026-10-31T00:00:00Z", "原开发者交付认领", "测试计划.md", "cp/D-ORIGINAL.md"]
+  ]), "utf8");
+  const headers = { Authorization: "Bearer " + secret, "Content-Type": "application/json" };
+  const seed = async (operationId, eventType, actorType, actorId, sessionId, metadata = {}) => {
+    const response = await fetch(base + "/api/projects/fixture/tasks/D-ORIGINAL/events", {
+      method: "POST", headers,
+      body: JSON.stringify({ operationId, eventType, actorType, actorId, sessionId, metadata })
+    });
+    assert.equal(response.status, 200, JSON.stringify(await response.json()));
+  };
+  await seed("delivery.origin.handoff.001", "handoff", "developer_ai", "original-developer", "original-session", {
+    atomicLifecycle: true, completedFromStatus: "开发中", handoffTarget: "待独测"
+  });
+  await seed("delivery.origin.tester.claim.001", "claim", "test_ai", "independent-tester", "test-session", { claimedFromStatus: "待独测" });
+  await seed("delivery.origin.tester.pass.001", "test_result", "test_ai", "independent-tester", "test-session", {
+    atomicLifecycle: true, testResult: "pass", deliveryDisposition: "required", deliveryActions: ["candidate_merge"],
+    commitSha: "a".repeat(40), headBranch: "feature/candidate", reportPath: "reports/D-ORIGINAL/pass.md"
+  });
+
+  await recordPreclaim(base, secret, "D-ORIGINAL", {
+    actorType: "developer_ai", actorId: "replacement-developer", sessionId: "replacement-session"
+  });
+  let current = await (await fetch(base + "/api/projects/fixture/tasks/D-ORIGINAL", { headers })).json();
+  const replacement = await fetch(base + "/api/projects/fixture/tasks/D-ORIGINAL/claim", {
+    method: "POST", headers,
+    body: JSON.stringify({
+      operationId: "delivery.claim.replacement.001", expectedRevision: current.registryRevision,
+      actorType: "developer_ai", actorId: "replacement-developer", assignee: "replacement-developer",
+      sessionId: "replacement-session", sessionWindowName: "替代开发窗口"
+    })
+  });
+  assert.equal(replacement.status, 409);
+  assert.equal((await replacement.json()).error.code, "DELIVERY_ORIGINAL_DEVELOPER_REQUIRED");
+
+  await recordPreclaim(base, secret, "D-ORIGINAL", {
+    actorType: "developer_ai", actorId: "original-developer", sessionId: "original-session"
+  });
+  current = await (await fetch(base + "/api/projects/fixture/tasks/D-ORIGINAL", { headers })).json();
+  const original = await fetch(base + "/api/projects/fixture/tasks/D-ORIGINAL/claim", {
+    method: "POST", headers,
+    body: JSON.stringify({
+      operationId: "delivery.claim.original.001", expectedRevision: current.registryRevision,
+      actorType: "developer_ai", actorId: "original-developer", assignee: "original-developer",
+      sessionId: "original-session", sessionWindowName: "原开发窗口"
+    })
+  });
+  const originalBody = await original.json();
+  assert.equal(original.status, 200, JSON.stringify(originalBody));
+  const claimed = originalBody;
+  assert.equal(claimed.after.status, "交付中");
+  assert.equal(claimed.after.assignee, "original-developer");
+  assert.equal(claimed.after.sessionId, "original-session");
+});
+
+test("delivery failure endpoint records the blocker and keeps original developer ownership", async (t) => {
+  const { base, secret, fixture } = await startFixture(t);
+  await fs.writeFile(fixture.registryPath, registryText([
+    ["D-FAILURE", "F-DELIVERY", "product", "P0", "交付中", "开发AI", "developer", "交付窗口", "dev-session", "2026-10-31T00:00:00Z", "交付失败恢复", "测试计划.md", "cp/D-FAILURE.md"]
+  ]), "utf8");
+  const headers = { Authorization: "Bearer " + secret, "Content-Type": "application/json" };
+  const seed = async (operationId, eventType, actorType, actorId, sessionId, metadata = {}) => {
+    const saved = await fetch(base + "/api/projects/fixture/tasks/D-FAILURE/events", {
+      method: "POST", headers,
+      body: JSON.stringify({ operationId, eventType, actorType, actorId, sessionId, metadata })
+    });
+    assert.equal(saved.status, 200, JSON.stringify(await saved.json()));
+  };
+  await seed("delivery.failure.origin.handoff.001", "handoff", "developer_ai", "developer", "dev-session", {
+    atomicLifecycle: true, completedFromStatus: "开发中", handoffTarget: "待独测"
+  });
+  await seed("delivery.failure.tester.claim.001", "claim", "test_ai", "independent-tester", "test-session", { claimedFromStatus: "待独测" });
+  await seed("delivery.failure.tester.pass.001", "test_result", "test_ai", "independent-tester", "test-session", {
+    atomicLifecycle: true, testResult: "pass", deliveryDisposition: "required", deliveryActions: ["candidate_merge"],
+    commitSha: "b".repeat(40), headBranch: "feature/candidate", reportPath: "reports/D-FAILURE/pass.md"
+  });
+  await seed("delivery.failure.developer.claim.001", "claim", "developer_ai", "developer", "dev-session", { claimedFromStatus: "待交付" });
+  const before = await (await fetch(base + "/api/projects/fixture/tasks/D-FAILURE", { headers })).json();
+  const response = await fetch(base + "/api/projects/fixture/tasks/D-FAILURE/delivery-attempt-failed", {
+    method: "POST", headers,
+    body: JSON.stringify({
+      operationId: "delivery.failure.record.001", expectedRevision: before.registryRevision,
+      actorType: "developer_ai", actorId: "developer", sessionId: "dev-session",
+      failureStage: "push", failureCode: "REMOTE_REJECTED", note: "远端推送被拒绝",
+      nextAction: "先 fetch origin/main，再同步并重试推送"
+    })
+  });
+  assert.equal(response.status, 200, JSON.stringify(await response.json()));
+  const current = await (await fetch(base + "/api/projects/fixture/tasks/D-FAILURE", { headers })).json();
+  assert.equal(current.status, "交付中");
+  assert.equal(current.assignee, "developer");
+  assert.equal(current.sessionId, "dev-session");
+  assert.match(current.presentation.currentProgress, /REMOTE_REJECTED/);
+  assert.match(current.presentation.currentProgress, /远端推送被拒绝/);
+  assert.match(current.presentation.currentProgress, /fetch origin\/main/);
 });
 
 test("independent test pass requires an explicit delivery disposition and validates real actions", async (t) => {

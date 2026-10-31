@@ -35,6 +35,38 @@ function hardDependencyBlockers(task, tasksById) {
   }
   return blockers;
 }
+export function deliveryEvidence(history, workflow) {
+  const latestResult = [...history].reverse().find((event) => event.event_type === "test_result");
+  const metadata = latestResult?.metadata || {};
+  const passIndex = latestResult ? history.indexOf(latestResult) : -1;
+  const prior = passIndex >= 0 ? history.slice(0, passIndex) : [];
+  const testerClaim = [...prior].reverse().find((event) =>
+    event.event_type === "claim" && event.actor_type === "test_ai" && event.actor_id === latestResult?.actor_id);
+  const developerHandoff = [...prior].reverse().find((event) =>
+    event.event_type === "handoff" && event.actor_type === "developer_ai"
+    && ["开发中", "修复中"].includes(event.metadata?.completedFromStatus));
+  const invalidated = passIndex >= 0 && history.slice(passIndex + 1).some((event) =>
+    event.event_type === "code_change" || event.event_type === "test_result" || event.metadata?.invalidatesTestEvidence === true);
+  const independent = Boolean(testerClaim && testerClaim.session_id === latestResult?.session_id
+    && developerHandoff && history.indexOf(developerHandoff) < history.indexOf(testerClaim)
+    && developerHandoff.actor_id !== latestResult?.actor_id
+    && developerHandoff.session_id !== latestResult?.session_id);
+  const valid = latestResult?.actor_type === "test_ai" && !invalidated && independent
+    && metadata.atomicLifecycle === true
+    && workflow.isExecutableDeliveryDecision(metadata)
+    && Array.isArray(metadata.deliveryActions)
+    && metadata.deliveryActions.includes("candidate_merge")
+    && /^[a-f0-9]{40}$/i.test(String(metadata.commitSha || ""))
+    && Boolean(String(metadata.headBranch || "").trim());
+  return {
+    valid,
+    eventId: latestResult?.event_id || null,
+    latestResult: latestResult || null,
+    developerActorId: developerHandoff?.actor_id || "",
+    developerSessionId: developerHandoff?.session_id || ""
+  };
+}
+
 function activeDeveloperTask(task) {
   return ["开发中", "修复中", "交付中"].includes(task.status) && Boolean(task.assignee || task.sessionId);
 }
@@ -100,14 +132,17 @@ export class CandidateEvaluator {
     const tasksById = new Map(parsed.tasks.map((task) => [task.id, task]));
 
     for (const task of parsed.tasks) {
+      let delivery = null;
       if (task.status === "待交付") {
-        const history = await this.taskStore.taskHistory(projectId, task.id, { limit: 200 });
-        const latestPass = [...history].reverse().find((event) => event.event_type === "test_result" && event.metadata?.testResult === "pass");
-        if (!context.workflow.isExecutableDeliveryDecision(latestPass?.metadata || {})) continue;
+        const history = await this.taskStore.taskHistory(projectId, task.id, { limit: 1000 });
+        delivery = deliveryEvidence(history, context.workflow);
       }
       const eligibleRole = roleFor(task);
       if (!eligibleRole) continue;
       const blockers = [];
+      if (task.status === "待交付" && !delivery?.valid) {
+        blockers.push("缺少有效的最新独立测试PASS、candidate_merge动作或固定候选SHA；任务保留在看板但禁止认领");
+      }
       blockers.push(...hardDependencyBlockers(task, tasksById));
       if (task.assignee || task.sessionId) blockers.push("已有负责人或活动会话");
       if (requirements.pendingCount > 0) blockers.push("存在待AI拆解的新需求");
@@ -135,7 +170,7 @@ export class CandidateEvaluator {
       }
 
       const dedupeKey = hash([projectId, task.id, task.status, task.updatedAt || "", task.plannedRole || "", eligibleRole].join("|"));
-      const sourceFingerprint = hash([parsed.fileSha256, resourceLedgerSha, task.updatedAt || "", task.assignee || "", task.sessionId || ""].join("|"));
+      const sourceFingerprint = hash([parsed.fileSha256, resourceLedgerSha, task.updatedAt || "", task.assignee || "", task.sessionId || "", delivery?.eventId || "", delivery?.developerActorId || "", delivery?.developerSessionId || ""].join("|"));
       candidates.push({
         project_id: projectId,
         task_id: task.id,
@@ -152,7 +187,10 @@ export class CandidateEvaluator {
         read_dependencies: readDependencies,
         write_targets: writeTargets,
         checkpoint_report_refs: splitRefs(task.targets),
+        delivery_evidence_event_id: delivery?.eventId || null,
         eligible_role: eligibleRole,
+        eligible_actor_id: delivery?.developerActorId || null,
+        eligible_session_id: delivery?.developerSessionId || null,
         eligible: Boolean(blockers.length === 0),
         blockers,
         reason: reasonFor(task, eligibleRole, blockers),
@@ -190,6 +228,19 @@ export class CandidateEvaluator {
     const currentRole = roleFor(task);
     const mismatches = [];
     const dependencyBlockers = hardDependencyBlockers(task, new Map(parsed.tasks.map((item) => [item.id, item])));
+    if (task.status === "待交付") {
+      const history = await this.taskStore.taskHistory(candidate.project_id, task.id, { limit: 1000 });
+      const delivery = deliveryEvidence(history, context.workflow);
+      if (!delivery.valid || delivery.eventId !== (candidate.delivery_evidence_event_id || null)) {
+        mismatches.push("delivery_evidence_changed");
+      }
+      if (candidate.eligible_actor_id && delivery.developerActorId !== candidate.eligible_actor_id) {
+        mismatches.push("delivery_developer_changed");
+      }
+      if (candidate.eligible_session_id && delivery.developerSessionId !== candidate.eligible_session_id) {
+        mismatches.push("delivery_session_changed");
+      }
+    }
     if (dependencyBlockers.length) mismatches.push("hard_dependency_blocked");
     if (parsed.registryRevision !== candidate.registry_revision) mismatches.push("registry_revision_changed");
     if (parsed.fileSha256 !== candidate.registry_sha) mismatches.push("registry_sha_changed");
@@ -208,6 +259,8 @@ export class CandidateEvaluator {
         session_id: task.sessionId,
         registry_revision: parsed.registryRevision,
         registry_sha: parsed.fileSha256,
+        required_actor_id: task.status === "待交付" ? (candidate.eligible_actor_id || null) : null,
+        required_session_id: task.status === "待交付" ? (candidate.eligible_session_id || null) : null,
       },
       next_step: mismatches.length ? "mark_stale" : "run_taskctl_guard_then_claim",
     };

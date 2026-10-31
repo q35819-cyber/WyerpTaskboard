@@ -75,6 +75,27 @@ function projectTask(args) { return { project: explicitProject(args), task: requ
 async function current(project, task) {
   return request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task));
 }
+async function recordDeliveryFailure(project, task, who, {
+  failureStage = "verification",
+  failureCode = "DELIVERY_ATTEMPT_FAILED",
+  note,
+  nextAction = "原开发AI保持当前Session继续处理；按阻断原因修复后重新同步远端main、重跑合并后回归，再执行taskctl complete"
+} = {}) {
+  const latest = await current(project, task);
+  if (latest.status !== "交付中" || latest.sessionId !== who.sessionId) return null;
+  return request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task) + "/delivery-attempt-failed", {
+    method: "POST",
+    body: {
+      operationId: "delivery_failure." + randomUUID(),
+      expectedRevision: latest.registryRevision,
+      ...who,
+      failureStage,
+      failureCode,
+      note: String(note || "交付核验失败").slice(0, 1000),
+      nextAction
+    }
+  });
+}
 function metadata(args, extra = {}) {
   let parsed = {};
   if (args.metadata) {
@@ -140,13 +161,14 @@ try {
         "taskctl reply-user --project PROJECT --task WTB-TEST-001 --message EVENT_ID --note TEXT [--session-id ID]",
         "taskctl priority --project PROJECT --task WTB-TEST-001 --value P1",
         "taskctl transition --project PROJECT --task WTB-TEST-001 --status 待独测 --event-type handoff",
-        "taskctl complete --project PROJECT --task WTB-TEST-001 --session-id ID --note TEXT",
+        "taskctl complete --project PROJECT --task WTB-TEST-001 --actor-id ID --session-id ID --note TEXT [--report POST_MERGE_PASS_REPORT when status is 交付中]",
+        "taskctl delivery-failed --project PROJECT --task WTB-TEST-001 --actor-id ID --session-id ID --failure-stage merge|push|remote_sync|regression|report|verification --failure-code CODE --note REASON --next-action ACTION",
         "taskctl changed --project PROJECT --task WTB-TEST-001 --kind code|doc --paths a,b --note TEXT [--invalidates-test true]",
-        "taskctl test-start --project PROJECT --task WTB-TEST-001 --note TEXT [--report path] [--actor-type test_ai --actor-id ID]",
-        "taskctl test-result --project PROJECT --task WTB-TEST-001 --result pass|fail|blocked --report path --note TEXT [--delivery-mode required|user_acceptance|auto_close] [--delivery-actions candidate_merge,deploy_switch,...] [--actor-type test_ai --actor-id ID]",
+        "taskctl test-start --project PROJECT --task WTB-TEST-001 --note TEXT [--report path] [--actor-type test_ai --actor-id ID --session-id ID]",
+        "taskctl test-result --project PROJECT --task WTB-TEST-001 --result pass|fail|blocked --report path --note TEXT [--delivery-mode required|user_acceptance|auto_close] [--delivery-actions candidate_merge,...] [--commit-sha SHA --branch feature/name when candidate_merge] [--actor-type test_ai --actor-id ID --session-id ID]",
         "taskctl stop --project PROJECT --task WTB-TEST-001 --note TEXT",
         "taskctl suspect-disconnect --project PROJECT --task WTB-TEST-001 --note EVIDENCE",
-        "taskctl takeover --project PROJECT --task WTB-TEST-001 --assignee NAME --session-name NAME --session-id ID --note TEXT [--user-quote '用户当前明确允许异常接管的原话' --evidence '原Session/Job/资源实际核查证据' --user-scope task|project --actor-id ID]", 
+        "taskctl takeover --project PROJECT --task WTB-TEST-001 --assignee NAME --session-name NAME --session-id ID --note TEXT [--user-quote '用户当前明确要求接管的原话' --user-scope task|project --actor-id ID] [--evidence '可选：原Session/Job/资源核验记录']",
         "taskctl ack-stop --project PROJECT --task WTB-TEST-001 --note TEXT",
         "taskctl resume --project PROJECT --task WTB-TEST-001 --note TEXT",
         "taskctl review --project PROJECT --task WTB-TEST-001 --action comment|accept|reject --reason defect|evidence|decision|hold --note TEXT",
@@ -156,7 +178,7 @@ try {
         "taskctl requirement-status --project PROJECT --requirement REQ-ID --status 待用户补充|已拆解|已取消 [--plans a.md,b.md --tasks A-01,B-02 --key-files server/a.js,web/b.js] --note TEXT"
       ],
       cooperativeEnforcement: true,
-      note: "help/projects 不需要项目；list 仅为只读兼容保留自身项目默认值，建议始终显式指定 --project。其余项目型命令必须提供 --project。claim 前先聊天汇报，再登记同一 actor/session 的 preclaim-report 并复核 guard/实时占用；claim 的 --actor-id 为必填。test-start/test-result 默认开发自测；独测必须显式传 --actor-type test_ai 和稳定 --actor-id。示例占位值需替换，含空格或竖线的参数值应加引号。"
+      note: "help/projects 不需要项目；list 仅为只读兼容保留自身项目默认值，建议始终显式指定 --project。其余项目型命令必须提供 --project。claim 前先聊天汇报，再登记同一 actor/session 的 preclaim-report 并复核 guard/实时占用；claim 的 --actor-id 为必填。test-start/test-result 默认开发自测；独测必须显式传 --actor-type test_ai 和稳定 --actor-id。待交付只能由原开发 actor/session 认领；交付核验失败会自动写入delivery_attempt_failed，merge/push等命令失败时必须执行delivery-failed。示例占位值需替换，含空格或竖线的参数值应加引号。"
     });
   } else if (command === "projects") {
     output(await request("/api/projects"));
@@ -445,12 +467,66 @@ try {
     const { project, task } = projectTask(args);
     await preflight(project, task, args);
     const before = await current(project, task);
-    output(await request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task) + "/complete-execution", {
+    required(args, "session-id");
+    if (before.status === "交付中") {
+      const who = actor(args, "developer_ai");
+      if (who.actorType !== "developer_ai") throw new Error("交付完成必须由developer_ai执行");
+      required(args, "actor-id");
+      const reportPath = required(args, "report");
+      try {
+        output(await request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task), {
+          method: "PATCH",
+          body: {
+            operationId: operationId(args, "delivery_complete"),
+            expectedRevision: before.registryRevision,
+            eventType: "delivery_complete",
+            patch: { status: "已完成" },
+            ...who,
+            metadata: metadata(args, { postMergeReportPath: reportPath, postMergeRegressionResult: "PASS" })
+          }
+        }));
+      } catch (error) {
+        try {
+          await recordDeliveryFailure(project, task, who, {
+            failureStage: "verification",
+            failureCode: error.code || "DELIVERY_VERIFICATION_FAILED",
+            note: error.message
+          });
+        } catch (recordError) {
+          error.failureLogError = recordError.message;
+        }
+        throw error;
+      }
+    } else {
+      output(await request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task) + "/complete-execution", {
+        method: "POST",
+        body: {
+          operationId: operationId(args, "complete_execution"),
+          expectedRevision: before.registryRevision,
+          ...actor(args, "developer_ai"),
+          metadata: metadata(args)
+        }
+      }));
+    }
+  } else if (command === "delivery-failed") {
+    const { project, task } = projectTask(args);
+    await preflight(project, task, args);
+    const before = await current(project, task);
+    if (before.status !== "交付中") throw preflightError("DELIVERY_STAGE_REQUIRED", "只有交付中的任务可以登记交付失败", { status: before.status });
+    const who = actor(args, "developer_ai");
+    if (who.actorType !== "developer_ai") throw new Error("delivery-failed必须由developer_ai执行");
+    required(args, "actor-id");
+    required(args, "session-id");
+    output(await request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task) + "/delivery-attempt-failed", {
       method: "POST",
       body: {
-        operationId: operationId(args, "complete_execution"),
+        operationId: operationId(args, "delivery_failure"),
         expectedRevision: before.registryRevision,
-        ...actor(args, "developer_ai"),
+        ...who,
+        failureStage: required(args, "failure-stage"),
+        failureCode: args["failure-code"] || "DELIVERY_ATTEMPT_FAILED",
+        note: required(args, "note"),
+        nextAction: required(args, "next-action"),
         metadata: metadata(args)
       }
     }));
@@ -458,6 +534,7 @@ try {
     const { project, task } = projectTask(args);
     await preflight(project, task, args);
     if (args["actor-type"] === "test_ai" && !args["actor-id"]) throw new Error("--actor-id is required for independent test");
+    if (args["actor-type"] === "test_ai") required(args, "session-id");
     output(await request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task) + "/events", {
       method: "POST",
       body: {
@@ -471,13 +548,26 @@ try {
     const { project, task } = projectTask(args);
     await preflight(project, task, args);
     if (args["actor-type"] === "test_ai" && !args["actor-id"]) throw new Error("--actor-id is required for independent test");
+    if (args["actor-type"] === "test_ai") required(args, "session-id");
     const result = required(args, "result");
     if (!["pass", "fail", "blocked"].includes(result)) throw new Error("--result must be pass, fail or blocked");
     const reportPath = required(args, "report");
     const actorType = args["actor-type"] || "developer_ai";
     if (actorType === "test_ai") {
       const before = await current(project, task);
-      output(await request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task) + "/test-result", {
+      const deliveryActions = args["delivery-actions"] ? args["delivery-actions"].split(",").map((x) => x.trim()).filter(Boolean) : [];
+      const testEvidence = {};
+      if (result === "pass" && (args["delivery-mode"] || "") === "required" && deliveryActions.includes("candidate_merge")) {
+        const commitSha = required(args, "commit-sha");
+        const headBranch = required(args, "branch");
+        if (!/^[a-f0-9]{40}$/i.test(commitSha)) throw new Error("--commit-sha must be a full 40-character Git commit SHA");
+        if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,190}$/.test(headBranch) || headBranch.includes("..") || headBranch.includes("//")) {
+          throw new Error("--branch must be a valid Git branch name");
+        }
+        testEvidence.commitSha = commitSha.toLowerCase();
+        testEvidence.headBranch = headBranch;
+      }
+      const saved = await request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task) + "/test-result", {
         method: "POST",
         body: {
           operationId: operationId(args, "test_result"),
@@ -486,10 +576,11 @@ try {
           testResult: result,
           reportPath,
           deliveryDisposition: args["delivery-mode"] || undefined,
-          deliveryActions: args["delivery-actions"] ? args["delivery-actions"].split(",").map((x) => x.trim()).filter(Boolean) : [],
-          metadata: metadata(args)
+          deliveryActions,
+          metadata: metadata(args, testEvidence)
         }
-      }));
+      });
+      output(saved);
     } else {
       output(await request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task) + "/events", {
         method: "POST",
@@ -522,17 +613,19 @@ try {
       required(args, "actor-id");
       required(args, "session-id");
       required(args, "session-name");
-      const evidence = required(args, "evidence");
+      const evidence = args.evidence ? String(args.evidence).trim() : "";
       const scope = String(args["user-scope"] || "task");
       if (!["task", "project"].includes(scope)) throw new Error("--user-scope must be task or project");
-      // Evidence is provided by the executor after inspecting the old Session,
-      // active Jobs, and external resources. This command does not kill them.
-      await request(basePath + "/suspect", {
-        method: "POST", body: {
-          operationId: id + ".suspect", ...who, note: evidence,
-          metadata: metadata(args, { evidenceOrigin: "executor_live_inspection" })
-        }
-      });
+      // User's explicit current instruction authorizes takeover directly.
+      // Optional live-inspection evidence is recorded when available, but is not a prerequisite.
+      if (evidence) {
+        await request(basePath + "/suspect", {
+          method: "POST", body: {
+            operationId: id + ".suspect", ...who, note: evidence,
+            metadata: metadata(args, { evidenceOrigin: "executor_live_inspection" })
+          }
+        });
+      }
       await request(basePath + "/allow", {
         method: "POST", body: {
           operationId: id + ".allow", ...who,

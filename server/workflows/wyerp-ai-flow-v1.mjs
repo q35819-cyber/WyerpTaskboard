@@ -36,7 +36,7 @@ const transitions = new Map([
   ["待复测", new Set(["复测中", "测试失败待修复", "待准备", "待确认", "阻断", "HOLD"])],
   ["复测中", new Set(["待交付", "待用户验收", "已完成", "测试失败待修复", "阻断", "HOLD"])],
   ["待交付", new Set(["交付中", "阻断", "HOLD"])],
-  ["交付中", new Set(["待用户验收", "待复测", "阻断", "HOLD"])],
+  ["交付中", new Set(["已完成", "待复测", "阻断", "HOLD"])],
   ["待用户验收", new Set(["已完成", "测试失败待修复", "待准备", "待确认", "HOLD"])],
   ["阻断", new Set(["待确认", "待准备", "待开发", "待独测", "待复测", "HOLD", "已取消"])],
   ["HOLD", new Set(["待确认", "待准备", "待开发", "测试失败待修复", "待独测", "待复测", "待交付", "已取消"])],
@@ -107,14 +107,73 @@ export const wyerpAiFlowV1 = {
     }
     throw new TaskboardError("任务阶段缺少计划角色规则: " + status, { code: "STATUS_ROLE_RULE_MISSING", status: 500 });
   },
-  normalizeTaskPatch(task, patch = {}) {
+  normalizeTaskPatch(task, patch = {}, { eventType = "task_update", actorType = "system", sessionId = "", metadata = null } = {}) {
     const normalized = { ...patch };
     const stateKeys = ["status", "plannedRole", "assignee", "sessionWindowName", "sessionId"];
     if (!stateKeys.some((key) => key in normalized)) return normalized;
 
     const statusChanging = "status" in normalized;
     const targetStatus = statusChanging ? String(normalized.status) : task.status;
-    if (statusChanging) this.assertTransition(task.status, targetStatus);
+    if (statusChanging) {
+      this.assertTransition(task.status, targetStatus);
+      const claimRole = (
+        (["待准备", "待开发"].includes(task.status) && targetStatus === "开发中")
+        || (task.status === "待独测" && targetStatus === "独测中")
+        || (task.status === "待复测" && targetStatus === "复测中")
+        || (task.status === "待交付" && targetStatus === "交付中")
+      ) ? (["待独测", "待复测"].includes(task.status) ? "test_ai" : "developer_ai") : "";
+      if (claimRole && (eventType !== "claim" || actorType !== claimRole || !sessionId)) {
+        throw new TaskboardError("进入执行阶段必须通过正式claim，不能手动填写负责人或Session", {
+          code: "FORMAL_CLAIM_REQUIRED", status: 409, details: { from: task.status, to: targetStatus, requiredActor: claimRole }
+        });
+      }
+      const meta = metadata && typeof metadata === "object" ? metadata : {};
+      const atomicHandoff = (task.status === "开发中" && targetStatus === "待独测")
+        || (task.status === "修复中" && targetStatus === "待复测");
+      if (atomicHandoff && (eventType !== "handoff" || actorType !== "developer_ai"
+        || !sessionId || sessionId !== task.sessionId || meta.atomicLifecycle !== true
+        || meta.completedFromStatus !== task.status || meta.handoffTarget !== targetStatus)) {
+        throw new TaskboardError("开发交接必须通过原子 complete 流程，不能手动改状态或释放占用", {
+          code: "ATOMIC_HANDOFF_REQUIRED", status: 409, details: { from: task.status, to: targetStatus }
+        });
+      }
+      const independentStage = ["独测中", "复测中"].includes(task.status);
+      if (independentStage && targetStatus !== "HOLD") {
+        const result = String(meta.testResult || "");
+        const expectedTarget = result === "fail" ? "测试失败待修复"
+          : result === "blocked" ? "阻断"
+            : result === "pass" ? ({ required: "待交付", user_acceptance: "待用户验收", auto_close: "已完成" })[meta.deliveryDisposition]
+              : "";
+        if (eventType !== "test_result" || actorType !== "test_ai" || !sessionId
+          || sessionId !== task.sessionId || meta.atomicLifecycle !== true || !meta.reportPath
+          || expectedTarget !== targetStatus) {
+          throw new TaskboardError("独立测试结果必须通过原子 test-result 流程提交，不能手动改状态", {
+            code: "ATOMIC_TEST_RESULT_REQUIRED", status: 409, details: { from: task.status, to: targetStatus }
+          });
+        }
+      }
+      if (task.status === "待交付" && targetStatus === "交付中"
+        && (eventType !== "claim" || actorType !== "developer_ai" || !sessionId)) {
+        throw new TaskboardError("待交付任务必须由开发AI正式认领后进入交付中", {
+          code: "DELIVERY_CLAIM_REQUIRED", status: 409
+        });
+      }
+      if (task.status === "交付中" && targetStatus === "已完成"
+        && (eventType !== "delivery_complete" || actorType !== "developer_ai" || !sessionId
+          || sessionId !== task.sessionId || meta.deliveryVerified !== true
+          || !meta.mergeCommitSha || !meta.remoteMainSha || !meta.postMergeReportSha256
+          || meta.postMergeRegressionResult !== "PASS")) {
+        throw new TaskboardError("交付完成必须通过 taskctl complete 的 Git 远端与合并后回归核验", {
+          code: "DELIVERY_VERIFICATION_REQUIRED", status: 409
+        });
+      }
+      if (task.status === "待用户验收" && targetStatus === "已完成"
+        && (eventType !== "user_accept" || actorType !== "user")) {
+        throw new TaskboardError("待用户验收任务必须由用户正式验收后关闭", {
+          code: "USER_ACCEPTANCE_REQUIRED", status: 409
+        });
+      }
+    }
     const hasSuppliedRole = "plannedRole" in normalized;
     const expectedRole = this.plannedRoleForStatus(targetStatus, {
       currentRole: task.plannedRole, suppliedRole: normalized.plannedRole, hasSuppliedRole, statusChanging
@@ -175,7 +234,10 @@ export const wyerpAiFlowV1 = {
   },
   isExecutableDeliveryDecision(metadata = {}) {
     const actions = Array.isArray(metadata.deliveryActions) ? metadata.deliveryActions : [];
-    return metadata.testResult === "pass" && metadata.deliveryDisposition === "required" && actions.length > 0 && actions.every((action) => deliveryActionSet.has(action));
+    const base = metadata.testResult === "pass" && metadata.deliveryDisposition === "required" && actions.length > 0 && actions.every((action) => deliveryActionSet.has(action));
+    if (!base) return false;
+    if (actions.includes("candidate_merge")) return /^[a-f0-9]{40}$/i.test(String(metadata.commitSha || "")) && Boolean(String(metadata.headBranch || "").trim());
+    return true;
   },
   isExecutionStatus(status) {
     return ["开发中", "修复中", "独测中", "复测中", "交付中"].includes(status);

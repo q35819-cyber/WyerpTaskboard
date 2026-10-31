@@ -112,16 +112,23 @@ test("TaskStore normalizes status role and ownership invariants", async (t) => {
   let snap = await store.snapshot("fixture");
   let moved = await store.updateTask("fixture", "T-01", {
     status: "独测中", assignee: "tester", sessionWindowName: "独测窗口", sessionId: "sess-store-test"
-  }, { expectedRevision: snap.registryRevision, operationId: "op.state.enter.test.0001" });
+  }, { expectedRevision: snap.registryRevision, operationId: "op.state.enter.test.0001", eventType: "claim", actorType: "test_ai", actorId: "tester", sessionWindowName: "独测窗口", sessionId: "sess-store-test" });
   assert.equal(moved.after.status, "独测中");
   assert.equal(moved.after.plannedRole, "独立测试AI");
 
   snap = await store.snapshot("fixture");
-  moved = await store.updateTask("fixture", "T-01", { status: "待准备" }, {
-    expectedRevision: snap.registryRevision, operationId: "op.state.leave.test.0001"
+  await assert.rejects(() => store.updateTask("fixture", "T-01", { status: "待准备" }, { expectedRevision: snap.registryRevision, operationId: "op.state.leave.test.0001" }), (error) => error.code === "ATOMIC_TEST_RESULT_REQUIRED");
+  moved = await store.updateTask("fixture", "T-01", { status: "阻断" }, {
+    expectedRevision: snap.registryRevision,
+    operationId: "op.state.leave.test.0002",
+    eventType: "test_result",
+    actorType: "test_ai",
+    actorId: "tester",
+    sessionId: "sess-store-test",
+    metadata: { atomicLifecycle: true, testResult: "blocked", reportPath: "reports/T-01/blocked.md" }
   });
-  assert.equal(moved.after.status, "待准备");
-  assert.equal(moved.after.plannedRole, "开发AI");
+  assert.equal(moved.after.status, "阻断");
+  assert.equal(moved.after.plannedRole, "");
   assert.equal(moved.after.assignee, "");
   assert.equal(moved.after.sessionWindowName, "");
   assert.equal(moved.after.sessionId, "");
@@ -135,7 +142,7 @@ test("TaskStore rejects execution status without identity and conflicting role",
     store.updateTask("fixture", "A-10", { status: "开发中" }, {
       expectedRevision: snap.registryRevision, operationId: "op.state.no.identity.0001"
     }),
-    (error) => error.code === "EXECUTION_IDENTITY_REQUIRED"
+    (error) => error.code === "FORMAL_CLAIM_REQUIRED"
   );
   snap = await store.snapshot("fixture");
   await assert.rejects(

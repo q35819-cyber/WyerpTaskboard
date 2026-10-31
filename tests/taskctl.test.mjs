@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import { execFile } from "node:child_process";
 import { createTaskboardServer } from "../server/http-server.mjs";
 import { parseRegistryText } from "../server/adapters/markdown-task-registry-v1.mjs";
-import { makeFixture } from "./helpers.mjs";
+import { makeFixture, registryText } from "./helpers.mjs";
 
 const execFileAsync = promisify(execFile);
 const taskctlPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../cli/taskctl.mjs");
@@ -280,7 +280,7 @@ test("taskctl transition atomically hands repair to retest", async (t) => {
   assert.equal(handedOff.after.sessionId, "");
 });
 
-test("taskctl generic transition normalizes test evidence fallback", async (t) => {
+test("taskctl generic transition cannot bypass the atomic independent test-result flow", async (t) => {
   const { fixture, base } = await startFixture(t);
   await preclaim(fixture.boardRoot, base, "T-01", { actorType: "test_ai", actorId: "tester-evidence", sessionId: "sess-evidence" });
   await taskctl(fixture.boardRoot, base, [
@@ -288,15 +288,19 @@ test("taskctl generic transition normalizes test evidence fallback", async (t) =
     "--assignee", "Independent Tester", "--session-name", "独测窗口", "--session-id", "sess-evidence",
     "--actor-type", "test_ai", "--actor-id", "tester-evidence"
   ]);
-  const moved = JSON.parse((await taskctl(fixture.boardRoot, base, [
+  await assert.rejects(() => taskctl(fixture.boardRoot, base, [
     "transition", "--project", "fixture", "--task", "T-01", "--status", "待准备",
     "--actor-type", "test_ai", "--actor-id", "tester-evidence", "--session-id", "sess-evidence"
+  ]), (error) => {
+    assert.match(error.stderr, /ATOMIC_TEST_RESULT_REQUIRED/);
+    return true;
+  });
+  const current = JSON.parse((await taskctl(fixture.boardRoot, base, [
+    "get", "--project", "fixture", "--task", "T-01"
   ])).stdout);
-  assert.equal(moved.after.status, "待准备");
-  assert.equal(moved.after.plannedRole, "开发AI");
-  assert.equal(moved.after.assignee, "");
-  assert.equal(moved.after.sessionWindowName, "");
-  assert.equal(moved.after.sessionId, "");
+  assert.equal(current.status, "独测中");
+  assert.equal(current.assignee, "Independent Tester");
+  assert.equal(current.sessionId, "sess-evidence");
 });
 
 test("taskctl generic transition derives user role for decision waiting", async (t) => {
@@ -336,7 +340,7 @@ test("taskctl generic transition cannot enter execution stage without claim iden
       "transition", "--project", "fixture", "--task", "A-10", "--status", "开发中"
     ]),
     (error) => {
-      assert.match(error.stderr, /EXECUTION_IDENTITY_REQUIRED/);
+      assert.match(error.stderr, /FORMAL_CLAIM_REQUIRED/);
       return true;
     }
   );
@@ -446,6 +450,88 @@ test("taskctl complete atomically hands developer work to independent test and r
   assert.equal(completed.after.plannedRole, "独立测试AI");
   assert.equal(completed.after.assignee, "");
   assert.equal(completed.after.sessionId, "");
+});
+
+test("taskctl delivery-failed records a visible blocker and preserves original developer ownership", async (t) => {
+  const { fixture, base } = await startFixture(t);
+  await fs.writeFile(fixture.registryPath, registryText([
+    ["D-CLI-FAIL", "F-DELIVERY", "infrastructure", "P0", "交付中", "开发AI", "developer", "交付窗口", "dev-session", "2026-10-31T00:00:00Z", "交付失败记录", "测试计划.md", "cp/B-10.md"]
+  ]), "utf8");
+  const event = async (eventType, actorType, actorId, sessionId, metadata) => {
+    await taskctl(fixture.boardRoot, base, [
+      "event", "--project", "fixture", "--task", "D-CLI-FAIL",
+      "--event-type", eventType, "--actor-type", actorType, "--actor-id", actorId,
+      "--session-id", sessionId, "--metadata", JSON.stringify(metadata)
+    ]);
+  };
+  await event("handoff", "developer_ai", "developer", "dev-session", {
+    atomicLifecycle: true, completedFromStatus: "开发中", handoffTarget: "待独测"
+  });
+  await event("claim", "test_ai", "independent-tester", "test-session", { claimedFromStatus: "待独测" });
+  await event("test_result", "test_ai", "independent-tester", "test-session", {
+    atomicLifecycle: true, testResult: "pass", deliveryDisposition: "required",
+    deliveryActions: ["candidate_merge"], commitSha: "c".repeat(40),
+    headBranch: "feature/candidate", reportPath: "reports/D-CLI-FAIL/pass.md"
+  });
+  await event("claim", "developer_ai", "developer", "dev-session", { claimedFromStatus: "待交付" });
+  const failed = JSON.parse((await taskctl(fixture.boardRoot, base, [
+    "delivery-failed", "--project", "fixture", "--task", "D-CLI-FAIL",
+    "--actor-id", "developer", "--session-id", "dev-session",
+    "--failure-stage", "push", "--failure-code", "REMOTE_REJECTED",
+    "--note", "远端推送被拒绝", "--next-action", "fetch origin/main 后同步并重试"
+  ])).stdout);
+  assert.equal(failed.event.event_type, "delivery_attempt_failed");
+  assert.equal(failed.event.actor_id, "developer");
+  const current = JSON.parse((await taskctl(fixture.boardRoot, base, [
+    "get", "--project", "fixture", "--task", "D-CLI-FAIL"
+  ])).stdout);
+  assert.equal(current.status, "交付中");
+  assert.equal(current.assignee, "developer");
+  assert.equal(current.sessionId, "dev-session");
+  assert.match(current.presentation.currentProgress, /REMOTE_REJECTED/);
+  assert.match(current.presentation.currentProgress, /远端推送被拒绝/);
+  assert.match(current.presentation.currentProgress, /fetch origin\/main/);
+});
+
+test("taskctl complete automatically records a failed Git verification and keeps the delivery owner", async (t) => {
+  const { fixture, base } = await startFixture(t);
+  await fs.writeFile(fixture.registryPath, registryText([
+    ["D-CLI-COMPLETE", "F-DELIVERY", "infrastructure", "P0", "交付中", "开发AI", "developer", "交付窗口", "dev-session", "2026-10-31T00:00:00Z", "交付自动记录失败", "测试计划.md", "cp/B-10.md"]
+  ]), "utf8");
+  const event = async (eventType, actorType, actorId, sessionId, metadata) => {
+    await taskctl(fixture.boardRoot, base, [
+      "event", "--project", "fixture", "--task", "D-CLI-COMPLETE",
+      "--event-type", eventType, "--actor-type", actorType, "--actor-id", actorId,
+      "--session-id", sessionId, "--metadata", JSON.stringify(metadata)
+    ]);
+  };
+  await event("handoff", "developer_ai", "developer", "dev-session", {
+    atomicLifecycle: true, completedFromStatus: "开发中", handoffTarget: "待独测"
+  });
+  await event("claim", "test_ai", "independent-tester", "test-session", { claimedFromStatus: "待独测" });
+  await event("test_result", "test_ai", "independent-tester", "test-session", {
+    atomicLifecycle: true, testResult: "pass", deliveryDisposition: "required",
+    deliveryActions: ["candidate_merge"], commitSha: "d".repeat(40),
+    headBranch: "feature/candidate", reportPath: "reports/D-CLI-COMPLETE/pass.md"
+  });
+  await event("claim", "developer_ai", "developer", "dev-session", { claimedFromStatus: "待交付" });
+
+  await assert.rejects(() => taskctl(fixture.boardRoot, base, [
+    "complete", "--project", "fixture", "--task", "D-CLI-COMPLETE",
+    "--actor-id", "developer", "--session-id", "dev-session",
+    "--report", "reports/B-10/report.md"
+  ]), (error) => {
+    assert.match(error.stderr, /DELIVERY_REMOTE_UNAVAILABLE/);
+    return true;
+  });
+  const current = JSON.parse((await taskctl(fixture.boardRoot, base, [
+    "get", "--project", "fixture", "--task", "D-CLI-COMPLETE"
+  ])).stdout);
+  assert.equal(current.status, "交付中");
+  assert.equal(current.assignee, "developer");
+  assert.equal(current.sessionId, "dev-session");
+  assert.match(current.presentation.currentProgress, /DELIVERY_REMOTE_UNAVAILABLE/);
+  assert.match(current.presentation.currentProgress, /原开发AI/);
 });
 
 test("independent test failure atomically returns task to developer and releases tester", async (t) => {
