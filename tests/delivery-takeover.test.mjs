@@ -293,3 +293,58 @@ test("authorized pending takeover rejects valid-shaped but nonexistent Git commi
   assert.equal(takeover.data.after.status, "待独测");
   assert.equal(takeover.data.requiresIndependentRetest, true);
 });
+
+test("a QA report with explicit FAIL verdict cannot reuse historic PASS", async (t) => {
+  const x = await setup(t, { mergedGit: true });
+  await fs.writeFile(path.join(x.fixture.projectRoot, "reports/D-PENDING/qa-pass.md"),
+    "结论：FAIL\n说明：此前PASS已失效，不可用于交付\n候选SHA：" + x.sha + "\n");
+  assert.equal((await allowed(x)).status, 200);
+  const result = await x.send("/takeover", x.takeoverBody((await x.get()).registryRevision));
+  assert.equal(result.status, 200, JSON.stringify(result.data));
+  assert.equal(result.data.after.status, "待独测");
+  assert.equal(result.data.requiresIndependentRetest, true);
+});
+
+test("a BLOCKED QA verdict cannot reuse historic PASS", async (t) => {
+  const x = await setup(t, { mergedGit: true });
+  await fs.writeFile(path.join(x.fixture.projectRoot, "reports/D-PENDING/qa-pass.md"),
+    "结论：BLOCKED\n原测试状态：PASS，现因证据损坏无法确认\n候选SHA：" + x.sha + "\n");
+  assert.equal((await allowed(x)).status, 200);
+  const result = await x.send("/takeover", x.takeoverBody((await x.get()).registryRevision));
+  assert.equal(result.status, 200, JSON.stringify(result.data));
+  assert.equal(result.data.after.status, "待独测");
+  assert.equal(result.data.requiresIndependentRetest, true);
+});
+
+test("contradictory explicit final verdict must not preserve an older PASS", async (t) => {
+  const x = await setup(t, { mergedGit: true });
+  await fs.writeFile(path.join(x.fixture.projectRoot, "reports/D-PENDING/qa-pass.md"),
+    "## 结论：PASS\n初测通过，但后来发现失效\n**最终结论：FAIL**\n候选SHA：" + x.sha + "\n");
+  assert.equal((await allowed(x)).status, 200);
+  const result = await x.send("/takeover", x.takeoverBody((await x.get()).registryRevision));
+  assert.equal(result.status, 200, JSON.stringify(result.data));
+  assert.equal(result.data.after.status, "待独测");
+  assert.equal(result.data.requiresIndependentRetest, true);
+});
+
+test("a historic PASS mention without any explicit QA verdict cannot authorize delivery", async (t) => {
+  const x = await setup(t, { mergedGit: true });
+  await fs.writeFile(path.join(x.fixture.projectRoot, "reports/D-PENDING/qa-pass.md"),
+    "历史测试PASS，待复核\n候选SHA：" + x.sha + "\n");
+  assert.equal((await allowed(x)).status, 200);
+  const result = await x.send("/takeover", x.takeoverBody((await x.get()).registryRevision));
+  assert.equal(result.status, 200, JSON.stringify(result.data));
+  assert.equal(result.data.after.status, "待独测");
+  assert.equal(result.data.requiresIndependentRetest, true);
+});
+
+test("explicit bold Markdown QA PASS with matching SHA remains valid", async (t) => {
+  const x = await setup(t, { mergedGit: true });
+  await fs.writeFile(path.join(x.fixture.projectRoot, "reports/D-PENDING/qa-pass.md"),
+    "## **结论：PASS**。\n候选SHA：" + x.sha + "\n");
+  assert.equal((await allowed(x)).status, 200);
+  const result = await x.send("/takeover", x.takeoverBody((await x.get()).registryRevision));
+  assert.equal(result.status, 200, JSON.stringify(result.data));
+  assert.equal(result.data.after.status, "待交付");
+  assert.equal(result.data.requiresIndependentRetest, false);
+});

@@ -19,6 +19,20 @@ import { AutomationControlStore } from "./automation-control.mjs";
 import { ChatgptMcpExecutor } from "./chatgpt-mcp-executor.mjs";
 import { SystemEventLog } from "./system-event-log.mjs";
 
+// A mention of a historical PASS is not an independent QA verdict.
+// Preserve delivery authority only with an explicit affirmative conclusion and
+// no conflicting conclusion anywhere in the report. Ambiguity fails closed.
+function reportHasIndependentPassVerdict(report) {
+  const declarations = String(report).split(/\r?\n/).map((line) => {
+    const normalized = line.replace(/^\uFEFF/, "")
+      .replace(/^\s{0,3}(?:#{1,6}\s*)?(?:[-*]\s+)?/, "")
+      .replace(/\*\*/g, "").trim();
+    return normalized.match(/^(?:(?:最终|本次|正式|独立测试|独立复测)\s*)?结论\s*[：:]\s*(.*)$/i)?.[1];
+  }).filter((value) => value !== undefined);
+  return declarations.length > 0 && declarations.every((value) =>
+    /^(?:PASS|通过)\s*(?:[。.!！])?\s*$/i.test(value));
+}
+
 function safeServiceStatus(state) {
   return {
     state: state?.state || "unknown",
@@ -1768,7 +1782,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
                   const stat = await fs.stat(resolved);
                   if (stat.isFile() && stat.size > 0 && stat.size <= 2 * 1024 * 1024) {
                     const report = await fs.readFile(resolved, "utf8");
-                    validReport = /PASS|通过/i.test(report) && report.toLowerCase().includes(passSha);
+                    validReport = reportHasIndependentPassVerdict(report) && report.toLowerCase().includes(passSha);
                   }
                 }
               } catch { /* Missing or unreadable independent report must be retested. */ }
