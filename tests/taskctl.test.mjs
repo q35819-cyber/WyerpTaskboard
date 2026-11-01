@@ -72,7 +72,9 @@ test("taskctl context uses only task ID and returns readable plan, safe links an
     "Authorization: Bearer SYNTH_BEARER_04",
     "Cookie: SID=SYNTH_COOKIE_05",
     "OPENAI_API_KEY=SYNTH_OPENAI_06",
-    '"apiKey": "SYNTH_JSON_07"'
+    '"apiKey": "SYNTH_JSON_07"',
+    "API Key: SYNTH_SPACE_KEY_08",
+    "OpenAI API Key: SYNTH_OPENAI_SPACE_09"
   ];
   await fs.appendFile(planPath, "\n正常任务内容仍可读取\n" + secrets.join("\n"));
   const registryBefore = await fs.readFile(fixture.registryPath, "utf8");
@@ -88,7 +90,8 @@ test("taskctl context uses only task ID and returns readable plan, safe links an
   assert.equal(info.guard.stopRequested, false);
   const all = JSON.stringify(info);
   for (const value of ["SYNTH_CTRL_HEADER_01", "SYNTH_CTRL_ENV_02", "SYNTH_JWT_03",
-    "SYNTH_BEARER_04", "SYNTH_COOKIE_05", "SYNTH_OPENAI_06", "SYNTH_JSON_07"]) {
+    "SYNTH_BEARER_04", "SYNTH_COOKIE_05", "SYNTH_OPENAI_06", "SYNTH_JSON_07",
+    "SYNTH_SPACE_KEY_08", "SYNTH_OPENAI_SPACE_09"]) {
     assert.equal(all.includes(value), false, "taskctl context leaked " + value);
   }
   assert.equal(await fs.readFile(fixture.registryPath, "utf8"), registryBefore);

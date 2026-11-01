@@ -135,7 +135,7 @@ function contextOutput(data) {
       .replace(/-----BEGIN (?:[A-Z ]* )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z ]* )?PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]")
       .replace(/\b((?:Authorization|Proxy-Authorization|X-API-Key|X-Wyerp-Controller-Proof|Cookie|Set-Cookie)\s*:\s*)[^\r\n]+/gi, "$1[REDACTED]")
       .replace(/\b((?:Bearer|Basic)\s+)(?:"[^"\r\n]+"|'[^'\r\n]+'|[A-Za-z0-9_+./=~-]{8,})/gi, "$1[REDACTED]")
-      .replace(/\b((?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|secret|token|proof|password|passwd|cookie|database[_-]?url|credentials?))\s*["']?\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s\r\n,;}\]]+)/gi, "$1=[REDACTED]");
+      .replace(/\b((?:[A-Za-z0-9]+[_-])*(?:(?:openai[ ]+)?api[ _-]?key|secret|token|proof|password|passwd|cookie|database[_-]?url|credentials?))\s*["']?\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s\r\n,;}\]]+)/gi, "$1=[REDACTED]");
   }));
 }
 async function taskContext(args) {
