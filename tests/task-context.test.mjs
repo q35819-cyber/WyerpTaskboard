@@ -122,3 +122,66 @@ test("HTTP also hides JSON credential fields and X-API-Key headers", async t => 
   }
   assert.match(body, /夹具计划内容/);
 });
+
+test("independent QA R2: ten synthetic credentials stay out of direct context and real unauthenticated localhost HTTP", async t => {
+  const x = await setup(t);
+  const cases = [
+    ["openai_prefixed_key", "OPENAI_API_KEY=SYNTH_R2_OPENAI_643829", "SYNTH_R2_OPENAI_643829"],
+    ["aws_secret_access_key", "AWS_SECRET_ACCESS_KEY=SYNTH_R2_AWS_673218", "SYNTH_R2_AWS_673218"],
+    ["github_token", "GITHUB_TOKEN=SYNTH_R2_GITHUB_903112", "SYNTH_R2_GITHUB_903112"],
+    ["double_quote_bearer", 'Authorization: Bearer "SYNTH_R2_BEARER_DOUBLE_56231"', "SYNTH_R2_BEARER_DOUBLE_56231"],
+    ["single_quote_bearer", "Authorization: Bearer 'SYNTH_R2_BEARER_SINGLE_99456'", "SYNTH_R2_BEARER_SINGLE_99456"],
+    ["session_token_json", '"session_token": "SYNTH_R2_SESSION_239011"', "SYNTH_R2_SESSION_239011"],
+    ["x_auth_token", "X-Auth-Token: SYNTH_R2_XAUTH_593118", "SYNTH_R2_XAUTH_593118"],
+    ["basic_header", "Authorization: Basic SYNTH_R2_BASIC_349008", "SYNTH_R2_BASIC_349008"],
+    ["database_url", "DATABASE_URL=postgresql://user:SYNTH_R2_DB_209348@localhost/db", "SYNTH_R2_DB_209348"],
+    ["url_api_key", "https://example.invalid/?api_key=SYNTH_R2_URL_390002", "SYNTH_R2_URL_390002"]
+  ];
+  const planFile = path.join(x.projectRoot, "账号登录与权限开发计划.md");
+  await fs.appendFile(planFile, "\n# Legitimate content remains\n正常计划依然完整\n" + cases.map(item => item[1]).join("\n") + "\n");
+  await fs.appendFile(path.join(x.projectRoot, "cp", "A-10.md"), "\nGITHUB_TOKEN=SYNTH_R2_CP_748300\n正常断点依然完整\n");
+  await fs.appendFile(path.join(x.boardRoot, "WORKFLOW.md"), "\nOPENAI_API_KEY=SYNTH_R2_RULE_732551\n正常规则依然完整\n");
+  const secrets = [...cases.map(item => item[2]), "SYNTH_R2_CP_748300", "SYNTH_R2_RULE_732551"];
+  const direct = await x.store.executionContext("A-10");
+  assert.equal(direct.blocked, false);
+  assert.match(direct.documents.find(item => item.kind === "plan").content, /正常计划依然完整/);
+  assert.match(direct.documents.find(item => item.kind === "checkpoint").content, /正常断点依然完整/);
+  assert.match(direct.documents.find(item => item.kind === "rule" && item.path === "WORKFLOW.md").content, /正常规则依然完整/);
+  const directJson = JSON.stringify(direct);
+  const app = await createTaskboardServer({ rootDir: x.boardRoot, port: 0 });
+  await new Promise(resolve => app.server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => app.server.close(resolve)));
+  const res = await fetch(`http://127.0.0.1:${app.server.address().port}/api/task-context/A-10`);
+  assert.equal(res.status, 200);
+  const httpJson = await res.text();
+  for (const [index, secret] of secrets.entries()) {
+    assert.equal(directJson.includes(secret), false, `direct context leak: ${index < cases.length ? cases[index][0] : "rule/checkpoint"}`);
+    assert.equal(httpJson.includes(secret), false, `HTTP context leak: ${index < cases.length ? cases[index][0] : "rule/checkpoint"}`);
+  }
+  assert.match(httpJson, /正常计划依然完整/);
+  assert.match(httpJson, /正常断点依然完整/);
+  assert.match(httpJson, /正常规则依然完整/);
+  assert.match(httpJson, /\[REDACTED\]/);
+  // Original user-authored plans must not be rewritten by a read-only API.
+  assert.match(await fs.readFile(planFile, "utf8"), /SYNTH_R2_OPENAI_643829/);
+});
+
+test("sensitive task metadata, history and related documents are scrubbed without rewriting stored data", async t => {
+  const x = await setup(t);
+  const registry = await fs.readFile(x.registryPath, "utf8");
+  await fs.writeFile(x.registryPath, registry.replace("权限收口", "权限收口 GITHUB_TOKEN=SYNTH_R2_METADATA_309884"));
+  await x.store.appendTaskEvent("fixture", "A-10", {
+    operationId: "qa.r2.context.event.001", eventType: "developer_note",
+    actorType: "developer_ai", actorId: "qa-r2",
+    note: "AWS_SECRET_ACCESS_KEY=SYNTH_R2_HISTORY_480930",
+    metadata: { credentials: "session_token=SYNTH_R2_EVENT_JSON_390110" }
+  });
+  const data = await x.store.executionContext("A-10");
+  const serialized = JSON.stringify(data);
+  for (const value of ["SYNTH_R2_METADATA_309884", "SYNTH_R2_HISTORY_480930", "SYNTH_R2_EVENT_JSON_390110"]) {
+    assert.equal(serialized.includes(value), false, `private task or history value leaked: ${value}`);
+  }
+  assert.match(serialized, /权限收口/);
+  assert.ok(data.history.some(item => item.event_type === "developer_note"));
+  assert.match(await fs.readFile(x.registryPath, "utf8"), /SYNTH_R2_METADATA_309884/);
+});

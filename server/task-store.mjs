@@ -762,10 +762,14 @@ export class TaskStore {
     // expose credential material embedded in otherwise readable task documents.
     const redactContext = (input) => String(input)
       .replace(/-----BEGIN (?:[A-Z ]* )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z ]* )?PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]")
-      .replace(/\b(Authorization\s*:\s*Bearer\s+)[^\s\r\n"'<>]+/gi, "$1[REDACTED]")
-      .replace(/\b(Bearer\s+)(?=[A-Za-z0-9_+./=-]{12,}(?:\s|$))[A-Za-z0-9_+./=-]{12,}/gi, "$1[REDACTED]")
-      .replace(/\b((?:Set-Cookie|Cookie)\s*:\s*)[^\r\n]+/gi, "$1[REDACTED]")
-      .replace(/\b((?:x-api-key|api[_-]?key|apiKey|access[_-]?token|accessToken|refresh[_-]?token|refreshToken|client[_-]?secret|clientSecret|admin[_-]?secret|password|secret[_-]?key|cookie)\b["']?\s*[:=]\s*)(["']?)[^\s\r\n"'`,;{}\]]+\2/gi, "$1[REDACTED]");
+      // Redact the complete header value, including quoted Bearer or Basic
+      // credentials. Do not accidentally leave the credential after a quote.
+      .replace(/\b((?:Authorization|Proxy-Authorization|X-Auth-Token|X-API-Key|Set-Cookie|Cookie)\s*:\s*)[^\r\n]+/gi, "$1[REDACTED]")
+      .replace(/\b((?:Bearer|Basic)\s+)(?:"[^"\r\n]+"|'[^'\r\n]+'|[A-Za-z0-9_+./=~-]{8,})/gi, "$1[REDACTED]")
+      // The credential name may have a vendor prefix (OPENAI_API_KEY,
+      // AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN), be a JSON key, or appear in a
+      // URL query. Remove the *value*, not normal neighbouring plan content.
+      .replace(/\b((?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|secret[_-]?access[_-]?key|access[_-]?key[_-]?id|session[_-]?token|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token|token|client[_-]?secret|admin[_-]?secret|password|passwd|secret[_-]?key|private[_-]?key|database[_-]?url|db[_-]?url|connection[_-]?string|credentials?|cookie)\s*["']?\s*[:=]\s*)(["']?)[^\s\r\n"'`,;{}\]]+\2/gi, "$1$2[REDACTED]$2");
     const scrubContextData = (value) => {
       if (typeof value === "string") return redactContext(value);
       if (Array.isArray(value)) return value.map(scrubContextData);
