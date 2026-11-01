@@ -106,12 +106,16 @@ test("real claim and handoff events are required; after handoff QA can resume fr
   await step(cp,"test_ai","Q01_ADMISSION",{eventId:qaClaim.eventId});
   await step(cp,"test_ai","Q02_TEST");
   assert.equal((await cp.show("fixture","A-10")).state.cursors.test_ai,"Q03_RESULT");
-  assert.equal((await fs.readFile((await cp.show("fixture","A-10")).file,"utf8")).includes("正式派给合法开发"),false);
+  const checkpointPath = (await cp.show("fixture","A-10")).file;
+  assert.equal(path.isAbsolute(checkpointPath), false);
+  assert.equal((await fs.readFile(path.join((await cp.taskStore.projects.context("fixture")).rootRealPath, checkpointPath),"utf8")).includes("正式派给合法开发"),false);
 });
 test("different task IDs are separate, other-role and invalid events are refused",async(t)=>{
   const {cp}=await fixture(t);
   const one=await cp.show("fixture","A-10"),two=await cp.show("fixture","B-10");
   assert.notEqual(one.file,two.file);
+  assert.equal(path.isAbsolute(one.file),false);
+  assert.equal(one.file.includes("\\\\"),false);
   await assert.rejects(step(cp,"test_ai","C01_SCAN"),e=>e.code==="CHECKPOINT_ROLE_STEP_INVALID");
   await assert.rejects(cp.show("fixture","../fake"),e=>e.code==="INVALID_TASK_ID");
   await assert.rejects(cp.show("fixture","NONE"),e=>e.code==="TASK_NOT_FOUND");
@@ -173,4 +177,31 @@ test("QA FAIL returns to developer without reusing the prior PASS attempt",async
   assert.equal(result.cursors.developer_ai,"D04_IMPLEMENT");
   assert.equal(result.cursors.test_ai,"Q01_ADMISSION");
   await assert.rejects(step(cp,"test_ai","Q01_ADMISSION"),e=>e.code==="CHECKPOINT_PREDECESSOR_REQUIRED");
+});
+
+test("portable flow paths stay relative and published template matches canonical steps",async()=>{
+  const root=path.resolve("流程文档"), template=path.resolve("templates/webcodex-v1/流程文档");
+  async function visit(folder,prefix=""){
+    const output=[];
+    for(const entry of await fs.readdir(folder,{withFileTypes:true})){
+      const relative=prefix?prefix+"/"+entry.name:entry.name;
+      if(entry.isDirectory())output.push(...await visit(path.join(folder,entry.name),relative));
+      else if(entry.isFile())output.push(relative);
+    }
+    return output;
+  }
+  const canonical=(await visit(root)).sort();
+  const copies=(await visit(template)).sort();
+  assert.deepEqual(copies,canonical);
+  assert.equal(canonical.length,25);
+  for(const relative of canonical){
+    const original=await fs.readFile(path.join(root,relative),"utf8");
+    const copy=await fs.readFile(path.join(template,relative),"utf8");
+    assert.equal(copy,original,"out-of-sync portable template: "+relative);
+    assert.doesNotMatch(original,/(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|\\\\[^\\\s]+\\|\/(?:home|Users|mnt|opt|tmp)\/)/,
+      "machine-specific absolute path found in "+relative);
+  }
+  const readme=await fs.readFile(path.resolve("templates/webcodex-v1/README.md"),"utf8");
+  assert.doesNotMatch(readme,/(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|\\\\[^\\\s]+\\|\/(?:home|Users|mnt|opt|tmp)\/)/);
+  assert.match(await fs.readFile(path.join(root,"00_统一入口.md"),"utf8"),/相对路径强制规则/);
 });

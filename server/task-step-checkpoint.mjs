@@ -106,7 +106,9 @@ export class TaskStepCheckpoint {
     const file = await this.location(projectId, taskId);
     const content = await fs.readFile(file, "utf8").catch((e) => e.code === "ENOENT" ? "" : Promise.reject(e));
     const { state, legacy } = parseCheckpoint(content, projectId, taskId);
-    return { file, sha256: SHA(content), exists: Boolean(content), legacy, state };
+    const context = await this.taskStore.projects.context(projectId);
+    const relativeFile = path.relative(context.rootRealPath, file).split(path.sep).join("/");
+    return { file: relativeFile, sha256: SHA(content), exists: Boolean(content), legacy, state };
   }
   async record(projectId, taskId, { operationId, expectedSha256, stepId, actorType, actorId,
     sessionId, result = "PASS", evidence, eventId = null, note = "", substepId = null } = {}) {
@@ -206,9 +208,10 @@ export class TaskStepCheckpoint {
           }
         }
       }
-      const original = await fs.readFile(previous.file, "utf8").catch((e) => e.code === "ENOENT" ? "" : Promise.reject(e));
+      const absoluteFile = await this.location(projectId, taskId);
+      const original = await fs.readFile(absoluteFile, "utf8").catch((e) => e.code === "ENOENT" ? "" : Promise.reject(e));
       const nextText = renderCheckpoint(original, state);
-      await writeFileAtomically(previous.file, nextText);
+      await writeFileAtomically(absoluteFile, nextText);
       const reread = await this.show(projectId, taskId);
       if (reread.state.lastAction?.operationId !== operationId) {
         throw invalid("CHECKPOINT_PERSIST_FAILED", "断点写入后核验失败");
