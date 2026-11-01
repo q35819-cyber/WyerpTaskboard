@@ -14,6 +14,8 @@
 9. 合并/推送/远端同步/回归/报告/核验任何一步失败，立即执行taskctl delivery-failed，写明failure-stage、failure-code、note和next-action；taskctl complete的核验失败会自动登记阻断事件。
 10. 只有远端核验和合并后回归通过后，以原actor-id和原Session执行taskctl complete，满足关闭条件才关闭任务。
 
+**阶段结束必须续接**：handoff/complete 后查 `taskctl projects` 和各项目 `list --project PROJECT`，优先本人交付/FAIL 再待开发；通过 get/history/guard、preclaim-report，以本人 actor/Session claim 一个并立即开始，无合法任务才退出。不自动唤醒其它角色。
+
 WebCodex 操作：
 - 先查看当前可用工具说明；不猜命令。
 - 文件读取用读取工具，单条程序命令用进程工具，相关 shell 操作用 shell。
