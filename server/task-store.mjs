@@ -758,13 +758,29 @@ export class TaskStore {
     const { id, snapshot, task } = found[0];
     const context = await this.projects.context(id);
     const records = [], blockers = [];
+    // Context is returned through a browser-accessible HTTP endpoint. Never
+    // expose credential material embedded in otherwise readable task documents.
+    const redactContext = (input) => String(input)
+      .replace(/-----BEGIN (?:[A-Z ]* )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z ]* )?PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]")
+      .replace(/\b(Authorization\s*:\s*Bearer\s+)[^\s\r\n"'<>]+/gi, "$1[REDACTED]")
+      .replace(/\b(Bearer\s+)(?=[A-Za-z0-9_+./=-]{12,}(?:\s|$))[A-Za-z0-9_+./=-]{12,}/gi, "$1[REDACTED]")
+      .replace(/\b((?:Set-Cookie|Cookie)\s*:\s*)[^\r\n]+/gi, "$1[REDACTED]")
+      .replace(/\b((?:x-api-key|api[_-]?key|apiKey|access[_-]?token|accessToken|refresh[_-]?token|refreshToken|client[_-]?secret|clientSecret|admin[_-]?secret|password|secret[_-]?key|cookie)\b["']?\s*[:=]\s*)(["']?)[^\s\r\n"'`,;{}\]]+\2/gi, "$1[REDACTED]");
+    const scrubContextData = (value) => {
+      if (typeof value === "string") return redactContext(value);
+      if (Array.isArray(value)) return value.map(scrubContextData);
+      if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, scrubContextData(item)]));
+      return value;
+    };
+    const sensitiveContextPath = (relative) => /(?:^|[\\/])(?:\.env(?:\..*)?|[^\\/]*(?:credentials?|secrets?|private[-_]?key)[^\\/]*)$/i.test(relative);
     const safeRead = async (root, relative, kind, required = true) => {
       try {
+        if (sensitiveContextPath(relative)) throw new Error("敏感配置文件不可作为任务上下文返回");
         const filename = await resolveProjectPath(root, relative, { mustExist: true, rejectReparse: true });
         const stat = await fs.stat(filename);
         if (!stat.isFile() || stat.size > 2 * 1024 * 1024) throw new Error("不是有效的2MB以内文件");
         const bytes = await fs.readFile(filename);
-        return { kind, path: relative, content: bytes.toString("utf8"), sha256: crypto.createHash("sha256").update(bytes).digest("hex") };
+        return { kind, path: relative, content: redactContext(bytes.toString("utf8")), sha256: crypto.createHash("sha256").update(bytes).digest("hex") };
       } catch (error) {
         if (required) blockers.push({ kind, path: relative, code: "CONTEXT_MISSING_MATERIAL", reason: String(error?.message || error).slice(0, 200) });
         return null;
@@ -792,14 +808,14 @@ export class TaskStore {
     else blockers.push({ kind: "checkpoint", path: checkpointPath, code: "CHECKPOINT_MISSING", reason: "没有可信的最近完成步骤" });
     const history = await this.taskHistory(id, taskId, { limit: 150 });
     const evidence = history.filter((e) => ["test_start", "test_result", "handoff", "delivery_complete", "delivery_attempt_failed"].includes(e.event_type));
-    return {
+    return scrubContextData({
       projectId: id, projectName: snapshot.projectName, taskId, status: task.status,
       nextRole: task.plannedRole || null, task, registryRevision: snapshot.registryRevision,
       documents: records, history, evidence, checkpointPath,
       blocked: blockers.length > 0, blockers,
       nextAction: task.presentation?.currentProgress || "按当前任务阶段和正式角色权限继续",
       note: "只读上下文；查看不构成claim、工作启动或独测通过"
-    };
+    });
   }
 
   async getTask(projectId, taskId) {

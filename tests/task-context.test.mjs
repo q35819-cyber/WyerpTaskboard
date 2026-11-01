@@ -74,3 +74,51 @@ test("HTTP route and taskctl context CLI return actual current data without crea
   assert.equal(JSON.parse(cli.stdout).projectId, "fixture");
   assert.equal((await x.store.getTask("fixture", "A-10")).task.status, "待开发");
 });
+
+test("real HTTP task context redacts synthetic Bearer, API keys, cookies and private keys without dropping plan", async t => {
+  const x = await setup(t);
+  const planPath = path.join(x.projectRoot, "账号登录与权限开发计划.md");
+  const sample = [
+    "# Test plan", "正常任务上下文仍然可读",
+    "Authorization: Bearer SYNTHETIC_ONLY_QA_SECRET_98731",
+    "api_key=synthetic_api_key_293847",
+    "client_secret: synthetic_client_secret_293847",
+    "Cookie: session=synthetic_cookie_298347; user=qa",
+    "-----BEGIN PRIVATE KEY-----", "SYNTHETIC_PRIVATE_KEY_CONTENT", "-----END PRIVATE KEY-----"
+  ].join("\n");
+  await fs.appendFile(planPath, "\n" + sample);
+  await fs.appendFile(path.join(x.projectRoot, "cp", "A-10.md"), "\naccess_token=synthetic_access_token_918273\n");
+  const context = await x.store.executionContext("A-10");
+  const all = JSON.stringify(context);
+  for (const secret of ["SYNTHETIC_ONLY_QA_SECRET_98731", "synthetic_api_key_293847", "synthetic_client_secret_293847", "synthetic_cookie_298347", "SYNTHETIC_PRIVATE_KEY_CONTENT", "synthetic_access_token_918273"]) {
+    assert.equal(all.includes(secret), false, `store leaked ${secret}`);
+  }
+  assert.match(context.documents.find(d => d.kind === "plan")?.content || "", /正常任务上下文仍然可读/);
+  const app = await createTaskboardServer({ rootDir: x.boardRoot, port: 0 });
+  await new Promise(resolve => app.server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => app.server.close(resolve)));
+  const response = await fetch(`http://127.0.0.1:${app.server.address().port}/api/task-context/A-10`);
+  assert.equal(response.status, 200);
+  const payload = await response.text();
+  for (const secret of ["SYNTHETIC_ONLY_QA_SECRET_98731", "synthetic_api_key_293847", "synthetic_client_secret_293847", "synthetic_cookie_298347", "SYNTHETIC_PRIVATE_KEY_CONTENT", "synthetic_access_token_918273"]) {
+    assert.equal(payload.includes(secret), false, `HTTP leaked ${secret}`);
+  }
+  assert.match(payload, /正常任务上下文仍然可读/);
+  assert.match(payload, /\[REDACTED\]/);
+});
+
+test("HTTP also hides JSON credential fields and X-API-Key headers", async t => {
+  const x = await setup(t);
+  const plan = path.join(x.projectRoot, "账号登录与权限开发计划.md");
+  await fs.appendFile(plan, '\n"apiKey": "SYNTHETIC_JSON_KEY_123456"\n"accessToken": "SYNTHETIC_JSON_TOKEN_123456"\nX-API-Key: SYNTHETIC_HEADER_KEY_123456\n');
+  const app = await createTaskboardServer({ rootDir: x.boardRoot, port: 0 });
+  await new Promise(resolve => app.server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => app.server.close(resolve)));
+  const response = await fetch(`http://127.0.0.1:${app.server.address().port}/api/task-context/A-10`);
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  for (const secret of ["SYNTHETIC_JSON_KEY_123456", "SYNTHETIC_JSON_TOKEN_123456", "SYNTHETIC_HEADER_KEY_123456"]) {
+    assert.equal(body.includes(secret), false, `HTTP leaked ${secret}`);
+  }
+  assert.match(body, /夹具计划内容/);
+});
