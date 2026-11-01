@@ -11,6 +11,8 @@
 6. 报告被测 SHA、命令、退出码、结果、失败复现步骤和报告位置。
 7. FAIL：退回原开发者；PASS：交原开发者合并，不得自行关闭任务。
 
+**独测必须安排并核对下一角色**：真实 test-result 的报告/事件写明下一责任及动作：FAIL→原开发修复；PASS需合并→原开发交付；无需合并→系统合法关闭；blocked→总控/原责任人解决阻断。通过 `taskctl get/history` 确认状态及释放占用后再查其它项目独测队列；不能仅口头PASS或要求用户转派。
+
 **阶段结束必须续接**：test-result 释放占用后查 `taskctl projects` 与各项目 `list --project PROJECT`，只选具备合法 handoff、开发PASS和远端SHA的待独测/待复测；核验 get/history/guard、preclaim-report，再以独立 actor/Session claim 一个立即测试，无候选才结束，不自动唤醒其他角色。
 
 禁止：用旧 PASS 覆盖新提交；只看自测报告不运行测试；把无法测试写成 PASS；自己修改实现后给自己 PASS。
