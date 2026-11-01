@@ -166,6 +166,42 @@ test("independent QA R2: ten synthetic credentials stay out of direct context an
   assert.match(await fs.readFile(planFile, "utf8"), /SYNTH_R2_OPENAI_643829/);
 });
 
+test("R3 QA proof and JWT secrets stay out of direct task context and real HTTP", async t => {
+  const x = await setup(t);
+  const cases = [
+    ["X-Wyerp-Controller-Proof: QA_SYNTH_CTRLHDR_719331", "QA_SYNTH_CTRLHDR_719331"],
+    ["WYERP_CONTROLLER_PROOF=QA_SYNTH_CTRLENV_719332", "QA_SYNTH_CTRLENV_719332"],
+    ["JWT_SECRET=QA_SYNTH_JWTSECRET_719333", "QA_SYNTH_JWTSECRET_719333"],
+    ["POSTGRES_PASSWORD=QA_SYNTH_POSTGRES_719334", "QA_SYNTH_POSTGRES_719334"],
+    ["Proxy-Authorization: Basic QA_SYNTH_PROXY_719335", "QA_SYNTH_PROXY_719335"],
+    ["OPENAI_API_KEY=QA_SYNTH_OPENAI_719336", "QA_SYNTH_OPENAI_719336"],
+    ['"password": "QA_SYNTH_JSON_719337"', "QA_SYNTH_JSON_719337"]
+  ];
+  const plan = path.join(x.projectRoot, "账号登录与权限开发计划.md");
+  await fs.appendFile(plan, "\n正常任务内容仍可读取\n" + cases.map(c => c[0]).join("\n") + "\n");
+  await fs.appendFile(path.join(x.projectRoot, "cp", "A-10.md"), "\nJWT_SECRET=QA_SYNTH_CP_719338\n正常断点仍可读取\n");
+  await fs.appendFile(path.join(x.boardRoot, "WORKFLOW.md"), "\nX-Wyerp-Controller-Proof: QA_SYNTH_RULE_719339\n正常规则仍可读取\n");
+  const secrets = [...cases.map(c => c[1]), "QA_SYNTH_CP_719338", "QA_SYNTH_RULE_719339"];
+  const direct = await x.store.executionContext("A-10");
+  assert.equal(direct.blocked, false);
+  const content = JSON.stringify(direct);
+  const app = await createTaskboardServer({ rootDir: x.boardRoot, port: 0 });
+  await new Promise(resolve => app.server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => app.server.close(resolve)));
+  const response = await fetch(`http://127.0.0.1:${app.server.address().port}/api/task-context/A-10`);
+  assert.equal(response.status, 200);
+  const http = await response.text();
+  for (const secret of secrets) {
+    assert.equal(content.includes(secret), false, "TaskStore leaked " + secret);
+    assert.equal(http.includes(secret), false, "HTTP leaked " + secret);
+  }
+  for (const text of ["正常任务内容仍可读取", "正常断点仍可读取", "正常规则仍可读取"]) {
+    assert.match(content, new RegExp(text));
+    assert.match(http, new RegExp(text));
+  }
+  assert.match(await fs.readFile(plan, "utf8"), /QA_SYNTH_CTRLHDR_719331/);
+});
+
 test("sensitive task metadata, history and related documents are scrubbed without rewriting stored data", async t => {
   const x = await setup(t);
   const registry = await fs.readFile(x.registryPath, "utf8");
