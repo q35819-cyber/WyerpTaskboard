@@ -15,13 +15,18 @@ function hardTaskDependencyId(value) {
   const match = token.match(/^([A-Za-z0-9][A-Za-z0-9._-]{0,127})\s*完成$/);
   return match ? match[1] : "";
 }
-function hardDependencyBlockers(task, tasksById) {
+export function hardDependencyBlockers(task, tasksById) {
   const blockers = [];
   const seen = new Set();
-  for (const ref of splitRefs(task.readDependencies)) {
-    const dependencyId = hardTaskDependencyId(ref);
+  const structured = splitRefs(task.dependsOn);
+  const legacy = splitRefs(task.readDependencies).map(hardTaskDependencyId).filter(Boolean);
+  for (const dependencyId of [...structured, ...legacy]) {
     if (!dependencyId || seen.has(dependencyId)) continue;
     seen.add(dependencyId);
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(dependencyId)) {
+      blockers.push('非法前置任务ID: ' + dependencyId);
+      continue;
+    }
     if (dependencyId === task.id) {
       blockers.push(`前置任务${dependencyId}不能依赖自身完成`);
       continue;

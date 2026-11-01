@@ -10,6 +10,7 @@ import { ProjectRegistry } from "./project-registry.mjs";
 import { EventStore } from "./event-store.mjs";
 import { TransactionStore } from "./transaction-store.mjs";
 import { ScanStore } from "./scan-store.mjs";
+import { hardDependencyBlockers } from "./candidate-evaluator.mjs";
 
 function assertOperationId(id) {
   if (typeof id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(id)) {
@@ -555,6 +556,13 @@ export class TaskStore {
       const effectivePatch = context.workflow.normalizeTaskPatch(currentTask, effectivePatchInput, {
         eventType, actorType, actorId, sessionId, metadata: effectiveMetadata
       });
+      if (effectivePatch.status && effectivePatch.status !== currentTask.status &&
+          !["HOLD", "已取消"].includes(effectivePatch.status)) {
+        const blockers = hardDependencyBlockers(currentTask, new Map(parsed.tasks.map(item => [item.id, item])));
+        if (blockers.length) throw new TaskboardError("任务前置依赖未完成，拒绝状态推进", {
+          code: "TASK_DEPENDENCY_INCOMPLETE", status: 409, details: { taskId, blockers }
+        });
+      }
       if (parsed.indexes.updatedAt >= 0 && !("updatedAt" in effectivePatch)) {
         effectivePatch.updatedAt = new Date().toISOString();
       }
@@ -727,6 +735,73 @@ export class TaskStore {
       return result;
     });
   }
+  // The task ID is a locator, never an instruction to guess a project.  An
+  // ambiguous ID must fail closed before loading any project's private text.
+  async executionContext(taskId, { projectId = "" } = {}) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(String(taskId || ""))) {
+      throw new TaskboardError("任务编号格式非法", { code: "INVALID_TASK_ID", status: 400 });
+    }
+    const projectIds = projectId ? [this.projects.get(projectId).id] : this.projects.list().map((p) => p.id);
+    const found = [];
+    for (const id of projectIds) {
+      const snapshot = await this.snapshot(id);
+      const task = snapshot.tasks.find((item) => item.id === taskId);
+      if (task) found.push({ id, snapshot, task });
+    }
+    if (found.length === 0) throw new TaskboardError("没有找到该任务编号", {
+      code: "TASK_NOT_FOUND", status: 404, details: { taskId }
+    });
+    if (found.length !== 1) throw new TaskboardError("任务编号在多个项目中重复，必须指定项目", {
+      code: "TASK_ID_AMBIGUOUS", status: 409,
+      details: { taskId, projectIds: found.map((item) => item.id) }
+    });
+    const { id, snapshot, task } = found[0];
+    const context = await this.projects.context(id);
+    const records = [], blockers = [];
+    const safeRead = async (root, relative, kind, required = true) => {
+      try {
+        const filename = await resolveProjectPath(root, relative, { mustExist: true, rejectReparse: true });
+        const stat = await fs.stat(filename);
+        if (!stat.isFile() || stat.size > 2 * 1024 * 1024) throw new Error("不是有效的2MB以内文件");
+        const bytes = await fs.readFile(filename);
+        return { kind, path: relative, content: bytes.toString("utf8"), sha256: crypto.createHash("sha256").update(bytes).digest("hex") };
+      } catch (error) {
+        if (required) blockers.push({ kind, path: relative, code: "CONTEXT_MISSING_MATERIAL", reason: String(error?.message || error).slice(0, 200) });
+        return null;
+      }
+    };
+    const boardRealRoot = await fs.realpath(this.rootDir);
+    for (const file of ["AGENTS.md", "WORKFLOW.md", "总控AI.md", "开发AI.md", "独立测试AI.md"]) {
+      const item = await safeRead(boardRealRoot, file, "rule");
+      if (item) records.push(item);
+    }
+    const plans = planEntries(task);
+    if (!plans.length) blockers.push({ kind: "plan", path: "", code: "CONTEXT_MISSING_MATERIAL", reason: "任务缺少主计划" });
+    for (const plan of plans) {
+      const item = await safeRead(context.rootRealPath, plan.path, "plan");
+      if (item) records.push(item);
+    }
+    for (const doc of documentEntries(task, context.project)) {
+      const item = await safeRead(context.rootRealPath, doc.path, "related_document");
+      if (item) records.push(item);
+    }
+    const checkpointPath = (context.project.checkpointDir || "data/taskboard/checkpoints")
+      .replace(/[\\/]+$/, "") + "/" + taskId + ".md";
+    const checkpoint = await safeRead(context.rootRealPath, checkpointPath, "checkpoint");
+    if (checkpoint) records.push(checkpoint);
+    else blockers.push({ kind: "checkpoint", path: checkpointPath, code: "CHECKPOINT_MISSING", reason: "没有可信的最近完成步骤" });
+    const history = await this.taskHistory(id, taskId, { limit: 150 });
+    const evidence = history.filter((e) => ["test_start", "test_result", "handoff", "delivery_complete", "delivery_attempt_failed"].includes(e.event_type));
+    return {
+      projectId: id, projectName: snapshot.projectName, taskId, status: task.status,
+      nextRole: task.plannedRole || null, task, registryRevision: snapshot.registryRevision,
+      documents: records, history, evidence, checkpointPath,
+      blocked: blockers.length > 0, blockers,
+      nextAction: task.presentation?.currentProgress || "按当前任务阶段和正式角色权限继续",
+      note: "只读上下文；查看不构成claim、工作启动或独测通过"
+    };
+  }
+
   async getTask(projectId, taskId) {
     const snapshot = await this.snapshot(projectId);
     const task = snapshot.tasks.find((item) => item.id === taskId);

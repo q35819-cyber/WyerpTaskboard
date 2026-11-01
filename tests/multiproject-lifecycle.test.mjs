@@ -109,7 +109,8 @@ test("creating a task in project C remains isolated from A and B regardless of G
    status:"待开发",plannedRole:"开发AI",boundary:"多项目任务创建夹具",
    plan:"任务看板与AI协作控制开发计划.md",traceability:"cp/B-10.md",
    readDependencies:"AGENTS.md",writeTargets:"测试隔离目录",targets:"独立项目C"};
-  const response=await fetch(x.base+"/api/projects/C/tasks",{method:"POST",headers:{Origin:x.base,"Content-Type":"application/json"},
+  const controllerProof=JSON.parse(await fs.readFile(path.join(x.root,"config","controller-proof.json"),"utf8")).proof;
+  const response=await fetch(x.base+"/api/projects/C/tasks",{method:"POST",headers:{...x.headers,"X-Wyerp-Controller-Proof":controllerProof},
     body:JSON.stringify({operationId:"multiproject.create."+ ++serial,expectedRevision:snapshot.registryRevision,
       actorId:"fixture-owner",task})}); const created=await response.json();
  assert.equal(response.status,201,JSON.stringify(created));
@@ -119,4 +120,32 @@ test("creating a task in project C remains isolated from A and B regardless of G
   const r=await fetch(x.base+"/api/projects/"+id+"/tasks/C-NEW-TASK",{headers:x.headers});
   assert.equal(r.status,404,"created task must not appear in "+id);
  }
+});
+
+test("one global QA Attempt across projects blocks a second tester until FAIL releases it", async t => {
+ const x=await setup(t);
+ for(const id of ["A","B"]){
+  await x.claim(id,"developer_ai","dev-"+id,"wc_sess_dev_"+id);
+  await x.post(id,"/events",{eventType:"test_result",actorType:"developer_ai",actorId:"dev-"+id,sessionId:"wc_sess_dev_"+id,
+    metadata:{testResult:"pass",reportPath:"reports/B-10/report.md"}});
+  await x.complete(id,"dev-"+id,"wc_sess_dev_"+id);
+ }
+ const first=await x.claim("A","test_ai","qa-global","wc_sess_qa_global");
+ assert.equal(first.after.status,"独测中");
+ const before=await x.get("B");
+ await x.post("B","/preclaim-report",{actorType:"test_ai",actorId:"qa-other",sessionId:"wc_sess_qa_other",note:"已人工唤醒独测并核验任务B"});
+ const denied=await fetch(x.base+"/api/projects/B/tasks/COMMON-TASK/claim",{
+  method:"POST",headers:x.headers,body:JSON.stringify({operationId:"global.qa.claim.denied."+ ++serial,
+    expectedRevision:before.registryRevision,actorType:"test_ai",actorId:"qa-other",
+    sessionId:"wc_sess_qa_other",assignee:"qa-other",sessionWindowName:"QA B窗口"})
+ });
+ assert.equal(denied.status,409);
+ const error=await denied.json();
+ assert.equal(error.error.code,"GLOBAL_QA_BUSY");
+ assert.ok(error.error.details.alreadyRunning.some(item=>item.projectId==="A"&&item.taskId==="COMMON-TASK"));
+ assert.equal((await x.get("B")).status,"待独测");
+ const failed=await x.outcome("A","qa-global","wc_sess_qa_global","fail");
+ assert.equal(failed.after.status,"测试失败待修复");
+ const resumed=await x.claim("B","test_ai","qa-other","wc_sess_qa_other");
+ assert.equal(resumed.after.status,"独测中");
 });

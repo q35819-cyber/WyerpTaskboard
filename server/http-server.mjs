@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { URL } from "node:url";
 import { TaskboardError } from "./core/errors.mjs";
 import { TaskStore, deliveryTakeoverAuthority, verifiedRemoteTakeoverCandidate } from "./task-store.mjs";
-import { deliveryEvidence } from "./candidate-evaluator.mjs";
+import { deliveryEvidence, hardDependencyBlockers } from "./candidate-evaluator.mjs";
 import { ErpPassGate } from "./erp-pass-gate.mjs";
 import { AuthManager } from "./auth.mjs";
 import { RequirementStore } from "./requirement-store.mjs";
@@ -259,6 +259,16 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
   const aiExecutionSettings = await new AiExecutionSettingsStore(rootDir, { systemEventLog }).init();
   const automationControl = await new AutomationControlStore(rootDir, { systemEventLog }).init();
   const auth = await new AuthManager(rootDir).init();
+  // Serializes global QA claims without serializing independent developer jobs.
+  let qaClaimTail = Promise.resolve();
+  const withQaClaimGate = async operation => {
+    const prior = qaClaimTail;
+    let release;
+    qaClaimTail = new Promise(resolve => { release = resolve; });
+    await prior;
+    try { return await operation(); }
+    finally { release(); }
+  };
   let server;
   const serviceControllerForRequest = () => new ServiceController(rootDir, { host, port: server?.address()?.port || port });
   const windowsMcpForRequest = async () => new WindowsMcpClient(rootDir, { automationControl, systemEventLog }).init();
@@ -817,6 +827,11 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           } : null
         });
       }
+      const taskContextParams = routeMatch(url.pathname, "/api/task-context/:taskId");
+      if (req.method === "GET" && taskContextParams) {
+        const projectId = url.searchParams.get("project") || "";
+        return send(res, 200, await taskStore.executionContext(taskContextParams.taskId, { projectId }));
+      }
       if (req.method === "GET" && url.pathname === "/api/projects") {
         const projects = [];
         for (const project of taskStore.projects.list()) {
@@ -978,6 +993,11 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
       let params = routeMatch(url.pathname, "/api/projects/:projectId/tasks");
       if (req.method === "GET" && params) return send(res, 200, await taskStore.snapshot(params.projectId));
       if (req.method === "POST" && params) {
+        if (identity.mode !== "bearer" || !auth.verifyControllerProof(req.headers["x-wyerp-controller-proof"])) {
+          throw new TaskboardError("创建正式任务必须具有服务端验证的独立总控授权", {
+            code: "CONTROLLER_AUTH_REQUIRED", status: 403
+          });
+        }
         const body = await readJson(req);
         requireOperation(body);
         requireExpectedRevision(body);
@@ -985,7 +1005,8 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         const result = await taskStore.createTask(params.projectId, body.task, {
           expectedRevision: body.expectedRevision,
           operationId: body.operationId,
-          ...actorOptions(identity, body),
+          ...actorOptions(identity, { ...body, actorType: "controller_ai" }),
+          actorType: "controller_ai",
           metadata: body.metadata || null
         });
         return send(res, 201, result);
@@ -1009,6 +1030,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
       params = routeMatch(url.pathname, "/api/projects/:projectId/tasks/:taskId/guard");
       if (req.method === "GET" && params) {
         const pair = await taskStore.getTask(params.projectId, params.taskId);
+        const dependencyBlockers = hardDependencyBlockers(pair.task, new Map(pair.snapshot.tasks.map(item => [item.id, item])));
         const actorContext = {
           actorType: url.searchParams.get("actorType") || "developer_ai",
           actorId: url.searchParams.get("actorId") || identity.actorId || "taskctl",
@@ -1019,6 +1041,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         return send(res, 200, {
           taskId: params.taskId, status: pair.task.status,
           registryRevision: pair.snapshot.registryRevision,
+          dependencyBlockers,
           preclaimReport,
           ...(await taskStore.stopState(params.projectId, params.taskId)),
           takeover: await taskStore.takeoverState(params.projectId, params.taskId),
@@ -1459,8 +1482,29 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         requireTrustedApiIdentity(identity);
         const body = await readJson(req);
         requireOperation(body); requireExpectedRevision(body);
+        const claimOperation = async () => {
         const { context, task } = await contextAndTask(taskStore, params.projectId, params.taskId);
+        const currentSnapshot = await taskStore.snapshot(params.projectId);
+        const dependencyBlockers = hardDependencyBlockers(task, new Map(currentSnapshot.tasks.map(item => [item.id, item])));
+        if (dependencyBlockers.length) throw new TaskboardError("任务前置依赖未完成，禁止认领", {
+          code: "TASK_DEPENDENCY_INCOMPLETE", status: 409,
+          details: { taskId: params.taskId, dependencyBlockers }
+        });
         const actorType = body.actorType || "developer_ai";
+        if (actorType === "test_ai") {
+          const alreadyRunning = [];
+          for (const project of taskStore.projects.list()) {
+            const snapshot = await taskStore.snapshot(project.id);
+            for (const other of snapshot.tasks) {
+              if (["独测中", "复测中"].includes(other.status)) {
+                alreadyRunning.push({ projectId: project.id, taskId: other.id, actor: other.assignee, sessionId: other.sessionId });
+              }
+            }
+          }
+          if (alreadyRunning.length) throw new TaskboardError("统一独立测试队列已有执行中的Attempt", {
+            code: "GLOBAL_QA_BUSY", status: 409, details: { alreadyRunning }
+          });
+        }
         if (context.workflow.isExecutionStatus(task.status) || task.assignee || task.sessionId) {
           throw new TaskboardError("任务已被其它执行者占用，禁止重复认领；请先确认原执行者已完成、释放或完成受控接管", {
             code: "TASK_ALREADY_OCCUPIED", status: 409,
@@ -1572,6 +1616,9 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           metadata: { ...(body.metadata || {}), claimedFromStatus: task.status }
         });
         return send(res, 200, result);
+        };
+        return await ((body.actorType || "developer_ai") === "test_ai"
+          ? withQaClaimGate(claimOperation) : claimOperation());
       }
 
       params = routeMatch(url.pathname, "/api/projects/:projectId/tasks/:taskId/review");

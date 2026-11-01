@@ -1,0 +1,3 @@
+# Private, reproducible local evidence contains full command output and local paths.
+# Publish the verifier source, not private execution transcripts.
+/role-doc-selftest-r2/

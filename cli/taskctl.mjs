@@ -42,6 +42,9 @@ async function secret() {
 }
 async function request(url, { method = "GET", body = null } = {}) {
   const headers = { Authorization: "Bearer " + await secret() };
+  if (method === "POST" && /^\/api\/projects\/[^/]+\/tasks$/.test(url) && process.env.WYERP_CONTROLLER_PROOF) {
+    headers["X-Wyerp-Controller-Proof"] = process.env.WYERP_CONTROLLER_PROOF;
+  }
   if (body !== null) headers["Content-Type"] = "application/json";
   let response;
   try {
@@ -145,8 +148,9 @@ try {
       usage: [
         "taskctl projects",
         "taskctl list [--project wyerp-taskboard]",
-        "taskctl create --project PROJECT --task TASK-ID --parent TEXT --track product[/subtrack]|bugfix|infrastructure --priority P0 --status 待开发 --planned-role 开发AI --boundary TEXT --plan PATH --traceability TEXT --read-dependencies TEXT --write-targets TEXT --targets TEXT [--acceptance-scope system|user_ui_business]",
+        "taskctl create --project PROJECT --task TASK-ID --parent TEXT --track product[/subtrack]|bugfix|infrastructure --priority P0 --status 待开发 --planned-role 开发AI --boundary TEXT --plan PATH --traceability TEXT --read-dependencies TEXT [--depends-on TASK-A;TASK-B] --write-targets TEXT --targets TEXT [--acceptance-scope system|user_ui_business] [requires WYERP_CONTROLLER_PROOF]",
         "taskctl get --project PROJECT --task WTB-TEST-001",
+        "taskctl context --task TASK-ID [--project PROJECT]",
         "taskctl guard --project PROJECT --task WTB-TEST-001 [--actor-id ID --session-id ID]",
         "taskctl preclaim-report --project PROJECT --task WTB-TEST-001 --actor-id ID --session-id ID --note TEXT [--actor-type developer_ai|test_ai]",
         "taskctl ack-user --project PROJECT --task WTB-TEST-001 [--actor-type developer_ai|test_ai] [--actor-id ID --session-id ID]",
@@ -200,6 +204,7 @@ try {
       plan: required(args, "plan"),
       traceability: required(args, "traceability"),
       readDependencies: args["read-dependencies"] || "",
+      dependsOn: args["depends-on"] || "",
       writeTargets: required(args, "write-targets"),
       targets: required(args, "targets")
     };
@@ -213,6 +218,12 @@ try {
         metadata: metadata(args, acceptanceScope ? { acceptanceScope } : {})
       }
     }));
+  } else if (command === "context") {
+    const task = required(args, "task");
+    const project = args.project ? "?project=" + encodeURIComponent(String(args.project)) : "";
+    const result = await request("/api/task-context/" + encodeURIComponent(task) + project);
+    output(result);
+    if (result.blocked) process.exitCode = 6;
   } else if (command === "get") {
     const { project, task } = projectTask(args); output(await current(project, task));
   } else if (command === "history") {
@@ -225,6 +236,7 @@ try {
     if (result.stopRequested) process.exitCode = 3;
     else if (result.userMessages?.requiresAcknowledgement) process.exitCode = 4;
     else if (result.requirements?.pendingCount > 0) process.exitCode = 5;
+    else if (result.dependencyBlockers?.length > 0) process.exitCode = 6;
   } else if (command === "preclaim-report") {
     const { project, task } = projectTask(args);
     const actorType = args["actor-type"] || "developer_ai";

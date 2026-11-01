@@ -20,6 +20,7 @@ const COLUMN_ALIASES = {
   plan: ["主计划", "计划"],
   traceability: ["关键文件/溯源", "关键文件 / 溯源", "关键文件"],
   readDependencies: ["只读依赖", "读取依赖"],
+  dependsOn: ["前置任务ID", "dependsOn"],
   writeTargets: ["计划写文件", "写文件组", "计划写入文件"],
   targets: ["目标位置（准备时创建，不是现有证据）", "目标位置"],
 };
@@ -119,6 +120,7 @@ export function parseRegistryText(fileText, project = {}) {
       plan: normalizedValue(cells[indexes.plan]),
       traceability: normalizedValue(cells[indexes.traceability]),
       readDependencies: indexes.readDependencies >= 0 ? normalizedValue(cells[indexes.readDependencies]) : "",
+      dependsOn: indexes.dependsOn >= 0 ? normalizedValue(cells[indexes.dependsOn]) : "",
       writeTargets: indexes.writeTargets >= 0 ? normalizedValue(cells[indexes.writeTargets]) : "",
       targets: normalizedValue(cells[indexes.targets]),
     };
@@ -131,8 +133,25 @@ export function parseRegistryText(fileText, project = {}) {
   };
 }
 
+function withDependencyColumn(fileText, project) {
+  const old = parseRegistryText(fileText, project);
+  if (old.indexes.dependsOn >= 0) return fileText;
+  let rowIndex = 0;
+  const lines = old.lines.map(line => {
+    if (!line.trim().startsWith("|") || !line.trim().endsWith("|")) return line;
+    const cells = splitMarkdownRow(line);
+    cells.push(rowIndex === 0 ? "前置任务ID" : rowIndex === 1 ? "---" : "—");
+    rowIndex++;
+    return joinMarkdownRow(cells);
+  });
+  const text = old.text.slice(0, old.blockStart) + lines.join(old.eol) + old.text.slice(old.end);
+  return old.hasBom ? "\ufeff" + text : text;
+}
+
 export function patchRegistryText(fileText, project, taskId, patch, workflowProfile) {
-  const parsed = parseRegistryText(fileText, project);
+  const original = parseRegistryText(fileText, project);
+  const workingText = "dependsOn" in patch ? withDependencyColumn(fileText, project) : fileText;
+  const parsed = parseRegistryText(workingText, project);
   const meta = parsed.rowMeta.get(taskId);
   if (!meta) throw new TaskboardError(`未知任务ID: ${taskId}`, { code: "TASK_NOT_FOUND", status: 404 });
   const task = parsed.tasks.find((item) => item.id === taskId);
@@ -140,7 +159,7 @@ export function patchRegistryText(fileText, project, taskId, patch, workflowProf
   if ("track" in patch) workflowProfile.validateTrack(patch.track);
   if ("status" in patch) workflowProfile.assertTransition(task.status, patch.status);
 
-  const allowed = ["track","priority","status","plannedRole","assignee","sessionWindowName","sessionId","writeTargets","updatedAt"];
+  const allowed = ["track","priority","status","plannedRole","assignee","sessionWindowName","sessionId","writeTargets","dependsOn","updatedAt"];
   const nextCells = [...meta.cells];
   for (const [key, value] of Object.entries(patch)) {
     if (!allowed.includes(key)) throw new TaskboardError(`不允许修改字段: ${key}`, { code: "FIELD_NOT_WRITABLE", status: 400 });
@@ -158,17 +177,18 @@ export function patchRegistryText(fileText, project, taskId, patch, workflowProf
   const nextParsed = parseRegistryText(finalText, project);
   return {
     text: finalText,
-    before: task,
+    before: original.tasks.find((item) => item.id === taskId),
     after: nextParsed.tasks.find((item) => item.id === taskId),
-    beforeRevision: parsed.registryRevision,
+    beforeRevision: original.registryRevision,
     afterRevision: nextParsed.registryRevision,
-    beforeFileSha256: parsed.fileSha256,
+    beforeFileSha256: original.fileSha256,
     afterFileSha256: nextParsed.fileSha256,
   };
 }
 
 export function appendRegistryTaskText(fileText, project, taskInput) {
-  const parsed = parseRegistryText(fileText, project);
+  const original = parseRegistryText(fileText, project);
+  const parsed = parseRegistryText(taskInput?.dependsOn ? withDependencyColumn(fileText, project) : fileText, project);
   const id = normalizedValue(taskInput?.id);
   if (!id) throw new TaskboardError("新增任务缺少任务ID", { code: "TASK_ID_REQUIRED", status: 400 });
   if (parsed.rowMeta.has(id)) throw new TaskboardError(`任务ID重复: ${id}`, { code: "DUPLICATE_TASK_ID", status: 409 });
@@ -187,6 +207,7 @@ export function appendRegistryTaskText(fileText, project, taskInput) {
     plan: taskInput.plan,
     traceability: taskInput.traceability,
     readDependencies: taskInput.readDependencies,
+    dependsOn: taskInput.dependsOn,
     writeTargets: taskInput.writeTargets,
     targets: taskInput.targets,
   };
@@ -213,8 +234,8 @@ export function appendRegistryTaskText(fileText, project, taskInput) {
   });
   return {
     text: finalText, task: added,
-    beforeRevision: parsed.registryRevision, afterRevision: nextParsed.registryRevision,
-    beforeFileSha256: parsed.fileSha256, afterFileSha256: nextParsed.fileSha256,
+    beforeRevision: original.registryRevision, afterRevision: nextParsed.registryRevision,
+    beforeFileSha256: original.fileSha256, afterFileSha256: nextParsed.fileSha256,
   };
 }
 export async function readMarkdownTaskRegistry(filePath, project) {
