@@ -12,8 +12,17 @@ import { makeFixture, registryText } from "./helpers.mjs";
 const execFileAsync = promisify(execFile);
 const taskctlPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../cli/taskctl.mjs");
 
-async function startFixture(t) {
+async function startFixture(t, { duplicate = false } = {}) {
   const fixture = await makeFixture();
+  if (duplicate) {
+    const project = path.join(fixture.boardRoot, "second-project");
+    await fs.mkdir(project, { recursive: true });
+    await fs.writeFile(path.join(project, "tasks.md"), registryText());
+    const configFile = path.join(fixture.boardRoot, "config", "projects.json");
+    const config = JSON.parse(await fs.readFile(configFile, "utf8"));
+    config.projects.push({ ...config.projects[0], id: "fixture-2", name: "Fixture 2", root: project });
+    await fs.writeFile(configFile, JSON.stringify(config));
+  }
   const app = await createTaskboardServer({ rootDir: fixture.boardRoot, host: "127.0.0.1", port: 0 });
   await new Promise((resolve, reject) => {
     app.server.once("error", reject);
@@ -52,6 +61,70 @@ async function preclaim(rootDir, base, task, {
     "--session-id", sessionId, "--note", note
   ])).stdout);
 }
+
+test("taskctl context uses only task ID and returns readable plan, safe links and existing guard", async t => {
+  const { fixture, base } = await startFixture(t);
+  const planPath = path.join(fixture.projectRoot, "任务看板与AI协作控制开发计划.md");
+  const secrets = [
+    "X-Wyerp-Controller-Proof: SYNTH_CTRL_HEADER_01",
+    "WYERP_CONTROLLER_PROOF=SYNTH_CTRL_ENV_02",
+    "JWT_SECRET=SYNTH_JWT_03",
+    "Authorization: Bearer SYNTH_BEARER_04",
+    "Cookie: SID=SYNTH_COOKIE_05",
+    "OPENAI_API_KEY=SYNTH_OPENAI_06",
+    '"apiKey": "SYNTH_JSON_07"'
+  ];
+  await fs.appendFile(planPath, "\n正常任务内容仍可读取\n" + secrets.join("\n"));
+  const registryBefore = await fs.readFile(fixture.registryPath, "utf8");
+  const info = JSON.parse((await taskctl(fixture.boardRoot, base, ["context", "--task", "B-10"])).stdout);
+  assert.equal(info.taskId, "B-10");
+  assert.equal(info.projectId, "fixture");
+  assert.equal(info.status, "开发中");
+  assert.equal(info.plannedRole, "开发AI");
+  assert.equal(info.blocked, false);
+  assert.match(info.mainPlan.content, /正常任务内容仍可读取/);
+  assert.ok(info.documents.some(item => item.kind === "checkpoint" && item.path === "cp/B-10.md"));
+  assert.ok(Array.isArray(info.history));
+  assert.equal(info.guard.stopRequested, false);
+  const all = JSON.stringify(info);
+  for (const value of ["SYNTH_CTRL_HEADER_01", "SYNTH_CTRL_ENV_02", "SYNTH_JWT_03",
+    "SYNTH_BEARER_04", "SYNTH_COOKIE_05", "SYNTH_OPENAI_06", "SYNTH_JSON_07"]) {
+    assert.equal(all.includes(value), false, "taskctl context leaked " + value);
+  }
+  assert.equal(await fs.readFile(fixture.registryPath, "utf8"), registryBefore);
+  assert.match(await fs.readFile(planPath, "utf8"), /SYNTH_CTRL_HEADER_01/);
+  const specific = JSON.parse((await taskctl(fixture.boardRoot, base, ["context", "--task", "B-10", "--project", "fixture"])).stdout);
+  assert.equal(specific.projectId, "fixture");
+});
+
+test("taskctl context rejects absent, ambiguous and unsafe task IDs", async t => {
+  const { fixture, base } = await startFixture(t, { duplicate: true });
+  for (const [args, code] of [
+    [["context", "--task", "NOT-THERE"], "TASK_NOT_FOUND"],
+    [["context", "--task", "../B-10"], "INVALID_TASK_ID"],
+    [["context", "--task", "B-10"], "TASK_ID_AMBIGUOUS"]
+  ]) {
+    await assert.rejects(taskctl(fixture.boardRoot, base, args), error => {
+      assert.match(error.stderr, new RegExp(code));
+      return true;
+    });
+  }
+  const specific = JSON.parse((await taskctl(fixture.boardRoot, base, ["context", "--task", "B-10", "--project", "fixture"])).stdout);
+  assert.equal(specific.projectId, "fixture");
+});
+
+test("taskctl context blocks unsafe or missing plans without reading their contents", async t => {
+  const { fixture, base } = await startFixture(t);
+  const forbidden = path.join(fixture.boardRoot, "private-plan.md");
+  await fs.writeFile(forbidden, "SYNTH_PRIVATE_OUTSIDE_011");
+  const registry = await fs.readFile(fixture.registryPath, "utf8");
+  await fs.writeFile(fixture.registryPath, registry.replace("账号登录与权限开发计划.md", "../private-plan.md"));
+  const info = JSON.parse((await taskctl(fixture.boardRoot, base, ["context", "--task", "A-10"])).stdout);
+  assert.equal(info.blocked, true);
+  assert.equal(info.mainPlan, null);
+  assert.ok(info.blockers.some(x => x.code === "CONTEXT_PLAN_UNSAFE_OR_MISSING"));
+  assert.doesNotMatch(JSON.stringify(info), /SYNTH_PRIVATE_OUTSIDE_011/);
+});
 
 test("taskctl reads project list and guard through bearer auth", async (t) => {
   const { fixture, base } = await startFixture(t);

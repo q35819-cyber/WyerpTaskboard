@@ -121,6 +121,72 @@ async function guardState(project, task, args) {
   const qs = new URLSearchParams({ actorType: who.actorType, actorId: who.actorId, sessionId: who.sessionId });
   return request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task) + "/guard?" + qs.toString());
 }
+function safeContextPath(value) {
+  const name = String(value || "").replace(/\\/g, "/");
+  return name.endsWith(".md") && !/^(?:\/|[A-Za-z]:)/.test(name)
+    && !name.split("/").some(part => part === ".." || part === "." || !part)
+    && !/(?:^|\/)(?:\.env(?:\..*)?|[^/]*(?:credentials?|secrets?|private[-_]?key)[^/]*|[^/]*\.(?:pem|key))$/i.test(name);
+}
+function contextOutput(data) {
+  return JSON.parse(JSON.stringify(data, (key, value) => {
+    if (/(?:api[_-]?key|password|passwd|secret|token|controller[_-]?proof|cookie|private[_-]?key)$/i.test(key)) return "[REDACTED]";
+    if (typeof value !== "string") return value;
+    return value
+      .replace(/-----BEGIN (?:[A-Z ]* )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z ]* )?PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]")
+      .replace(/\b((?:Authorization|Proxy-Authorization|X-API-Key|X-Wyerp-Controller-Proof|Cookie|Set-Cookie)\s*:\s*)[^\r\n]+/gi, "$1[REDACTED]")
+      .replace(/\b((?:Bearer|Basic)\s+)(?:"[^"\r\n]+"|'[^'\r\n]+'|[A-Za-z0-9_+./=~-]{8,})/gi, "$1[REDACTED]")
+      .replace(/\b((?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|secret|token|proof|password|passwd|cookie|database[_-]?url|credentials?))\s*["']?\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s\r\n,;}\]]+)/gi, "$1=[REDACTED]");
+  }));
+}
+async function taskContext(args) {
+  const id = required(args, "task");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id)) {
+    throw Object.assign(new Error("非法任务编号"), { code: "INVALID_TASK_ID" });
+  }
+  const registered = (await request("/api/projects")).projects || [];
+  const projects = args.project ? registered.filter(item => item.id === args.project) : registered;
+  const matches = [];
+  for (const project of projects) {
+    const snapshot = await request("/api/projects/" + encodeURIComponent(project.id) + "/tasks");
+    if ((snapshot.tasks || []).some(task => task.id === id)) matches.push(project);
+  }
+  if (matches.length !== 1) {
+    throw Object.assign(new Error(matches.length ? "任务编号在多个项目重复" : "找不到任务编号"), {
+      code: matches.length ? "TASK_ID_AMBIGUOUS" : "TASK_NOT_FOUND",
+      details: matches.map(item => item.id)
+    });
+  }
+  const project = matches[0];
+  const route = "/api/projects/" + encodeURIComponent(project.id) + "/tasks/" + encodeURIComponent(id);
+  const task = await request(route);
+  const blockers = [];
+  const planPath = task.presentation?.mainPlan?.path;
+  let mainPlan = null;
+  if (!safeContextPath(planPath)) blockers.push({ code: "CONTEXT_PLAN_UNSAFE_OR_MISSING", path: planPath || "" });
+  else {
+    try { mainPlan = await request(route + "/plans/0"); }
+    catch (error) { blockers.push({ code: error.code || "CONTEXT_PLAN_MISSING", path: planPath }); }
+  }
+  const documents = (task.presentation?.documents || []).map(doc => {
+    if (!safeContextPath(doc.path)) {
+      blockers.push({ code: "CONTEXT_DOCUMENT_UNSAFE", path: doc.path });
+      return null;
+    }
+    return { kind: doc.kind, path: doc.path };
+  }).filter(Boolean);
+  const history = await request(route + "/history?limit=20");
+  const guard = await guardState(project.id, id, args);
+  return contextOutput({
+    taskId: id, projectId: project.id, projectName: project.name, status: task.status,
+    plannedRole: task.plannedRole, assignee: task.assignee, sessionId: task.sessionId,
+    mainPlan, documents, history: Array.isArray(history) ? history.slice(-20) : (history.events || []).slice(-20),
+    guard: { stopRequested: guard.stopRequested, dependencyBlockers: guard.dependencyBlockers,
+      unreadCount: guard.userMessages?.unreadCount, pendingRequirements: guard.requirements?.pendingCount },
+    blocked: blockers.length > 0 || guard.stopRequested, blockers,
+    nextAction: guard.stopRequested ? "停止请求待处理" : task.presentation?.currentProgress || "按任务当前角色与状态执行"
+  });
+}
+
 function preflightError(code, message, details) {
   const error = new Error(message); error.code = code; error.status = 409; error.details = details; return error;
 }
@@ -147,6 +213,7 @@ try {
         "taskctl list [--project wyerp-taskboard]",
         "taskctl create --project PROJECT --task TASK-ID --parent TEXT --track product[/subtrack]|bugfix|infrastructure --priority P0 --status 待开发 --planned-role 开发AI --boundary TEXT --plan PATH --traceability TEXT --read-dependencies TEXT --write-targets TEXT --targets TEXT [--acceptance-scope system|user_ui_business]",
         "taskctl get --project PROJECT --task WTB-TEST-001",
+        "taskctl context --task TASK-ID [--project PROJECT]",
         "taskctl guard --project PROJECT --task WTB-TEST-001 [--actor-id ID --session-id ID]",
         "taskctl preclaim-report --project PROJECT --task WTB-TEST-001 --actor-id ID --session-id ID --note TEXT [--actor-type developer_ai|test_ai]",
         "taskctl ack-user --project PROJECT --task WTB-TEST-001 [--actor-type developer_ai|test_ai] [--actor-id ID --session-id ID]",
@@ -215,6 +282,8 @@ try {
     }));
   } else if (command === "get") {
     const { project, task } = projectTask(args); output(await current(project, task));
+  } else if (command === "context") {
+    output(await taskContext(args));
   } else if (command === "history") {
     const { project, task } = projectTask(args);
     output(await request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task) + "/history?limit=" + encodeURIComponent(args.limit || "200")));
