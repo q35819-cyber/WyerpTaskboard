@@ -292,6 +292,75 @@ test("delivery refuses to close when source files remain dirty outside the new r
   }), (error) => error.code === "DELIVERY_WORKTREE_DIRTY");
 });
 
+async function isolatedDeliveryWorktree(x) {
+  const worktree = path.join(x.fixture.boardRoot, "isolated-delivery");
+  await git(x.fixture.projectRoot, "worktree", "add", "--detach", worktree, "main");
+  await fs.mkdir(path.join(worktree, path.dirname(x.reportPath)), { recursive: true });
+  await fs.writeFile(path.join(worktree, x.reportPath),
+    "结论：PASS\n候选SHA：" + x.candidateSha + "\nmain SHA：" + x.mergeSha + "\n", "utf8");
+  return worktree;
+}
+
+test("registered clean isolated delivery succeeds while another AI's root worktree remains dirty", async (t) => {
+  const x = await deliveryFixture(t, { acceptanceScope: "system" });
+  const dirtyPath = path.join(x.fixture.projectRoot, "other-ai-uncommitted.js");
+  await fs.writeFile(dirtyPath, "export const otherAi = true;\n", "utf8");
+  const worktree = await isolatedDeliveryWorktree(x);
+  const result = await x.store.updateTask("fixture", x.taskId, { status: "已完成" }, {
+    expectedRevision: x.snapshot.registryRevision,
+    operationId: "delivery.isolated.clean.accepted.0001",
+    eventType: "delivery_complete", actorType: "developer_ai", actorId: "developer", sessionId: "dev-session",
+    metadata: { deliveryWorktreePath: worktree, postMergeReportPath: x.reportPath, postMergeRegressionResult: "PASS" }
+  });
+  assert.equal(result.after.status, "已完成");
+  assert.equal(await fs.readFile(dirtyPath, "utf8"), "export const otherAi = true;\n");
+  assert.match(await git(x.fixture.projectRoot, "status", "--porcelain"), /other-ai-uncommitted/);
+});
+
+test("isolated delivery rejects a dirty worktree or an unregistered path", async (t) => {
+  const x = await deliveryFixture(t);
+  const worktree = await isolatedDeliveryWorktree(x);
+  const complete = (candidate, operationId) => x.store.updateTask("fixture", x.taskId, { status: "已完成" }, {
+    expectedRevision: x.snapshot.registryRevision,
+    operationId, eventType: "delivery_complete",
+    actorType: "developer_ai", actorId: "developer", sessionId: "dev-session",
+    metadata: { deliveryWorktreePath: candidate, postMergeReportPath: x.reportPath, postMergeRegressionResult: "PASS" }
+  });
+  await fs.writeFile(path.join(worktree, "dirty-source.js"), "dirty", "utf8");
+  await assert.rejects(() => complete(worktree, "delivery.isolated.dirty.denied.0001"),
+    (error) => error.code === "DELIVERY_WORKTREE_DIRTY");
+  const external = path.join(x.fixture.boardRoot, "external-repository");
+  await execFileAsync("git", ["clone", x.bare, external], { encoding: "utf8" });
+  await assert.rejects(() => complete(external, "delivery.isolated.other.repo.denied.0001"),
+    (error) => error.code === "DELIVERY_WORKTREE_INVALID");
+  await assert.rejects(() => complete(path.join(x.fixture.boardRoot, "missing-worktree"),
+    "delivery.isolated.unknown.path.denied.0001"), (error) => error.code === "DELIVERY_WORKTREE_INVALID");
+});
+
+test("isolated delivery retains candidate ancestry, report, and developer identity gates", async (t) => {
+  const unmerged = await deliveryFixture(t, { merged: false });
+  const worktree = await isolatedDeliveryWorktree(unmerged);
+  const complete = (x, meta, who = "developer") => x.store.updateTask("fixture", x.taskId, { status: "已完成" }, {
+    expectedRevision: x.snapshot.registryRevision,
+    operationId: "delivery.isolated.unmerged.denied.0001",
+    eventType: "delivery_complete", actorType: "developer_ai", actorId: who, sessionId: "dev-session",
+    metadata: { deliveryWorktreePath: worktree, postMergeReportPath: x.reportPath, postMergeRegressionResult: "PASS", ...meta }
+  });
+  await assert.rejects(() => complete(unmerged, {}), (error) => error.code === "DELIVERY_CANDIDATE_NOT_MERGED");
+  const merged = await deliveryFixture(t);
+  const validWorktree = await isolatedDeliveryWorktree(merged);
+  const mergedComplete = (meta, who = "developer") => merged.store.updateTask("fixture", merged.taskId, { status: "已完成" }, {
+    expectedRevision: merged.snapshot.registryRevision,
+    operationId: "delivery.isolated." + (who === "developer" ? "report" : "owner") + ".denied.0001",
+    eventType: "delivery_complete", actorType: "developer_ai", actorId: who, sessionId: "dev-session",
+    metadata: { deliveryWorktreePath: validWorktree, postMergeReportPath: merged.reportPath, postMergeRegressionResult: "PASS", ...meta }
+  });
+  await assert.rejects(() => mergedComplete({}, "wrong-developer"),
+    (error) => error.code === "DELIVERY_ORIGINAL_DEVELOPER_REQUIRED");
+  await fs.writeFile(path.join(validWorktree, merged.reportPath), "结论：PASS\n错误SHA\n", "utf8");
+  await assert.rejects(() => mergedComplete({}), (error) => error.code === "DELIVERY_POST_MERGE_REPORT_INVALID");
+});
+
 test("delivery attempt failure is visible and retains the original developer for retry", async (t) => {
   const x = await deliveryFixture(t);
   const failed = await x.store.updateTask("fixture", x.taskId, { status: "交付中" }, {
