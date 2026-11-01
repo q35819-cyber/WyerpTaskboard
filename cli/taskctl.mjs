@@ -228,7 +228,7 @@ try {
         "taskctl reply-user --project PROJECT --task WTB-TEST-001 --message EVENT_ID --note TEXT [--session-id ID]",
         "taskctl priority --project PROJECT --task WTB-TEST-001 --value P1",
         "taskctl transition --project PROJECT --task WTB-TEST-001 --status 待独测 --event-type handoff",
-        "taskctl complete --project PROJECT --task WTB-TEST-001 --actor-id ID --session-id ID --note TEXT [--report POST_MERGE_PASS_REPORT when status is 交付中]",
+        "taskctl complete --project PROJECT --task WTB-TEST-001 --actor-id ID --session-id ID --note TEXT [--report POST_MERGE_PASS_REPORT] [--delivery-worktree REGISTERED_CLEAN_WORKTREE when status is 交付中]",
         "taskctl delivery-failed --project PROJECT --task WTB-TEST-001 --actor-id ID --session-id ID --failure-stage merge|push|remote_sync|regression|report|verification --failure-code CODE --note REASON --next-action ACTION",
         "taskctl changed --project PROJECT --task WTB-TEST-001 --kind code|doc --paths a,b --note TEXT [--invalidates-test true]",
         "taskctl test-start --project PROJECT --task WTB-TEST-001 --note TEXT [--report path] [--actor-type test_ai --actor-id ID --session-id ID]",
@@ -554,7 +554,10 @@ try {
             eventType: "delivery_complete",
             patch: { status: "已完成" },
             ...who,
-            metadata: metadata(args, { postMergeReportPath: reportPath, postMergeRegressionResult: "PASS" })
+            metadata: metadata(args, {
+              postMergeReportPath: reportPath, postMergeRegressionResult: "PASS",
+              ...(args["delivery-worktree"] ? { deliveryWorktreePath: args["delivery-worktree"] } : {})
+            })
           }
         }));
       } catch (error) {

@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import crypto from "node:crypto";
+import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { TaskboardError } from "./core/errors.mjs";
@@ -146,6 +147,28 @@ async function gitIsAncestor(root, ancestor, descendant) {
   if (result.code === 1) return false;
   throw new TaskboardError("Git无法验证候选提交与main的关系", { code: "DELIVERY_GIT_ANCESTRY_FAILED", status: 409 });
 }
+async function deliveryGitRoot(context, metadata) {
+  const requested = metadata?.deliveryWorktreePath;
+  if (requested === undefined || requested === null || requested === "") return context.rootRealPath;
+  const invalid = () => new TaskboardError("交付工作区必须是已登记的同仓库Git worktree", {
+    code: "DELIVERY_WORKTREE_INVALID", status: 409
+  });
+  if (typeof requested !== "string" || !path.isAbsolute(requested)) throw invalid();
+  let candidate;
+  try {
+    candidate = await fs.realpath(requested);
+    if (!(await fs.stat(candidate)).isDirectory()) throw invalid();
+  } catch { throw invalid(); }
+  const normalize = (value) => process.platform === "win32" ? path.resolve(value).toLowerCase() : path.resolve(value);
+  const listed = await gitOutput(context.rootRealPath, ["worktree", "list", "--porcelain"], "DELIVERY_WORKTREE_INVALID");
+  const registered = listed.split(/\r?\n/).filter(line => line.startsWith("worktree "))
+    .some(line => normalize(line.slice(9)) === normalize(candidate));
+  if (!registered) throw invalid();
+  const common = await gitOutput(context.rootRealPath, ["rev-parse", "--path-format=absolute", "--git-common-dir"], "DELIVERY_WORKTREE_INVALID");
+  const candidateCommon = await gitOutput(candidate, ["rev-parse", "--path-format=absolute", "--git-common-dir"], "DELIVERY_WORKTREE_INVALID");
+  if (normalize(common) !== normalize(candidateCommon)) throw invalid();
+  return candidate;
+}
 // Fail closed when an independent PASS cannot be matched to a real remote Git
 // candidate. A branch may be deleted after it was merged; in that case only an
 // existing local commit that is an ancestor of remote HEAD can be accepted.
@@ -273,7 +296,7 @@ async function verifyDeliveryCompletion(context, task, events, patch, { actorTyp
       code: "DELIVERY_CLAIM_MISMATCH", status: 409
     });
   }
-  const root = context.rootRealPath;
+  const root = await deliveryGitRoot(context, metadata);
   const symref = await gitOutput(root, ["ls-remote", "--symref", "origin", "HEAD"], "DELIVERY_REMOTE_UNAVAILABLE");
   const branchMatch = symref.match(/^ref:\s+refs\/heads\/([A-Za-z0-9][A-Za-z0-9._/-]{0,190})\s+HEAD$/m);
   if (!branchMatch || branchMatch[1].includes("..") || branchMatch[1].includes("//")) {
@@ -281,7 +304,7 @@ async function verifyDeliveryCompletion(context, task, events, patch, { actorTyp
   }
   const mainBranch = branchMatch[1];
   const localBranch = await gitOutput(root, ["rev-parse", "--abbrev-ref", "HEAD"], "DELIVERY_LOCAL_BRANCH_UNAVAILABLE");
-  if (localBranch !== mainBranch) throw new TaskboardError("请先切换到origin默认分支，再执行交付闭环", {
+  if (localBranch !== mainBranch && !(metadata?.deliveryWorktreePath && localBranch === "HEAD")) throw new TaskboardError("请先切换到origin默认分支，再执行交付闭环", {
     code: "DELIVERY_NOT_ON_MAIN", status: 409, details: { expectedBranch: mainBranch, currentBranch: localBranch }
   });
   const mergeCommitSha = (await gitOutput(root, ["rev-parse", "HEAD"], "DELIVERY_LOCAL_HEAD_UNAVAILABLE")).toLowerCase();
