@@ -13,6 +13,8 @@
 
 **独测必须安排并核对下一角色**：真实 test-result 的报告/事件写明下一责任及动作：FAIL→原开发修复；PASS需合并→原开发交付；无需合并→系统合法关闭；blocked→总控/原责任人解决阻断。通过 `taskctl get/history` 确认状态及释放占用后再查其它项目独测队列；不能仅口头PASS或要求用户转派。
 
+**24小时逾期独测接管**：本角色任务超过24小时无真实进展，新独测窗口按用户常设授权以新actor/Session合法接管并继续，保留原SHA和旧测试证据，旧Session退出、唯一独测不能双占；接口不支持则报总控派开发，不能假报独测结果。
+
 **阻断或测试失败也要安排开发**：真实代码/CLI缺陷按正式test-result FAIL回原开发，环境、无证据、服务不可用按blocked在原报告写明下一责任和具体修复/恢复动作交总控协调；不能说“blocked所以没有开发任务”。独测PASS交原开发合并、回归、正式关闭和清理已合并的本人任务分支；独测不负责清理其他AI工作区。核对原任务下一步后，再查下一可独测候选。
 
 **阶段结束必须续接**：test-result 释放占用后查 `taskctl projects` 与各项目 `list --project PROJECT`，只选具备合法 handoff、开发PASS和远端SHA的待独测/待复测；核验 get/history/guard、preclaim-report，再以独立 actor/Session claim 一个立即测试，无候选才结束，不自动唤醒其他角色。
