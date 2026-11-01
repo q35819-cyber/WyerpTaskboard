@@ -16,6 +16,8 @@
 
 **开发必须安排并核对下一角色**：自测通过固定远端SHA后正式 handoff 到待独测，在原任务报告/事件写明下一责任独测AI及精确SHA，通过 `taskctl get/history` 核对成功再开始找下一项；测试FAIL回原开发，PASS后原开发合并关闭。未正式handoff不能只说“交测试”。同一开发可继续领取另一项不冲突的任务，不能双占。
 
+**Git交付包含安全清理**：独测PASS后原开发合并远端main、回归并成功taskctl complete后，先检查本人任务worktree/本地分支/远端分支是否已合并、干净、无人占用，再安全 `git worktree remove` 和 `git branch -d`；远端分支仅无人引用/无开放PR且已合并才受控删除。异常保全并写原任务清理阻断，报总控协调。**清理后立刻查下一开发任务，有合法候选就正式claim继续**。接到阻断先区分真代码Bug、证据不足、环境和合法接管原因，不得遗忘阻断或假报完成。
+
 **阶段结束必须续接**：handoff/complete 后查 `taskctl projects` 和各项目 `list --project PROJECT`，优先本人交付/FAIL 再待开发；通过 get/history/guard、preclaim-report，以本人 actor/Session claim 一个并立即开始，无合法任务才退出。不自动唤醒其它角色。
 
 WebCodex 操作：
