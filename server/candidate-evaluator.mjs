@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { resolveProjectPath } from "./core/path-safety.mjs";
+import isPathInside from "./core/vendor/is-path-inside.mjs";
 
 function hash(value) { return crypto.createHash("sha256").update(value).digest("hex"); }
 function splitRefs(value) {
@@ -156,7 +157,7 @@ export class CandidateEvaluator {
       const writeTargets = splitRefs(task.writeTargets);
       if (eligibleRole === "developer_ai") {
         if (!writeTargets.length) blockers.push("未声明计划写文件，不能进入待认领");
-        const candidateWrites = new Set(normalizedFileRefs(task.writeTargets));
+        const candidateWrites = normalizedFileRefs(task.writeTargets);
         for (const active of activeDeveloperTasks) {
           if (active.id === task.id) continue;
           const activeWrites = normalizedFileRefs(active.writeTargets);
@@ -164,7 +165,8 @@ export class CandidateEvaluator {
             blockers.push("开发中任务" + active.id + "未声明写文件组，无法证明无冲突");
             continue;
           }
-          const conflict = activeWrites.find((item) => candidateWrites.has(item));
+          const conflict = activeWrites.find((item) => candidateWrites.some((candidate) =>
+            candidate === item || isPathInside(candidate, item) || isPathInside(item, candidate)));
           if (conflict) blockers.push("计划写文件与开发中任务" + active.id + "冲突：" + conflict);
         }
       }

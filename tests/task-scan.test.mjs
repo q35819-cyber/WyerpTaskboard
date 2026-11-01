@@ -302,7 +302,12 @@ test("developer candidates require declared write targets and exclude conflicts 
     ["DEV-A","F-A","product","P0","待开发","开发AI","—","—","—","—","候选A","计划A.md","trace/A.md","read/shared.md","src/shared.js","cp/DEV-A.md"],
     ["DEV-B","F-B","product","P0","开发中","开发AI","owner","窗口","sess-owner","2026-09-29T00:00:00Z","执行中B","计划B.md","trace/B.md","read/other.md","src/shared.js","cp/DEV-B.md"],
     ["DEV-C","F-C","product","P1","待开发","开发AI","—","—","—","—","候选C","计划C.md","trace/C.md","read/c.md","","cp/DEV-C.md"],
-    ["DEV-D","F-D","product","P0","测试失败待修复","开发AI","—","—","—","—","失败回流D","计划D.md","trace/D.md","read/d.md","src/fix-d.js","cp/DEV-D.md"]
+    ["DEV-D","F-D","product","P0","测试失败待修复","开发AI","—","—","—","—","失败回流D","计划D.md","trace/D.md","read/d.md","src/fix-d.js","cp/DEV-D.md"],
+    ["DEV-E","F-E","product","P1","待开发","开发AI","—","—","—","—","子路径候选","计划E.md","trace/E.md","read/e.md","src/mediaflow/config/settings.json","cp/DEV-E.md"],
+    ["DEV-F","F-F","product","P1","开发中","开发AI","owner-f","窗口","sess-f","2026-09-29T00:00:00Z","上级目录占用","计划F.md","trace/F.md","read/f.md","src/mediaflow/","cp/DEV-F.md"],
+    ["DEV-G","F-G","product","P1","待开发","开发AI","—","—","—","—","相似前缀非冲突","计划G.md","trace/G.md","read/g.md","src/mediaflowing/","cp/DEV-G.md"],
+    ["DEV-H","F-H","product","P1","待开发","开发AI","—","—","—","—","上级目录候选","计划H.md","trace/H.md","read/h.md","tests/","cp/DEV-H.md"],
+    ["DEV-I","F-I","product","P1","开发中","开发AI","owner-i","窗口","sess-i","2026-09-29T00:00:00Z","子目录占用","计划I.md","trace/I.md","read/i.md","tests/data/","cp/DEV-I.md"]
   ];
   await fs.writeFile(fixture.registryPath, registryText(rows), "utf8");
   const taskStore = await new TaskStore(fixture.boardRoot).init();
@@ -314,6 +319,9 @@ test("developer candidates require declared write targets and exclude conflicts 
   const a = candidates.find((x) => x.task_id === "DEV-A");
   const c = candidates.find((x) => x.task_id === "DEV-C");
   const d = candidates.find((x) => x.task_id === "DEV-D");
+  const e = candidates.find((x) => x.task_id === "DEV-E");
+  const g = candidates.find((x) => x.task_id === "DEV-G");
+  const h = candidates.find((x) => x.task_id === "DEV-H");
   assert.equal(a.eligible, false);
   assert.deepEqual(a.read_dependencies, ["read/shared.md"]);
   assert.deepEqual(a.write_targets, ["src/shared.js"]);
@@ -323,6 +331,11 @@ test("developer candidates require declared write targets and exclude conflicts 
   assert.equal(d.eligible, true);
   assert.equal(d.eligible_role, "developer_ai");
   assert.deepEqual(d.write_targets, ["src/fix-d.js"]);
+  assert.equal(e.eligible, false);
+  assert.ok(e.blockers.some((x) => x.includes("DEV-F")));
+  assert.equal(g.eligible, true);
+  assert.equal(h.eligible, false);
+  assert.ok(h.blockers.some((x) => x.includes("DEV-I")));
 });
 
 
