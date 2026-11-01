@@ -1,5 +1,7 @@
 ﻿# WebCodex 简化开发模板 v1
 
+**适用范围**：本模板可以作为其他 Node、Python 或不同技术栈项目的**手工接入基线**。任务看板仍集中管理任务ID与流程；新软件只需使用相同三角色/流程规范、Ponytail 和自己的构建测试命令。**自动探测/自动注册尚未交付**，不能称为一键接入。
+
 ## 文件
 - AGENTS.md：所有执行者的简短规则
 - WORKFLOW.md：唯一任务状态与交付流程
@@ -10,6 +12,16 @@
 - software-project-config.schema.json：版本化项目配置 Schema
 - examples/node-project/、examples/python-project/：两种技术栈的可运行接入样例
 - ONBOARDING_REPORT_TEMPLATE.md：接入自检报告模板
+- 总控AI.md、开发AI.md、独立测试AI.md：可移植的三角色完整规范（部署到新项目根目录后才是该项目的权威版本）
+- .agents/skills/ponytail/SKILL.md：**强制 full**，开发前必须实际阅读并按最少必要代码规则执行
+
+## 最少步骤接入其他软件（现阶段手工）
+
+1. 在新软件仓库先检查原有 `AGENTS.md`、`WORKFLOW.md`、角色文档和未提交修改；**存在就合并关键条款，不覆盖**。不复制 WyerpTaskboard 的任务登记数据、历史或私有配置。
+2. 把模板的 `AGENTS.md`、`WORKFLOW.md`、`总控AI.md`、`开发AI.md`、`独立测试AI.md` 配置到项目根目录，并将 `.agents/skills/ponytail/SKILL.md` 保留相同相对路径；三角色及提示词都引用这个唯一 Skill。
+3. 按实际语言选择 `examples/node-project/wyerp-taskboard.project.json` 或 Python 对应样例，修改唯一项目 ID、项目路径、Git 远端与真实 build/test 命令；已存在的项目配置优先复用，不要随意增加其他字段。
+4. 在项目根目录实际运行其质量命令，保留退出码；使用当前任务看板注册信息及任务ID安排角色执行。**此处不是自动注册指令**；未来自动 onboarding 功能必须由对应 P1 任务独立开发和测试后才能宣称可用。
+5. 开发自测/独测报告必须写出 Ponytail 检查：**复用了什么、检查过哪些调用方、最小必要 diff、实际测试**。不能只写“已用 Ponytail”。
 
 ## 当前 WebCodex 工具映射
 | 需要做的事 | 当前工具 | 使用要求 |
@@ -39,7 +51,7 @@
 - 上下文切换依赖任务断点和 SHA，不依赖聊天记忆。
 
 ## 验收前提
-这些是流程模板，不代表现有任务看板已经实现所有门禁。必须先用独立模拟仓库验证状态机和 Git 闭环，再接入看板。
+这是可运行的模板基线，不代表生产自动 onboarding、自动派工或其他未来门禁已实现。接入前先执行项目实际测试和任务看板自身的既有 Git/独测流程；不因为历史模拟报告 PASS 而跳过真实测试。
 
 ## 通用项目接入契约（P0 最小交付）
 - 项目差异写入 `wyerp-taskboard.project.json`，统一校验 `software-project-config.schema.json`；不得在项目内复制一套状态机或角色提示词。

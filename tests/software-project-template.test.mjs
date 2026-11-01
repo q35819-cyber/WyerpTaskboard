@@ -5,6 +5,22 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 
 const templateRoot = path.resolve("templates/webcodex-v1");
+const coreFiles = ["AGENTS.md", "WORKFLOW.md", "总控AI.md", "开发AI.md", "独立测试AI.md"];
+const ponytailPath = path.join(".agents", "skills", "ponytail", "SKILL.md");
+test("universal template has a complete portable Ponytail-based three-role entry", async () => {
+  const skill = await fs.readFile(path.join(templateRoot, ponytailPath), "utf8");
+  assert.match(skill, /^name: ponytail$/m);
+  assert.match(skill, /^license: MIT$/m);
+  assert.equal(skill, await fs.readFile(path.resolve(ponytailPath), "utf8"));
+  for (const file of coreFiles) {
+    const body = await fs.readFile(path.join(templateRoot, file), "utf8");
+    assert.ok(body.includes("ponytail/SKILL.md"), `${file} must mandate Ponytail`);
+    assert.doesNotMatch(body, /docs\/governance\/|docs\/产品需求\//, `${file} must not depend on Wyerp private files`);
+  }
+  const controller = await fs.readFile(path.join(templateRoot, "CONTROLLER_PROMPT.md"), "utf8");
+  assert.doesNotMatch(controller, /20261101_WyerpTaskboard全流程角色任务审计_NO_GO|00_WyerpTaskboard核心产品需求|docs\/流程标准\//);
+});
+
 const schema = JSON.parse(await fs.readFile(path.join(templateRoot, "software-project-config.schema.json"), "utf8"));
 const examples = [
   { id: "nodejs", folder: "examples/node-project", expectedLanguage: "nodejs" },
@@ -65,6 +81,7 @@ test("both technology-stack examples execute their declared test gates", () => {
     const result = spawnSync(command.executable, command.args, {
       cwd: path.resolve(root, command.cwd),
       encoding: "utf8",
+      env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" },
       timeout: command.timeoutSeconds * 1000,
       windowsHide: true
     });
