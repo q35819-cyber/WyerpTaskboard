@@ -37,7 +37,7 @@ test("independent PASS derives the correct next state from acceptance scope and 
     status: "待用户验收", plannedRole: "用户", deliveryDisposition: "user_acceptance", deliveryActions: []
   });
   assert.deepEqual(workflow.resolveIndependentTestOutcome("独测中", "pass", { acceptanceScope: "system", deliveryActions: ["candidate_merge"] }), {
-    status: "待交付", plannedRole: "开发AI", deliveryDisposition: "required", deliveryActions: ["candidate_merge"]
+    status: "待交付", plannedRole: "总控AI", deliveryDisposition: "required", deliveryActions: ["candidate_merge"]
   });
   assert.throws(
     () => workflow.resolveIndependentTestOutcome("独测中", "pass", { acceptanceScope: "system", deliveryActions: "candidate_merge" }),

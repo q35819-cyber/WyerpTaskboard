@@ -17,12 +17,12 @@ async function git(cwd, ...args) {
   return String(stdout || "").trim();
 }
 
-async function deliveryFixture(t, { merged = true, deliveryActorId = "developer", deliverySessionId = "dev-session", acceptanceScope = "user_ui_business" } = {}) {
+async function deliveryFixture(t, { merged = true, deliveryActorId = "controller", deliverySessionId = "ctrl-session", acceptanceScope = "user_ui_business" } = {}) {
   const fixture = await makeFixture();
   t.after(() => fs.rm(fixture.boardRoot, { recursive: true, force: true }));
   const taskId = "D-DELIVERY";
   await fs.writeFile(fixture.registryPath, registryText([
-    [taskId, "F-DELIVERY", "product", "P0", "交付中", "开发AI", deliveryActorId, "开发窗口", deliverySessionId,
+    [taskId, "F-DELIVERY", "product", "P0", "交付中", "总控AI", deliveryActorId, "总控窗口", deliverySessionId,
       "2026-10-31T00:00:00Z", "Git交付闭环测试", "测试计划.md", "reports/D-DELIVERY/post-merge.md"]
   ]), "utf8");
   await fs.mkdir(path.join(fixture.projectRoot, "reports", taskId), { recursive: true });
@@ -97,9 +97,9 @@ async function deliveryFixture(t, { merged = true, deliveryActorId = "developer"
     }
   });
   await store.appendTaskEvent("fixture", taskId, {
-    operationId: "delivery.developer.claim.0001",
+    operationId: "delivery.controller.claim.0001",
     eventType: "claim",
-    actorType: "developer_ai",
+    actorType: "controller_ai",
     actorId: deliveryActorId,
     sessionId: deliverySessionId,
     metadata: { claimedFromStatus: "待交付" }
@@ -108,8 +108,8 @@ async function deliveryFixture(t, { merged = true, deliveryActorId = "developer"
   return { fixture, store, snapshot, taskId, candidateSha, mergeSha, reportPath, bare };
 }
 
-test("delivery completion is restricted to the original developer identity and Session", async (t) => {
-  const x = await deliveryFixture(t, { deliveryActorId: "replacement-developer", deliverySessionId: "replacement-session" });
+test("delivery completion rejects a developer impersonating controller", async (t) => {
+  const x = await deliveryFixture(t, { deliveryActorId: "replacement-controller", deliverySessionId: "replacement-session" });
   await assert.rejects(() => x.store.updateTask("fixture", x.taskId, { status: "已完成" }, {
     expectedRevision: x.snapshot.registryRevision,
     operationId: "delivery.complete.wrong.owner.0001",
@@ -118,10 +118,10 @@ test("delivery completion is restricted to the original developer identity and S
     actorId: "replacement-developer",
     sessionId: "replacement-session",
     metadata: { postMergeReportPath: x.reportPath, postMergeRegressionResult: "PASS" }
-  }), (error) => error.code === "DELIVERY_ORIGINAL_DEVELOPER_REQUIRED");
+  }), (error) => error.code === "DELIVERY_OWNER_MISMATCH");
   const current = await x.store.getTask("fixture", x.taskId);
   assert.equal(current.task.status, "交付中");
-  assert.equal(current.task.assignee, "replacement-developer");
+  assert.equal(current.task.assignee, "replacement-controller");
   assert.equal(current.task.sessionId, "replacement-session");
 });
 
@@ -131,10 +131,10 @@ test("delivery reaches user acceptance only after the independently tested candi
     expectedRevision: x.snapshot.registryRevision,
     operationId: "delivery.complete.verified.0001",
     eventType: "delivery_complete",
-    actorType: "developer_ai",
-    actorId: "developer",
-    sessionWindowName: "开发窗口",
-    sessionId: "dev-session",
+    actorType: "controller_ai",
+    actorId: "controller",
+    sessionWindowName: "总控窗口",
+    sessionId: "ctrl-session",
     note: "已合并、推送并完成合并后回归",
     metadata: { postMergeReportPath: x.reportPath, postMergeRegressionResult: "PASS" }
   });
@@ -156,10 +156,10 @@ test("system-scoped delivery auto-closes after verified merge without user accep
     expectedRevision: x.snapshot.registryRevision,
     operationId: "delivery.complete.system.0001",
     eventType: "delivery_complete",
-    actorType: "developer_ai",
-    actorId: "developer",
-    sessionWindowName: "开发窗口",
-    sessionId: "dev-session",
+    actorType: "controller_ai",
+    actorId: "controller",
+    sessionWindowName: "总控窗口",
+    sessionId: "ctrl-session",
     note: "系统范围任务已合并并完成合并后回归",
     metadata: { postMergeReportPath: x.reportPath, postMergeRegressionResult: "PASS" }
   });
@@ -175,9 +175,9 @@ test("delivery cannot close by a generic status change or before candidate merge
     expectedRevision: bypass.snapshot.registryRevision,
     operationId: "delivery.generic.bypass.0001",
     eventType: "status_change",
-    actorType: "developer_ai",
-    actorId: "developer",
-    sessionId: "dev-session"
+    actorType: "controller_ai",
+    actorId: "controller",
+    sessionId: "ctrl-session"
   }), (error) => error.code === "DELIVERY_VERIFICATION_REQUIRED");
 
   const unmerged = await deliveryFixture(t, { merged: false });
@@ -185,24 +185,24 @@ test("delivery cannot close by a generic status change or before candidate merge
     expectedRevision: unmerged.snapshot.registryRevision,
     operationId: "delivery.unmerged.denied.0001",
     eventType: "delivery_complete",
-    actorType: "developer_ai",
-    actorId: "developer",
-    sessionId: "dev-session",
+    actorType: "controller_ai",
+    actorId: "controller",
+    sessionId: "ctrl-session",
     metadata: { postMergeReportPath: unmerged.reportPath, postMergeRegressionResult: "PASS" }
   }), (error) => error.code === "DELIVERY_CANDIDATE_NOT_MERGED");
   const blocked = await unmerged.store.getTask("fixture", unmerged.taskId);
   assert.equal(blocked.task.status, "交付中");
-  assert.equal(blocked.task.assignee, "developer");
-  assert.equal(blocked.task.sessionId, "dev-session");
+  assert.equal(blocked.task.assignee, "controller");
+  assert.equal(blocked.task.sessionId, "ctrl-session");
 
   const failureSnapshot = await unmerged.store.snapshot("fixture");
   const failureEvent = await unmerged.store.appendTaskEvent("fixture", unmerged.taskId, {
     expectedRevision: failureSnapshot.registryRevision,
     operationId: "delivery.unmerged.failure.logged.0001",
     eventType: "delivery_attempt_failed",
-    actorType: "developer_ai",
-    actorId: "developer",
-    sessionId: "dev-session",
+    actorType: "controller_ai",
+    actorId: "controller",
+    sessionId: "ctrl-session",
     note: "候选提交尚未进入远端main",
     metadata: {
       failureStage: "verification",
@@ -223,9 +223,9 @@ test("delivery cannot close by a generic status change or before candidate merge
     expectedRevision: retrySnapshot.registryRevision,
     operationId: "delivery.unmerged.retry.completed.0001",
     eventType: "delivery_complete",
-    actorType: "developer_ai",
-    actorId: "developer",
-    sessionId: "dev-session",
+    actorType: "controller_ai",
+    actorId: "controller",
+    sessionId: "ctrl-session",
     metadata: { postMergeReportPath: unmerged.reportPath, postMergeRegressionResult: "PASS" }
   });
   assert.equal(retried.after.status, "待用户验收");
@@ -248,9 +248,9 @@ test("delivery rejects a remote main SHA that advanced after the local merge", a
     expectedRevision: snapshot.registryRevision,
     operationId: "delivery.remote.sha.mismatch.0001",
     eventType: "delivery_complete",
-    actorType: "developer_ai",
-    actorId: "developer",
-    sessionId: "dev-session",
+    actorType: "controller_ai",
+    actorId: "controller",
+    sessionId: "ctrl-session",
     metadata: { postMergeReportPath: x.reportPath, postMergeRegressionResult: "PASS" }
   }), (error) => error.code === "DELIVERY_REMOTE_SHA_MISMATCH");
 });
@@ -270,9 +270,9 @@ test("code changes after independent PASS invalidate delivery evidence", async (
     expectedRevision: snapshot.registryRevision,
     operationId: "delivery.pass.invalidated.0001",
     eventType: "delivery_complete",
-    actorType: "developer_ai",
-    actorId: "developer",
-    sessionId: "dev-session",
+    actorType: "controller_ai",
+    actorId: "controller",
+    sessionId: "ctrl-session",
     metadata: { postMergeReportPath: x.reportPath, postMergeRegressionResult: "PASS" }
   }), (error) => error.code === "DELIVERY_PASS_INVALIDATED");
 });
@@ -285,9 +285,9 @@ test("delivery refuses to close when source files remain dirty outside the new r
     expectedRevision: snapshot.registryRevision,
     operationId: "delivery.dirty.worktree.denied.0001",
     eventType: "delivery_complete",
-    actorType: "developer_ai",
-    actorId: "developer",
-    sessionId: "dev-session",
+    actorType: "controller_ai",
+    actorId: "controller",
+    sessionId: "ctrl-session",
     metadata: { postMergeReportPath: x.reportPath, postMergeRegressionResult: "PASS" }
   }), (error) => error.code === "DELIVERY_WORKTREE_DIRTY");
 });
@@ -309,7 +309,7 @@ test("registered clean isolated delivery succeeds while another AI's root worktr
   const result = await x.store.updateTask("fixture", x.taskId, { status: "已完成" }, {
     expectedRevision: x.snapshot.registryRevision,
     operationId: "delivery.isolated.clean.accepted.0001",
-    eventType: "delivery_complete", actorType: "developer_ai", actorId: "developer", sessionId: "dev-session",
+    eventType: "delivery_complete", actorType: "controller_ai", actorId: "controller", sessionId: "ctrl-session",
     metadata: { deliveryWorktreePath: worktree, postMergeReportPath: x.reportPath, postMergeRegressionResult: "PASS" }
   });
   assert.equal(result.after.status, "已完成");
@@ -323,7 +323,7 @@ test("isolated delivery rejects a dirty worktree or an unregistered path", async
   const complete = (candidate, operationId) => x.store.updateTask("fixture", x.taskId, { status: "已完成" }, {
     expectedRevision: x.snapshot.registryRevision,
     operationId, eventType: "delivery_complete",
-    actorType: "developer_ai", actorId: "developer", sessionId: "dev-session",
+    actorType: "controller_ai", actorId: "controller", sessionId: "ctrl-session",
     metadata: { deliveryWorktreePath: candidate, postMergeReportPath: x.reportPath, postMergeRegressionResult: "PASS" }
   });
   await fs.writeFile(path.join(worktree, "dirty-source.js"), "dirty", "utf8");
@@ -337,39 +337,39 @@ test("isolated delivery rejects a dirty worktree or an unregistered path", async
     "delivery.isolated.unknown.path.denied.0001"), (error) => error.code === "DELIVERY_WORKTREE_INVALID");
 });
 
-test("isolated delivery retains candidate ancestry, report, and developer identity gates", async (t) => {
+test("isolated delivery retains candidate ancestry, report, and controller identity gates", async (t) => {
   const unmerged = await deliveryFixture(t, { merged: false });
   const worktree = await isolatedDeliveryWorktree(unmerged);
-  const complete = (x, meta, who = "developer") => x.store.updateTask("fixture", x.taskId, { status: "已完成" }, {
+  const complete = (x, meta, who = "controller") => x.store.updateTask("fixture", x.taskId, { status: "已完成" }, {
     expectedRevision: x.snapshot.registryRevision,
     operationId: "delivery.isolated.unmerged.denied.0001",
-    eventType: "delivery_complete", actorType: "developer_ai", actorId: who, sessionId: "dev-session",
+    eventType: "delivery_complete", actorType: "controller_ai", actorId: who, sessionId: "ctrl-session",
     metadata: { deliveryWorktreePath: worktree, postMergeReportPath: x.reportPath, postMergeRegressionResult: "PASS", ...meta }
   });
   await assert.rejects(() => complete(unmerged, {}), (error) => error.code === "DELIVERY_CANDIDATE_NOT_MERGED");
   const merged = await deliveryFixture(t);
   const validWorktree = await isolatedDeliveryWorktree(merged);
-  const mergedComplete = (meta, who = "developer") => merged.store.updateTask("fixture", merged.taskId, { status: "已完成" }, {
+  const mergedComplete = (meta, who = "controller") => merged.store.updateTask("fixture", merged.taskId, { status: "已完成" }, {
     expectedRevision: merged.snapshot.registryRevision,
-    operationId: "delivery.isolated." + (who === "developer" ? "report" : "owner") + ".denied.0001",
-    eventType: "delivery_complete", actorType: "developer_ai", actorId: who, sessionId: "dev-session",
+    operationId: "delivery.isolated." + (who === "controller" ? "report" : "owner") + ".denied.0001",
+    eventType: "delivery_complete", actorType: "controller_ai", actorId: who, sessionId: "ctrl-session",
     metadata: { deliveryWorktreePath: validWorktree, postMergeReportPath: merged.reportPath, postMergeRegressionResult: "PASS", ...meta }
   });
-  await assert.rejects(() => mergedComplete({}, "wrong-developer"),
-    (error) => error.code === "DELIVERY_ORIGINAL_DEVELOPER_REQUIRED");
+  await assert.rejects(() => mergedComplete({}, "wrong-controller"),
+    (error) => error.code === "DELIVERY_CLAIM_MISMATCH");
   await fs.writeFile(path.join(validWorktree, merged.reportPath), "结论：PASS\n错误SHA\n", "utf8");
   await assert.rejects(() => mergedComplete({}), (error) => error.code === "DELIVERY_POST_MERGE_REPORT_INVALID");
 });
 
-test("delivery attempt failure is visible and retains the original developer for retry", async (t) => {
+test("delivery attempt failure is visible and retains the controller for retry", async (t) => {
   const x = await deliveryFixture(t);
   const failed = await x.store.updateTask("fixture", x.taskId, { status: "交付中" }, {
     expectedRevision: x.snapshot.registryRevision,
     operationId: "delivery.attempt.failed.0001",
     eventType: "delivery_attempt_failed",
-    actorType: "developer_ai",
-    actorId: "developer",
-    sessionId: "dev-session",
+    actorType: "controller_ai",
+    actorId: "controller",
+    sessionId: "ctrl-session",
     note: "远端推送被拒绝",
     metadata: {
       failureStage: "push",
@@ -379,8 +379,8 @@ test("delivery attempt failure is visible and retains the original developer for
     }
   });
   assert.equal(failed.after.status, "交付中");
-  assert.equal(failed.after.assignee, "developer");
-  assert.equal(failed.after.sessionId, "dev-session");
+  assert.equal(failed.after.assignee, "controller");
+  assert.equal(failed.after.sessionId, "ctrl-session");
   const presentation = await x.store.presentation("fixture", x.taskId);
   assert.match(presentation.currentProgress, /REMOTE_REJECTED/);
   assert.match(presentation.currentProgress, /远端分支已前进/);

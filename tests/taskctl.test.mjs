@@ -571,10 +571,10 @@ test("taskctl complete atomically hands developer work to independent test and r
   assert.equal(completed.after.sessionId, "");
 });
 
-test("taskctl delivery-failed records a visible blocker and preserves original developer ownership", async (t) => {
+test("taskctl delivery-failed records a visible blocker and preserves controller ownership", async (t) => {
   const { fixture, base } = await startFixture(t);
   await fs.writeFile(fixture.registryPath, registryText([
-    ["D-CLI-FAIL", "F-DELIVERY", "infrastructure", "P0", "交付中", "开发AI", "developer", "交付窗口", "dev-session", "2026-10-31T00:00:00Z", "交付失败记录", "测试计划.md", "cp/B-10.md"]
+    ["D-CLI-FAIL", "F-DELIVERY", "infrastructure", "P0", "交付中", "总控AI", "controller", "交付窗口", "controller-session", "2026-10-31T00:00:00Z", "交付失败记录", "测试计划.md", "cp/B-10.md"]
   ]), "utf8");
   const event = async (eventType, actorType, actorId, sessionId, metadata) => {
     await taskctl(fixture.boardRoot, base, [
@@ -592,21 +592,21 @@ test("taskctl delivery-failed records a visible blocker and preserves original d
     deliveryActions: ["candidate_merge"], commitSha: "c".repeat(40),
     headBranch: "feature/candidate", reportPath: "reports/D-CLI-FAIL/pass.md"
   });
-  await event("claim", "developer_ai", "developer", "dev-session", { claimedFromStatus: "待交付" });
+  await event("claim", "controller_ai", "controller", "controller-session", { claimedFromStatus: "待交付" });
   const failed = JSON.parse((await taskctl(fixture.boardRoot, base, [
     "delivery-failed", "--project", "fixture", "--task", "D-CLI-FAIL",
-    "--actor-id", "developer", "--session-id", "dev-session",
+    "--actor-id", "controller", "--session-id", "controller-session",
     "--failure-stage", "push", "--failure-code", "REMOTE_REJECTED",
     "--note", "远端推送被拒绝", "--next-action", "fetch origin/main 后同步并重试"
   ])).stdout);
   assert.equal(failed.event.event_type, "delivery_attempt_failed");
-  assert.equal(failed.event.actor_id, "developer");
+  assert.equal(failed.event.actor_id, "controller");
   const current = JSON.parse((await taskctl(fixture.boardRoot, base, [
     "get", "--project", "fixture", "--task", "D-CLI-FAIL"
   ])).stdout);
   assert.equal(current.status, "交付中");
-  assert.equal(current.assignee, "developer");
-  assert.equal(current.sessionId, "dev-session");
+  assert.equal(current.assignee, "controller");
+  assert.equal(current.sessionId, "controller-session");
   assert.match(current.presentation.currentProgress, /REMOTE_REJECTED/);
   assert.match(current.presentation.currentProgress, /远端推送被拒绝/);
   assert.match(current.presentation.currentProgress, /fetch origin\/main/);
@@ -615,7 +615,7 @@ test("taskctl delivery-failed records a visible blocker and preserves original d
 test("taskctl complete automatically records a failed Git verification and keeps the delivery owner", async (t) => {
   const { fixture, base } = await startFixture(t);
   await fs.writeFile(fixture.registryPath, registryText([
-    ["D-CLI-COMPLETE", "F-DELIVERY", "infrastructure", "P0", "交付中", "开发AI", "developer", "交付窗口", "dev-session", "2026-10-31T00:00:00Z", "交付自动记录失败", "测试计划.md", "cp/B-10.md"]
+    ["D-CLI-COMPLETE", "F-DELIVERY", "infrastructure", "P0", "交付中", "总控AI", "controller", "交付窗口", "controller-session", "2026-10-31T00:00:00Z", "交付自动记录失败", "测试计划.md", "cp/B-10.md"]
   ]), "utf8");
   const event = async (eventType, actorType, actorId, sessionId, metadata) => {
     await taskctl(fixture.boardRoot, base, [
@@ -633,11 +633,11 @@ test("taskctl complete automatically records a failed Git verification and keeps
     deliveryActions: ["candidate_merge"], commitSha: "d".repeat(40),
     headBranch: "feature/candidate", reportPath: "reports/D-CLI-COMPLETE/pass.md"
   });
-  await event("claim", "developer_ai", "developer", "dev-session", { claimedFromStatus: "待交付" });
+  await event("claim", "controller_ai", "controller", "controller-session", { claimedFromStatus: "待交付" });
 
   await assert.rejects(() => taskctl(fixture.boardRoot, base, [
     "complete", "--project", "fixture", "--task", "D-CLI-COMPLETE",
-    "--actor-id", "developer", "--session-id", "dev-session",
+    "--actor-id", "controller", "--session-id", "controller-session",
     "--report", "reports/B-10/report.md"
   ]), (error) => {
     assert.match(error.stderr, /DELIVERY_REMOTE_UNAVAILABLE/);
@@ -647,10 +647,10 @@ test("taskctl complete automatically records a failed Git verification and keeps
     "get", "--project", "fixture", "--task", "D-CLI-COMPLETE"
   ])).stdout);
   assert.equal(current.status, "交付中");
-  assert.equal(current.assignee, "developer");
-  assert.equal(current.sessionId, "dev-session");
+  assert.equal(current.assignee, "controller");
+  assert.equal(current.sessionId, "controller-session");
   assert.match(current.presentation.currentProgress, /DELIVERY_REMOTE_UNAVAILABLE/);
-  assert.match(current.presentation.currentProgress, /原开发AI/);
+  assert.match(current.presentation.currentProgress, /总控AI/);
 });
 
 test("independent test failure atomically returns task to developer and releases tester", async (t) => {

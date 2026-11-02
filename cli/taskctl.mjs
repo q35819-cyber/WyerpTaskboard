@@ -79,7 +79,7 @@ async function recordDeliveryFailure(project, task, who, {
   failureStage = "verification",
   failureCode = "DELIVERY_ATTEMPT_FAILED",
   note,
-  nextAction = "原开发AI保持当前Session继续处理；按阻断原因修复后重新同步远端main、重跑合并后回归，再执行taskctl complete"
+  nextAction = "总控AI保持当前Session继续交付；按阻断原因修复后同步远端main、重跑合并后回归，再执行taskctl complete"
 } = {}) {
   const latest = await current(project, task);
   if (latest.status !== "交付中" || latest.sessionId !== who.sessionId) return null;
@@ -114,7 +114,8 @@ function actor(args, defaultType = "developer_ai") {
 }
 function output(data) { process.stdout.write(JSON.stringify(data, null, 2) + "\n"); }
 function inferredActorTypeForStatus(status) {
-  return ["待独测", "独测中", "待复测", "复测中"].includes(status) ? "test_ai" : "developer_ai";
+  return ["待独测", "独测中", "待复测", "复测中"].includes(status) ? "test_ai"
+    : ["待交付", "交付中"].includes(status) ? "controller_ai" : "developer_ai";
 }
 async function guardState(project, task, args) {
   const who = actor(args, args["actor-type"] || "developer_ai");
@@ -215,7 +216,7 @@ try {
         "taskctl get --project PROJECT --task WTB-TEST-001",
         "taskctl context --task TASK-ID [--project PROJECT]",
         "taskctl guard --project PROJECT --task WTB-TEST-001 [--actor-id ID --session-id ID]",
-        "taskctl preclaim-report --project PROJECT --task WTB-TEST-001 --actor-id ID --session-id ID --note TEXT [--actor-type developer_ai|test_ai]",
+        "taskctl preclaim-report --project PROJECT --task WTB-TEST-001 --actor-id ID --session-id ID --note TEXT [--actor-type controller_ai|developer_ai|test_ai]",
         "taskctl ack-user --project PROJECT --task WTB-TEST-001 [--actor-type developer_ai|test_ai] [--actor-id ID --session-id ID]",
         "taskctl need-user --project PROJECT --task WTB-TEST-001 --note TEXT",
         "taskctl clear-user-need --project PROJECT --task WTB-TEST-001 --note TEXT",
@@ -223,12 +224,12 @@ try {
         "taskctl resource-preserve --project PROJECT --task WTB-TEST-001 --resource ID --resource-type process|port|fixture|browser|database --locator TEXT --purpose TEXT --handoff developer_ai --cleanup-condition TEXT --evidence PATH --actor-type test_ai --actor-id ID --session-id ID [--cleanup-by ISO --safety-status safe|isolated|risk]",
         "taskctl resource-observe --project PROJECT --task WTB-TEST-001 --resource ID --result viewed|reproduced|not_needed --note TEXT [--actor-id ID --session-id ID]",
         "taskctl resource-clean --project PROJECT --task WTB-TEST-001 --resource ID --note TEXT [--actor-type developer_ai|test_ai --actor-id ID --session-id ID]",
-        "taskctl claim --project PROJECT --task WTB-TEST-001 --assignee NAME --session-name NAME --session-id ID --actor-id ID [--actor-type developer_ai|test_ai]",
+        "taskctl claim --project PROJECT --task WTB-TEST-001 --assignee NAME --session-name NAME --session-id ID --actor-id ID [--actor-type controller_ai|developer_ai|test_ai]",
         "taskctl release --project PROJECT --task WTB-TEST-001 --session-id ID [--note TEXT]",
         "taskctl reply-user --project PROJECT --task WTB-TEST-001 --message EVENT_ID --note TEXT [--session-id ID]",
         "taskctl priority --project PROJECT --task WTB-TEST-001 --value P1",
         "taskctl transition --project PROJECT --task WTB-TEST-001 --status 待独测 --event-type handoff",
-        "taskctl complete --project PROJECT --task WTB-TEST-001 --actor-id ID --session-id ID --note TEXT [--report POST_MERGE_PASS_REPORT] [--delivery-worktree REGISTERED_CLEAN_WORKTREE when status is 交付中]",
+        "taskctl complete --project PROJECT --task WTB-TEST-001 --actor-id ID --session-id ID --note TEXT [--actor-type controller_ai when 交付中] [--report POST_MERGE_PASS_REPORT] [--delivery-worktree REGISTERED_CLEAN_WORKTREE when 交付中]",
         "taskctl delivery-failed --project PROJECT --task WTB-TEST-001 --actor-id ID --session-id ID --failure-stage merge|push|remote_sync|regression|report|verification --failure-code CODE --note REASON --next-action ACTION",
         "taskctl changed --project PROJECT --task WTB-TEST-001 --kind code|doc --paths a,b --note TEXT [--invalidates-test true]",
         "taskctl test-start --project PROJECT --task WTB-TEST-001 --note TEXT [--report path] [--actor-type test_ai --actor-id ID --session-id ID]",
@@ -245,7 +246,7 @@ try {
         "taskctl requirement-status --project PROJECT --requirement REQ-ID --status 待用户补充|已拆解|已取消 [--plans a.md,b.md --tasks A-01,B-02 --key-files server/a.js,web/b.js] --note TEXT"
       ],
       cooperativeEnforcement: true,
-      note: "help/projects 不需要项目；list 仅为只读兼容保留自身项目默认值，建议始终显式指定 --project。其余项目型命令必须提供 --project。claim 前先聊天汇报，再登记同一 actor/session 的 preclaim-report 并复核 guard/实时占用；claim 的 --actor-id 为必填。test-start/test-result 默认开发自测；独测必须显式传 --actor-type test_ai 和稳定 --actor-id。待交付只能由原开发 actor/session 认领；交付核验失败会自动写入delivery_attempt_failed，merge/push等命令失败时必须执行delivery-failed。示例占位值需替换，含空格或竖线的参数值应加引号。"
+      note: "help/projects 不需要项目；list 仅为只读兼容保留自身项目默认值，建议始终显式指定 --project。其余项目型命令必须提供 --project。claim 前先聊天汇报，再登记同一 actor/session 的 preclaim-report 并复核 guard/实时占用；claim 的 --actor-id 为必填。test-start/test-result 默认开发自测；独测必须显式传 --actor-type test_ai 和稳定 --actor-id。待交付由独立总控 controller_ai 正式认领，开发不可代交付；交付核验失败会自动写入delivery_attempt_failed，merge/push等命令失败时必须执行delivery-failed。示例占位值需替换，含空格或竖线的参数值应加引号。"
     });
   } else if (command === "projects") {
     output(await request("/api/projects"));
@@ -541,8 +542,8 @@ try {
     const before = await current(project, task);
     required(args, "session-id");
     if (before.status === "交付中") {
-      const who = actor(args, "developer_ai");
-      if (who.actorType !== "developer_ai") throw new Error("交付完成必须由developer_ai执行");
+      const who = actor(args, "controller_ai");
+      if (who.actorType !== "controller_ai") throw new Error("交付完成必须由controller_ai执行");
       required(args, "actor-id");
       const reportPath = required(args, "report");
       try {
@@ -588,8 +589,8 @@ try {
     await preflight(project, task, args);
     const before = await current(project, task);
     if (before.status !== "交付中") throw preflightError("DELIVERY_STAGE_REQUIRED", "只有交付中的任务可以登记交付失败", { status: before.status });
-    const who = actor(args, "developer_ai");
-    if (who.actorType !== "developer_ai") throw new Error("delivery-failed必须由developer_ai执行");
+    const who = actor(args, "controller_ai");
+    if (who.actorType !== "controller_ai") throw new Error("delivery-failed必须由controller_ai执行");
     required(args, "actor-id");
     required(args, "session-id");
     output(await request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task) + "/delivery-attempt-failed", {

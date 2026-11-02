@@ -1682,7 +1682,7 @@ test("project service status endpoint exposes safe state without instance secret
   assert.equal(unsupportedBody.state, "unsupported");
 });
 
-test("待交付 can only be claimed by the original developer AI from the original Session", async (t) => {
+test("legacy 待交付 requires a new controller Session, not the original developer", async (t) => {
   const { base, secret, fixture } = await startFixture(t);
   await fs.writeFile(fixture.registryPath, registryText([
     ["D-ORIGINAL", "F-DELIVERY", "product", "P0", "待交付", "开发AI", "—", "—", "—", "2026-10-31T00:00:00Z", "原开发者交付认领", "测试计划.md", "cp/D-ORIGINAL.md"]
@@ -1717,33 +1717,34 @@ test("待交付 can only be claimed by the original developer AI from the origin
     })
   });
   assert.equal(replacement.status, 409);
-  assert.equal((await replacement.json()).error.code, "DELIVERY_ORIGINAL_DEVELOPER_REQUIRED");
+  assert.equal((await replacement.json()).error.code, "DELIVERY_CONTROLLER_REQUIRED");
 
   await recordPreclaim(base, secret, "D-ORIGINAL", {
-    actorType: "developer_ai", actorId: "original-developer", sessionId: "original-session"
+    actorType: "controller_ai", actorId: "controller", sessionId: "controller-session"
   });
   current = await (await fetch(base + "/api/projects/fixture/tasks/D-ORIGINAL", { headers })).json();
   const original = await fetch(base + "/api/projects/fixture/tasks/D-ORIGINAL/claim", {
     method: "POST", headers,
     body: JSON.stringify({
-      operationId: "delivery.claim.original.001", expectedRevision: current.registryRevision,
-      actorType: "developer_ai", actorId: "original-developer", assignee: "original-developer",
-      sessionId: "original-session", sessionWindowName: "原开发窗口"
+      operationId: "delivery.claim.controller.001", expectedRevision: current.registryRevision,
+      actorType: "controller_ai", actorId: "controller", assignee: "controller",
+      sessionId: "controller-session", sessionWindowName: "总控窗口"
     })
   });
   const originalBody = await original.json();
   assert.equal(original.status, 200, JSON.stringify(originalBody));
   const claimed = originalBody;
   assert.equal(claimed.after.status, "交付中");
-  assert.equal(claimed.after.assignee, "original-developer");
-  assert.equal(claimed.after.sessionId, "original-session");
+  assert.equal(claimed.after.plannedRole, "总控AI");
+  assert.equal(claimed.after.assignee, "controller");
+  assert.equal(claimed.after.sessionId, "controller-session");
 });
 
-test("delivery failure endpoint records the blocker and keeps original developer ownership", async (t) => {
+test("delivery failure endpoint records the blocker and retains controller ownership", async (t) => {
   const { base, secret, fixture } = await startFixture(t);
   const { cookie } = await login(base, secret);
   await fs.writeFile(fixture.registryPath, registryText([
-    ["D-FAILURE", "F-DELIVERY", "product", "P0", "交付中", "开发AI", "developer", "交付窗口", "dev-session", "2026-10-31T00:00:00Z", "交付失败恢复", "测试计划.md", "cp/D-FAILURE.md"]
+    ["D-FAILURE", "F-DELIVERY", "product", "P0", "交付中", "总控AI", "controller", "交付窗口", "controller-session", "2026-10-31T00:00:00Z", "交付失败恢复", "测试计划.md", "cp/D-FAILURE.md"]
   ]), "utf8");
   const headers = { Authorization: "Bearer " + secret, "Content-Type": "application/json" };
   const seed = async (operationId, eventType, actorType, actorId, sessionId, metadata = {}) => {
@@ -1761,7 +1762,7 @@ test("delivery failure endpoint records the blocker and keeps original developer
     atomicLifecycle: true, testResult: "pass", deliveryDisposition: "required", deliveryActions: ["candidate_merge"],
     commitSha: "b".repeat(40), headBranch: "feature/candidate", reportPath: "reports/D-FAILURE/pass.md"
   });
-  await seed("delivery.failure.developer.claim.001", "claim", "developer_ai", "developer", "dev-session", { claimedFromStatus: "待交付" });
+  await seed("delivery.failure.controller.claim.001", "claim", "controller_ai", "controller", "controller-session", { claimedFromStatus: "待交付" });
   const before = await (await fetch(base + "/api/projects/fixture/tasks/D-FAILURE", { headers })).json();
   const browserFailure = await fetch(base + "/api/projects/fixture/tasks/D-FAILURE/delivery-attempt-failed", {
     method: "POST",
@@ -1769,9 +1770,9 @@ test("delivery failure endpoint records the blocker and keeps original developer
     body: JSON.stringify({
       operationId: "delivery.failure.browser-spoof.denied",
       expectedRevision: before.registryRevision,
-      actorType: "developer_ai",
-      actorId: "developer",
-      sessionId: "dev-session",
+      actorType: "controller_ai",
+      actorId: "controller",
+      sessionId: "controller-session",
       failureStage: "push",
       note: "伪造交付失败",
       nextAction: "继续执行"
@@ -1783,7 +1784,7 @@ test("delivery failure endpoint records the blocker and keeps original developer
     method: "POST", headers,
     body: JSON.stringify({
       operationId: "delivery.failure.record.001", expectedRevision: before.registryRevision,
-      actorType: "developer_ai", actorId: "developer", sessionId: "dev-session",
+      actorType: "controller_ai", actorId: "controller", sessionId: "controller-session",
       failureStage: "push", failureCode: "REMOTE_REJECTED", note: "远端推送被拒绝",
       nextAction: "先 fetch origin/main，再同步并重试推送"
     })
@@ -1791,8 +1792,8 @@ test("delivery failure endpoint records the blocker and keeps original developer
   assert.equal(response.status, 200, JSON.stringify(await response.json()));
   const current = await (await fetch(base + "/api/projects/fixture/tasks/D-FAILURE", { headers })).json();
   assert.equal(current.status, "交付中");
-  assert.equal(current.assignee, "developer");
-  assert.equal(current.sessionId, "dev-session");
+  assert.equal(current.assignee, "controller");
+  assert.equal(current.sessionId, "controller-session");
   assert.match(current.presentation.currentProgress, /REMOTE_REJECTED/);
   assert.match(current.presentation.currentProgress, /远端推送被拒绝/);
   assert.match(current.presentation.currentProgress, /fetch origin\/main/);
@@ -1820,7 +1821,7 @@ test("independent test pass derives delivery need from validated real actions", 
   assert.equal(accepted.status, 200);
   const body = await accepted.json();
   assert.equal(body.after.status, "待交付", "server derives delivery from real actions and ignores caller-selected disposition");
-  assert.equal(body.after.plannedRole, "开发AI");
+  assert.equal(body.after.plannedRole, "总控AI");
 });
 
 test("explicit user_ui_business product task pass goes to UI/business user acceptance", async (t) => {

@@ -242,8 +242,8 @@ async function verifyDeliveryCompletion(context, task, events, patch, { actorTyp
   if (task.status !== "交付中" || patch?.status !== "已完成") {
     throw new TaskboardError("只有交付中的任务可以提交合并完成", { code: "DELIVERY_STAGE_REQUIRED", status: 409 });
   }
-  if (actorType !== "developer_ai" || !sessionId || sessionId !== task.sessionId) {
-    throw new TaskboardError("必须由当前交付负责人在原Session完成合并交付", { code: "DELIVERY_OWNER_MISMATCH", status: 409 });
+  if (actorType !== "controller_ai" || !actorId || !sessionId || sessionId !== task.sessionId) {
+    throw new TaskboardError("必须由正式认领的总控AI在当前Session完成合并交付", { code: "DELIVERY_OWNER_MISMATCH", status: 409 });
   }
   const latestTest = [...events].reverse().find((event) => event.event_type === "test_result");
   const pass = latestTest?.metadata || {};
@@ -269,30 +269,15 @@ async function verifyDeliveryCompletion(context, task, events, patch, { actorTyp
       code: "DELIVERY_TEST_INDEPENDENCE_INVALID", status: 409
     });
   }
-  const takeover = deliveryTakeoverAuthority(events, {
-    valid: true, eventId: latestTest.event_id, latestResult: latestTest,
-    developerActorId: developerHandoff.actor_id, developerSessionId: developerHandoff.session_id
-  });
-  const originalOwner = developerHandoff.actor_id === actorId && developerHandoff.session_id === sessionId;
-  const delegatedOwner = takeover?.metadata?.newDeveloperActorId === actorId &&
-    takeover?.metadata?.newDeveloperSessionId === sessionId;
-  if ((!originalOwner && !delegatedOwner) || (takeover && !delegatedOwner)) {
-    throw new TaskboardError("交付必须由当前已授权的开发Session完成；旧Session接管后失权", {
-      code: "DELIVERY_ORIGINAL_DEVELOPER_REQUIRED", status: 409,
-      details: { requiredActorId: takeover?.metadata?.newDeveloperActorId || developerHandoff.actor_id,
-        requiredSessionId: takeover?.metadata?.newDeveloperSessionId || developerHandoff.session_id }
-    });
-  }
   const invalidation = events.slice(passIndex + 1).find((event) =>
     event.event_type === "code_change" || event.event_type === "test_result" || event.metadata?.invalidatesTestEvidence === true);
   if (invalidation) throw new TaskboardError("独立PASS之后又发生代码修改或测试结果变化，必须重新独测", {
     code: "DELIVERY_PASS_INVALIDATED", status: 409
   });
   const deliveryClaim = [...events].reverse().find((event) =>
-    event.event_type === "claim" && event.new_status === "交付中" && event.actor_type === "developer_ai");
-  if (!deliveryClaim || deliveryClaim.actor_id !== actorId || deliveryClaim.session_id !== sessionId
-    || (takeover && !delegatedOwner) || (!takeover && !originalOwner)) {
-    throw new TaskboardError("当前执行身份不是原开发AI的正式交付认领", {
+    event.event_type === "claim" && event.new_status === "交付中" && event.actor_type === "controller_ai");
+  if (!deliveryClaim || deliveryClaim.actor_id !== actorId || deliveryClaim.session_id !== sessionId) {
+    throw new TaskboardError("当前执行身份不是总控AI的正式交付认领", {
       code: "DELIVERY_CLAIM_MISMATCH", status: 409
     });
   }

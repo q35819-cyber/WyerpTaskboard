@@ -1160,8 +1160,8 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           });
         }
         const actorType = body.actorType || "developer_ai";
-        if (!["developer_ai", "test_ai"].includes(actorType)) {
-          throw new TaskboardError("认领前汇报actorType必须为developer_ai或test_ai", {
+        if (!["controller_ai", "developer_ai", "test_ai"].includes(actorType)) {
+          throw new TaskboardError("认领前汇报actorType必须为controller_ai、developer_ai或test_ai", {
             code: "PRECLAIM_REPORT_ACTOR_INVALID", status: 400, details: { actorType }
           });
         }
@@ -1398,8 +1398,8 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           code: "DELIVERY_STAGE_REQUIRED", status: 409, details: { status: task.status }
         });
         const actorType = body.actorType || "developer_ai";
-        if (actorType !== "developer_ai" || !body.actorId || !body.sessionId) {
-          throw new TaskboardError("交付失败必须由明确的developer_ai身份和Session登记", {
+        if (actorType !== "controller_ai" || !body.actorId || !body.sessionId) {
+          throw new TaskboardError("交付失败必须由明确的controller_ai身份和Session登记", {
             code: "DELIVERY_OWNER_MISMATCH", status: 409
           });
         }
@@ -1410,19 +1410,10 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           code: "DELIVERY_INDEPENDENT_PASS_REQUIRED", status: 409
         });
         const deliveryClaim = [...history].reverse().find((event) =>
-          event.event_type === "claim" && event.new_status === "交付中" && event.actor_type === "developer_ai");
+          event.event_type === "claim" && event.new_status === "交付中" && event.actor_type === "controller_ai");
         if (!deliveryClaim || deliveryClaim.actor_id !== body.actorId || deliveryClaim.session_id !== body.sessionId) {
           throw new TaskboardError("交付失败必须由当前正式交付认领者登记", {
             code: "DELIVERY_CLAIM_MISMATCH", status: 409
-          });
-        }
-        const takeover = deliveryTakeoverAuthority(history, evidence);
-        const requiredActorId = takeover?.metadata?.newDeveloperActorId || evidence.developerActorId;
-        const requiredSessionId = takeover?.metadata?.newDeveloperSessionId || evidence.developerSessionId;
-        if (body.actorId !== requiredActorId || body.sessionId !== requiredSessionId) {
-          throw new TaskboardError("交付失败必须由当前正式接管开发AI和Session记录", {
-            code: "DELIVERY_ORIGINAL_DEVELOPER_REQUIRED", status: 409,
-            details: { requiredActorId, requiredSessionId }
           });
         }
         const failureStage = String(body.failureStage || "").trim();
@@ -1474,9 +1465,9 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         }
         const actorId = body.actorId || identity.actorId || "taskctl";
         if (task.status === "待交付") {
-          if (actorType !== "developer_ai" || !body.actorId || !body.sessionId) {
-            throw new TaskboardError("待交付只能由原开发AI使用原Session认领", {
-              code: "DELIVERY_ORIGINAL_DEVELOPER_REQUIRED", status: 409
+          if (actorType !== "controller_ai" || !body.actorId || !body.sessionId) {
+            throw new TaskboardError("待交付只能由总控AI以独立actor/Session认领", {
+              code: "DELIVERY_CONTROLLER_REQUIRED", status: 409
             });
           }
           const deliveryHistory = await taskStore.taskHistory(params.projectId, params.taskId, { all: true });
@@ -1484,13 +1475,10 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           if (!evidence.valid) throw new TaskboardError("缺少有效的最新独立测试PASS，禁止认领交付任务", {
             code: "DELIVERY_INDEPENDENT_PASS_REQUIRED", status: 409
           });
-          const takeover = deliveryTakeoverAuthority(deliveryHistory, evidence);
-          const requiredActorId = takeover?.metadata?.newDeveloperActorId || evidence.developerActorId;
-          const requiredSessionId = takeover?.metadata?.newDeveloperSessionId || evidence.developerSessionId;
-          if (actorId !== requiredActorId || body.sessionId !== requiredSessionId) {
-            throw new TaskboardError("待交付必须由原开发或当前用户授权接管的开发AI/Session认领", {
-              code: "DELIVERY_ORIGINAL_DEVELOPER_REQUIRED", status: 409,
-              details: { requiredActorId, requiredSessionId }
+          if (actorId === evidence.developerActorId || body.sessionId === evidence.developerSessionId
+            || actorId === evidence.latestResult?.actor_id || body.sessionId === evidence.latestResult?.session_id) {
+            throw new TaskboardError("总控交付身份必须独立于开发与独测Session", {
+              code: "DELIVERY_CONTROLLER_IDENTITY_CONFLICT", status: 409
             });
           }
         }

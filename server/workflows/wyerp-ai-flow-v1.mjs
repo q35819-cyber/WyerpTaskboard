@@ -52,7 +52,7 @@ const fixedPlannedRoleByStatus = new Map([
 ]);
 const deliveryStatuses = new Set(["待交付", "交付中"]);
 function canonicalRole(value) { const role = String(value ?? "").trim(); return role === "—" ? "" : role; }
-function validRole(role) { return ["", "开发AI", "独立测试AI", "用户"].includes(role); }
+function validRole(role) { return ["", "总控AI", "开发AI", "独立测试AI", "用户"].includes(role); }
 
 export const wyerpAiFlowV1 = {
   id: "wyerp-ai-flow-v1",
@@ -90,13 +90,8 @@ export const wyerpAiFlowV1 = {
     this.validateStatus(status);
     if (fixedPlannedRoleByStatus.has(status)) return fixedPlannedRoleByStatus.get(status);
     if (deliveryStatuses.has(status)) {
-      const role = hasSuppliedRole ? canonicalRole(suppliedRole) : canonicalRole(currentRole);
-      if (!role || !validRole(role)) {
-        throw new TaskboardError("待交付/交付中必须保留已登记的真实交付执行角色", {
-          code: "DELIVERY_ROLE_REQUIRED", status: 409, details: { status, role: role || null }
-        });
-      }
-      return role;
+      // Old tasks may still say 开发AI; transition to the sole controller delivery role.
+      return "总控AI";
     }
     if (status === "阻断") {
       const role = hasSuppliedRole ? canonicalRole(suppliedRole) : (statusChanging ? "" : canonicalRole(currentRole));
@@ -121,7 +116,8 @@ export const wyerpAiFlowV1 = {
         || (task.status === "待独测" && targetStatus === "独测中")
         || (task.status === "待复测" && targetStatus === "复测中")
         || (task.status === "待交付" && targetStatus === "交付中")
-      ) ? (["待独测", "待复测"].includes(task.status) ? "test_ai" : "developer_ai") : "";
+      ) ? (["待独测", "待复测"].includes(task.status) ? "test_ai"
+        : task.status === "待交付" ? "controller_ai" : "developer_ai") : "";
       if (claimRole && (eventType !== "claim" || actorType !== claimRole || !sessionId)) {
         throw new TaskboardError("进入执行阶段必须通过正式claim，不能手动填写负责人或Session", {
           code: "FORMAL_CLAIM_REQUIRED", status: 409, details: { from: task.status, to: targetStatus, requiredActor: claimRole }
@@ -161,14 +157,14 @@ export const wyerpAiFlowV1 = {
         });
       }
       if (task.status === "待交付" && targetStatus === "交付中"
-        && (eventType !== "claim" || actorType !== "developer_ai" || !sessionId)) {
-        throw new TaskboardError("待交付任务必须由开发AI正式认领后进入交付中", {
+        && (eventType !== "claim" || actorType !== "controller_ai" || !sessionId)) {
+        throw new TaskboardError("待交付任务必须由总控AI正式认领后进入交付中", {
           code: "DELIVERY_CLAIM_REQUIRED", status: 409
         });
       }
       if (task.status === "交付中" && ["已完成", "待用户验收"].includes(targetStatus)) {
         const expectedDeliveryTarget = meta.acceptanceScope === "user_ui_business" ? "待用户验收" : "已完成";
-        if (targetStatus !== expectedDeliveryTarget || eventType !== "delivery_complete" || actorType !== "developer_ai" || !sessionId
+        if (targetStatus !== expectedDeliveryTarget || eventType !== "delivery_complete" || actorType !== "controller_ai" || !sessionId
           || sessionId !== task.sessionId || meta.deliveryVerified !== true
           || !meta.mergeCommitSha || !meta.remoteMainSha || !meta.postMergeReportSha256
           || meta.postMergeRegressionResult !== "PASS") {
@@ -255,7 +251,7 @@ export const wyerpAiFlowV1 = {
     if (invalid.length) throw new TaskboardError("存在不允许的交付动作: " + invalid.join(", "), { code: "INVALID_DELIVERY_ACTION", status: 400, details: { invalid } });
     if (disposition === "required") {
       if (!actions.length) throw new TaskboardError("判定需要交付时必须提供至少一个真实交付动作", { code: "DELIVERY_ACTION_REQUIRED", status: 400 });
-      return { status: "待交付", plannedRole: "开发AI", deliveryDisposition: disposition, deliveryActions: actions };
+      return { status: "待交付", plannedRole: "总控AI", deliveryDisposition: disposition, deliveryActions: actions };
     }
     if (actions.length) throw new TaskboardError("无交付动作路径不能携带deliveryActions", { code: "DELIVERY_ACTION_NOT_ALLOWED", status: 400 });
     if (disposition === "user_acceptance") return { status: "待用户验收", plannedRole: "用户", deliveryDisposition: disposition, deliveryActions: [] };
