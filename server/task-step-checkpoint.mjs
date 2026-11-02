@@ -221,6 +221,15 @@ export class TaskStepCheckpoint {
         const legacyEmpty = state.cursors.developer_ai === "D01_CLAIM" && recordedSteps.length === 0
           && state.records.every((entry) => entry.actorType === "test_ai"
             && entry.stepId === "Q01_ADMISSION" && entry.result === "FAIL");
+        const intervening = history.slice(handoffIndex + 1, qaClaimIndex);
+        const superseded = intervening.some((entry, index) =>
+          (entry.event_type === "test_result" &&
+            (entry.metadata?.testResult !== "blocked"
+              || !intervening.slice(index + 1).some((later) =>
+                later.actor_type === "controller_ai" && later.old_status === "阻断"
+                  && later.new_status === "待复测")))
+          || (entry.actor_type === "developer_ai"
+            && ["claim", "takeover"].includes(entry.event_type)));
         if ((!legacyEmpty && state.cursors.developer_ai !== "D08_HANDOFF") || !handoff || handoffIndex < 0
           || !devAuthority || !event || !["claim", "takeover"].includes(event.event_type)
           || event.actor_type !== "test_ai" || event.actor_id !== actorId
@@ -231,9 +240,7 @@ export class TaskStepCheckpoint {
           || handoff.actor_type !== "developer_ai"
           || handoff.actor_id !== devAuthority.actor_id
           || handoff.session_id !== devAuthority.session_id
-          || history.slice(handoffIndex + 1).some((entry) =>
-            entry.event_type === "test_result" || (entry.actor_type === "developer_ai"
-              && ["claim", "takeover"].includes(entry.event_type)))) {
+          || superseded) {
           throw invalid("CHECKPOINT_PREDECESSOR_REQUIRED", "缺少本轮可信正式开发交接事件，不能进入独测");
         }
         const recovered = {

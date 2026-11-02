@@ -266,6 +266,127 @@ test("existing Q01 FAIL history may be retained during zero-developer-checkpoint
   assert.equal(recovered.state.records[1].eventId,handoff.eventId);
   assert.equal(recovered.state.records[2].result,"PASS");
 });
+test("independent BLOCK followed by real controller requeue permits new QA to recover unchanged handoff",async(t)=>{
+  const {cp,taskStore}=await fixture(t);
+  await claimDev(taskStore);
+  const handoff=await taskStore.updateTask("fixture","A-10",{
+    status:"待独测",assignee:"",sessionWindowName:"",sessionId:""
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.block-requeue.handoff",eventType:"handoff",
+    actorType:"developer_ai",actorId:"developer",sessionId:"developer_ai.session",
+    metadata:{atomicLifecycle:true,completedFromStatus:"开发中",handoffTarget:"待独测"}
+  });
+  await taskStore.updateTask("fixture","A-10",{
+    status:"独测中",assignee:"qa",sessionWindowName:"qa",sessionId:"test_ai.session"
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.block-requeue.qa1",eventType:"claim",
+    actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session"
+  });
+  await step(cp,"test_ai","Q01_ADMISSION",{result:"FAIL"});
+  const blocked=await taskStore.updateTask("fixture","A-10",{
+    status:"阻断",plannedRole:"独立测试AI"
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.block-requeue.block",eventType:"test_result",
+    actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session",
+    metadata:{atomicLifecycle:true,testResult:"blocked",reportPath:"reports/qa-block.md"}
+  });
+  assert.ok(blocked.eventId);
+  const resumed=await taskStore.updateTask("fixture","A-10",{status:"待复测"},{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.block-requeue.controller",eventType:"controller_requeue",
+    actorType:"controller_ai",actorId:"controller",sessionId:"controller-session"
+  });
+  assert.ok(resumed.eventId);
+  const qa2=await taskStore.updateTask("fixture","A-10",{
+    status:"复测中",assignee:"qa2",sessionWindowName:"qa2",sessionId:"qa2-session"
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.block-requeue.qa2",eventType:"claim",
+    actorType:"test_ai",actorId:"qa2",sessionId:"qa2-session"
+  });
+  const before=await cp.show("fixture","A-10");
+  await assert.rejects(step(cp,"test_ai","Q01_ADMISSION",{
+    actorId:"qa",sessionId:"test_ai.session",eventId:qa2.eventId
+  }), e=>e.code==="CHECKPOINT_SESSION_MISMATCH");
+  assert.equal((await cp.show("fixture","A-10")).sha256,before.sha256);
+  const result=await step(cp,"test_ai","Q01_ADMISSION",{
+    actorId:"qa2",sessionId:"qa2-session",eventId:qa2.eventId
+  });
+  assert.equal(result.state.cursors.test_ai,"Q02_TEST");
+  assert.equal(result.state.records[0].result,"FAIL");
+  const marker=result.state.records.find(r=>r.eventId===handoff.eventId);
+  assert.equal(marker.stepId,"HISTORICAL_HANDOFF");
+  assert.equal(marker.result,"RECOVERED");
+  assert.equal(result.state.records.filter(r=>/^D0[1-8]_/.test(r.stepId)).length,0);
+});
+test("QA recovery refuses BLOCK requeued by non-controller and refuses real failed test verdict",async(t)=>{
+  for(const verdict of ["blocked","fail"]){
+    const {cp,taskStore}=await fixture(t);
+    await claimDev(taskStore);
+    await taskStore.updateTask("fixture","A-10",{
+      status:"待独测",assignee:"",sessionWindowName:"",sessionId:""
+    },{
+      expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      operationId:"fixture.block-negative.handoff."+verdict,eventType:"handoff",
+      actorType:"developer_ai",actorId:"developer",sessionId:"developer_ai.session",
+      metadata:{atomicLifecycle:true,completedFromStatus:"开发中",handoffTarget:"待独测"}
+    });
+    await taskStore.updateTask("fixture","A-10",{
+      status:"独测中",assignee:"qa",sessionWindowName:"qa",sessionId:"test_ai.session"
+    },{
+      expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      operationId:"fixture.block-negative.qa."+verdict,eventType:"claim",
+      actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session"
+    });
+    await taskStore.updateTask("fixture","A-10",{
+      status:verdict==="blocked"?"阻断":"测试失败待修复",
+      ...(verdict==="blocked"?{plannedRole:"独立测试AI"}:{})
+    },{
+      expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      operationId:"fixture.block-negative.result."+verdict,eventType:"test_result",
+      actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session",
+      metadata:{atomicLifecycle:true,testResult:verdict,reportPath:"reports/qa-verdict.md"}
+    });
+    if(verdict==="blocked") {
+      await taskStore.updateTask("fixture","A-10",{status:"待复测"},{
+        expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+        operationId:"fixture.block-negative.requeue",eventType:"fake_requeue",
+        actorType:"developer_ai",actorId:"developer",sessionId:"developer_ai.session"
+      });
+    } else {
+      // Malformed historical requeue event must never erase a genuine FAIL.
+      await taskStore.appendTaskEvent("fixture","A-10",{
+        operationId:"fixture.block-negative.fake-controller",eventType:"controller_requeue",
+        actorType:"controller_ai",actorId:"controller",sessionId:"controller-session"
+      });
+      await taskStore.updateTask("fixture","A-10",{status:"阻断",plannedRole:"开发AI"},{
+        expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+        operationId:"fixture.block-negative.to-block",eventType:"controller_block",
+        actorType:"controller_ai",actorId:"controller",sessionId:"controller-session"
+      });
+      await taskStore.updateTask("fixture","A-10",{status:"待复测"},{
+        expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+        operationId:"fixture.block-negative.retest",eventType:"controller_requeue",
+        actorType:"controller_ai",actorId:"controller",sessionId:"controller-session"
+      });
+    }
+    const qa=await taskStore.updateTask("fixture","A-10",{
+      status:"复测中",assignee:"qa2",sessionWindowName:"qa2",sessionId:"qa2-session"
+    },{
+      expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      operationId:"fixture.block-negative.qa2."+verdict,eventType:"claim",
+      actorType:"test_ai",actorId:"qa2",sessionId:"qa2-session"
+    });
+    const before=await cp.show("fixture","A-10");
+    await assert.rejects(step(cp,"test_ai","Q01_ADMISSION",{
+      actorId:"qa2",sessionId:"qa2-session",eventId:qa.eventId
+    }),e=>e.code==="CHECKPOINT_PREDECESSOR_REQUIRED");
+    assert.equal((await cp.show("fixture","A-10")).sha256,before.sha256);
+  }
+});
 test("partially written developer steps cannot be silently skipped by historical handoff projection",async(t)=>{
   const {cp,taskStore}=await fixture(t);
   await controllerReady(taskStore,cp);
