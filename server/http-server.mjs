@@ -4,7 +4,8 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { URL } from "node:url";
 import { TaskboardError } from "./core/errors.mjs";
-import { TaskStore, deliveryTakeoverAuthority, verifiedRemoteTakeoverCandidate } from "./task-store.mjs";
+import { TaskStore, deliveryTakeoverAuthority, verifiedRemoteTakeoverCandidate,
+  staleTakeoverWindow, verifiedMergedRemoteCandidate, verifiedRegisteredCleanWorktree } from "./task-store.mjs";
 import { deliveryEvidence } from "./candidate-evaluator.mjs";
 import { ErpPassGate } from "./erp-pass-gate.mjs";
 import { AuthManager } from "./auth.mjs";
@@ -1518,7 +1519,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
             });
           }
           const history = await taskStore.taskHistory(params.projectId, params.taskId, { all: true });
-          const conflict = history.find((event) => event.actor_type === "developer_ai"
+          const conflict = history.find((event) => ["developer_ai", "controller_ai"].includes(event.actor_type)
             && ((event.event_type === "code_change"
               && (event.actor_id === actorId || event.session_id === body.sessionId))
               || (event.event_type === "takeover" && event.metadata?.deliveryTakeover === true
@@ -1704,12 +1705,117 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         requireOperation(body);
         requireExpectedRevision(body);
         const { context, task, snapshot } = await contextAndTask(taskStore, params.projectId, params.taskId);
-        if (!context.workflow.isExecutionStatus(task.status) && task.status !== "待交付") {
-          throw new TaskboardError("只有执行中或待交付任务可以异常接管", {
+        if (!context.workflow.isExecutionStatus(task.status) && task.status !== "待交付" && task.status !== "已完成") {
+          throw new TaskboardError("只有执行中、待交付或已完成的安全清理任务可以异常接管", {
             code: "TAKEOVER_STAGE_INVALID", status: 409, details: { status: task.status }
           });
         }
         const state = await taskStore.takeoverState(params.projectId, params.taskId);
+        const history = await taskStore.taskHistory(params.projectId, params.taskId, { all: true });
+        const standing = !state.takeoverAllowed && staleTakeoverWindow(task, history);
+        const staleAuthorized = Boolean(standing?.eligible);
+        if (staleAuthorized) {
+          requireTrustedApiIdentity(identity);
+          const requiredActor = ["待交付", "交付中", "已完成"].includes(task.status) ? "controller_ai"
+            : ["独测中", "复测中"].includes(task.status) ? "test_ai" : "developer_ai";
+          const previous = [...history].reverse().find(event =>
+            ["claim", "takeover", "test_result", "delivery_complete"].includes(event.event_type));
+          if (body.actorType !== requiredActor || !body.actorId || !body.sessionId ||
+              body.actorId === previous?.actor_id || body.sessionId === previous?.session_id ||
+              body.actorId === task.assignee || body.sessionId === task.sessionId) {
+            throw new TaskboardError("逾期接管必须由当前责任角色的新actor及Session执行", {
+              code: "STALE_TAKEOVER_IDENTITY_INVALID", status: 409
+            });
+          }
+          if (!String(body.previousWorktree || "").trim() || !String(body.nextWorktree || "").trim() ||
+              !String(body.liveInspection || "").trim()) {
+            throw new TaskboardError("逾期接管必须提供原/新worktree及Job现场核验", {
+              code: "STALE_TAKEOVER_INSPECTION_REQUIRED", status: 409
+            });
+          }
+          const nextIsolated = await verifiedRegisteredCleanWorktree(context.rootRealPath, body.nextWorktree);
+          if (!nextIsolated || path.resolve(nextIsolated).toLowerCase() === path.resolve(context.rootRealPath).toLowerCase()) {
+            throw new TaskboardError("新接管工作区必须是同仓已登记的干净独立worktree", {
+              code: "STALE_TAKEOVER_WORKTREE_INVALID", status: 409
+            });
+          }
+          const resources = await taskStore.testResourceState(params.projectId, params.taskId);
+          if (resources.activeCount > 0) throw new TaskboardError("仍有已登记活跃资源，不能凭24小时期限抢占", {
+            code: "STALE_TAKEOVER_ACTIVE_RESOURCE", status: 409
+          });
+        }
+        if (task.status === "已完成") {
+          if (!staleAuthorized) throw new TaskboardError("已完成任务未证实逾期，不能接管清理", {
+            code: "STALE_TAKEOVER_NOT_ELIGIBLE", status: 409, details: standing
+          });
+          const lastDelivery = [...history].reverse().find(event =>
+            event.event_type === "delivery_complete" && event.new_status === "已完成");
+          const candidateSha = lastDelivery?.metadata?.candidateCommitSha;
+          const git = await verifiedMergedRemoteCandidate(context.rootRealPath, candidateSha);
+          if (!git) throw new TaskboardError("无法确认远端main已包含正式候选，保全清理资源", {
+            code: "STALE_CLEANUP_REMOTE_UNVERIFIED", status: 409
+          });
+          if (!await verifiedRegisteredCleanWorktree(context.rootRealPath, body.previousWorktree)) {
+            throw new TaskboardError("原工作区不干净、丢失或不是同仓登记的worktree，拒绝清理接管", {
+              code: "STALE_CLEANUP_WORKTREE_UNSAFE", status: 409
+            });
+          }
+          // Ownership only: this endpoint never deletes a branch/worktree.
+          const result = await taskStore.updateTask(params.projectId, params.taskId,
+            { updatedAt: new Date().toISOString() }, {
+              expectedRevision: body.expectedRevision, operationId: body.operationId,
+              eventType: "cleanup_takeover", ...actorOptions(identity, body),
+              note: String(body.note || "已完成任务逾期清理接管"),
+              metadata: {
+                standingUserAuthorization: true, generation: 1 +
+                  history.filter(event => event.event_type === "cleanup_takeover").length,
+                originalActorId: lastDelivery.actor_id, originalSessionId: lastDelivery.session_id,
+                previousWorktree: body.previousWorktree, newWorktree: body.nextWorktree,
+                liveInspection: body.liveInspection, ...git,
+                cleanupOnly: true, deletionAuthorized: false
+              }
+            });
+          return send(res, 200, { ...result, cleanupOnly: true, deletionAuthorized: false });
+        }
+        if (task.status === "待交付" && staleAuthorized) {
+          const evidence = deliveryEvidence(history, context.workflow);
+          const pass = evidence.latestResult?.metadata || {};
+          let reportVerified = false;
+          if (evidence.valid && String(pass.reportPath || "").trim()) {
+            try {
+              const reportPath = path.resolve(context.rootRealPath, pass.reportPath);
+              if (reportPath.startsWith(path.resolve(context.rootRealPath) + path.sep)) {
+                const qaReport = await fs.readFile(reportPath, "utf8");
+                reportVerified = reportHasIndependentPassVerdict(qaReport) &&
+                  qaReport.toLowerCase().includes(String(pass.commitSha || "").toLowerCase());
+              }
+            } catch { /* No QA report: retest instead of assuming PASS. */ }
+          }
+          const preservedPass = evidence.valid && reportVerified &&
+            await verifiedRemoteTakeoverCandidate(context.rootRealPath, pass);
+          const generation = history.filter(event => event.event_type === "takeover").length + 1;
+          const result = await taskStore.updateTask(params.projectId, params.taskId,
+            preservedPass ? { updatedAt: new Date().toISOString() } :
+              { status: "待独测", plannedRole: "独立测试AI" }, {
+              expectedRevision: body.expectedRevision, operationId: body.operationId,
+              eventType: "takeover", ...actorOptions(identity, body),
+              note: String(body.note || "24小时常设授权交付接管"),
+              metadata: {
+                deliveryTakeover: true, generation, standingUserAuthorization: true,
+                requiresIndependentRetest: !preservedPass,
+                originalDeveloperActorId: evidence.developerActorId || null,
+                originalDeveloperSessionId: evidence.developerSessionId || null,
+                newControllerActorId: body.actorId, newControllerSessionId: body.sessionId,
+                previousWorktree: body.previousWorktree, newWorktree: body.nextWorktree,
+                liveInspection: body.liveInspection,
+                independentPassEventId: preservedPass ? evidence.eventId : null,
+                candidateSha: preservedPass ? pass.commitSha : null,
+                candidateBranch: preservedPass ? pass.headBranch : null
+              }
+            });
+          return send(res, 200, { ...result, generation, requiresIndependentRetest: !preservedPass,
+            nextRole: preservedPass ? "controller_ai" : "test_ai" });
+        }
         if (task.status === "待交付") {
           requireTrustedApiIdentity(identity);
           const authz = state.authorization?.metadata || {};
@@ -1724,9 +1830,9 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
               code: "TAKEOVER_AUTHORIZATION_STALE", status: 409
             });
           }
-          if ((body.actorType || "developer_ai") !== "developer_ai"
+          if ((body.actorType || "controller_ai") !== "controller_ai"
             || !body.actorId || !body.assignee || !body.sessionId || !body.sessionWindowName) {
-            throw new TaskboardError("待交付接管必须指定全新的开发AI、负责人及Session", {
+            throw new TaskboardError("待交付接管必须指定全新的总控AI、负责人及Session", {
               code: "TAKEOVER_IDENTITY_REQUIRED", status: 400
             });
           }
@@ -1787,7 +1893,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
               expectedRevision: body.expectedRevision,
               operationId: body.operationId,
               eventType: "takeover",
-              ...actorOptions(identity, { ...body, actorType: "developer_ai" }),
+              ...actorOptions(identity, { ...body, actorType: "controller_ai" }),
               note: String(body.note || "用户授权待交付异常接管"),
               metadata: {
                 deliveryTakeover: true, generation, requiresIndependentRetest: !preservedPass,
@@ -1811,15 +1917,15 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           return send(res, 200, { ...result, takeoverConsumed: true,
             requiresIndependentRetest: !preservedPass, generation });
         }
-        if (!state.takeoverAllowed || !state.authorization) {
+        if (!staleAuthorized && (!state.takeoverAllowed || !state.authorization)) {
           throw new TaskboardError("用户尚未明确允许异常接管", { code: "TAKEOVER_NOT_ALLOWED", status: 409 });
         }
-        const authz = state.authorization.metadata || {};
-        if (
+        const authz = state.authorization?.metadata || {};
+        if (!staleAuthorized && (
           (authz.authorizedFromAssignee || "") !== (task.assignee || "") ||
           (authz.authorizedFromSessionId || "") !== (task.sessionId || "") ||
           authz.authorizedRegistryRevision !== snapshot.registryRevision
-        ) {
+        )) {
           throw new TaskboardError("异常接管授权已因任务负责人/Session/revision变化而失效", {
             code: "TAKEOVER_AUTHORIZATION_STALE", status: 409,
             details: { authorizedRegistryRevision: authz.authorizedRegistryRevision, currentRegistryRevision: snapshot.registryRevision }
@@ -1841,10 +1947,17 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           ...actorOptions(identity, body),
           metadata: {
             ...(body.metadata || {}),
-            authorizationOperationId: state.authorization.operation_id || null,
+            authorizationOperationId: state.authorization?.operation_id || null,
+            standingUserAuthorization: staleAuthorized,
+            generation: history.filter(event => event.event_type === "takeover").length + 1,
             previousAssignee: task.assignee || "",
             previousSessionId: task.sessionId || "",
-            previousSessionWindowName: task.sessionWindowName || ""
+            previousSessionWindowName: task.sessionWindowName || "",
+            ...(staleAuthorized ? {
+              previousActorId: [...history].reverse().find(event => ["claim", "takeover"].includes(event.event_type))?.actor_id || null,
+              previousWorktree: body.previousWorktree, newWorktree: body.nextWorktree,
+              liveInspection: body.liveInspection
+            } : {})
           }
         });
         return send(res, 200, { ...result, takeoverConsumed: true });

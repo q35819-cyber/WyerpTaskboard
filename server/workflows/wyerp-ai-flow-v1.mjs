@@ -150,7 +150,7 @@ export const wyerpAiFlowV1 = {
         }
       }
       if (task.status === "待交付" && targetStatus === "待独测"
-        && (eventType !== "takeover" || actorType !== "developer_ai"
+        && (eventType !== "takeover" || !["developer_ai", "controller_ai"].includes(actorType)
           || meta.deliveryTakeover !== true || meta.requiresIndependentRetest !== true)) {
         throw new TaskboardError("交付接管缺少可信独测证据时，只能由正式takeover退回独测", {
           code: "DELIVERY_RETEST_TAKEOVER_REQUIRED", status: 409

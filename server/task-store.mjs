@@ -122,6 +122,38 @@ function currentProgressText(task, events = []) {
 }
 const execFileAsync = promisify(execFile);
 const GIT_SHA = /^[a-f0-9]{40}$/i;
+const STALE_TAKEOVER_MS = 24 * 60 * 60 * 1000;
+// Only real workflow milestones advance the 24-hour clock; inspection,
+// preclaim, retry messages, priority edits and heartbeats never do.
+export function staleTakeoverWindow(task, events = [], now = Date.now()) {
+  const status = task?.status;
+  const completed = status === "已完成";
+  const pendingDelivery = status === "待交付";
+  if (!completed && !pendingDelivery &&
+      !["开发中", "修复中", "独测中", "复测中", "交付中"].includes(status)) {
+    return { eligible: false, reason: "stage_invalid" };
+  }
+  const progressTypes = completed ? new Set(["delivery_complete", "user_accept"])
+    : pendingDelivery ? new Set(["test_result", "takeover", "handoff"])
+      : new Set(["claim", "takeover", "handoff", "test_result", "stop_acknowledged", "resume"]);
+  const latest = [...events].reverse().find(event => progressTypes.has(event.event_type) &&
+    (!completed || event.new_status === "已完成") &&
+    (!pendingDelivery || event.event_type !== "test_result" || event.metadata?.testResult === "pass"));
+  const when = Date.parse(latest?.timestamp || "");
+  if (!Number.isFinite(when) || when > now) return { eligible: false, reason: "progress_time_unverified" };
+  const latestStop = [...events].reverse().find(e => ["stop_request", "stop_acknowledged", "resume"].includes(e.event_type));
+  const latestUserRevoke = [...events].reverse().find(e => e.event_type === "takeover_revoked");
+  if (latestStop?.event_type === "stop_request" || (latestUserRevoke && Date.parse(latestUserRevoke.timestamp) >= when)) {
+    return { eligible: false, reason: "user_stop_or_revoke" };
+  }
+  if (completed && events.some(e => e.event_type === "cleanup_takeover")) {
+    return { eligible: false, reason: "cleanup_already_claimed" };
+  }
+  const elapsedMs = now - when;
+  return { eligible: elapsedMs > STALE_TAKEOVER_MS,
+    reason: elapsedMs > STALE_TAKEOVER_MS ? null : "under_24h",
+    lastProgressAt: latest.timestamp, elapsedMs, lastProgressEventId: latest.event_id || null };
+}
 const EXECUTING_DEVELOPER = new Set(["开发中", "修复中", "交付中"]);
 const RESERVED_WRITES = new Set(["开发中", "修复中", "交付中", "待独测", "独测中",
   "测试失败待修复", "待复测", "复测中", "待交付", "待用户验收", "阻断"]);
@@ -253,6 +285,40 @@ export async function verifiedRemoteTakeoverCandidate(root, metadata = {}) {
   } catch {
     return false;
   }
+}
+
+// Cleanup is safe only if the frozen candidate is an ancestor of the actual
+// remote default branch; a still-open feature branch alone is insufficient.
+export async function verifiedRegisteredCleanWorktree(root, suppliedPath) {
+  const value = String(suppliedPath || "").trim();
+  if (!path.isAbsolute(value)) return null;
+  try {
+    const actual = await fs.realpath(value);
+    const rootCommon = await runGit(root, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    const otherCommon = await runGit(actual, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    if (rootCommon.code !== 0 || otherCommon.code !== 0 ||
+      path.resolve(String(rootCommon.stdout).trim()).toLowerCase() !==
+        path.resolve(String(otherCommon.stdout).trim()).toLowerCase()) return null;
+    const listed = await runGit(root, ["worktree", "list", "--porcelain"]);
+    if (listed.code !== 0 || !listed.stdout.split(/\r?\n/).some(line =>
+      line.startsWith("worktree ") && path.resolve(line.slice(9)).toLowerCase() === actual.toLowerCase())) return null;
+    const status = await runGit(actual, ["status", "--porcelain", "--untracked-files=all"]);
+    return status.code === 0 && !String(status.stdout || "").trim() ? actual : null;
+  } catch { return null; }
+}
+
+export async function verifiedMergedRemoteCandidate(root, sha) {
+  if (!GIT_SHA.test(String(sha || ""))) return null;
+  try {
+    const symref = await runGit(root, ["ls-remote", "--symref", "origin", "HEAD"]);
+    const branch = String(symref.stdout || "").match(/^ref:\s+refs\/heads\/([A-Za-z0-9._/-]+)\s+HEAD$/m)?.[1];
+    if (symref.code !== 0 || !branch) return null;
+    const remote = await runGit(root, ["ls-remote", "origin", "refs/heads/" + branch]);
+    const remoteSha = String(remote.stdout || "").trim().split(/\s+/)[0];
+    if (remote.code !== 0 || !GIT_SHA.test(remoteSha) ||
+        !(await gitIsAncestor(root, sha, remoteSha))) return null;
+    return { candidateSha: sha.toLowerCase(), remoteMainSha: remoteSha.toLowerCase(), branch };
+  } catch { return null; }
 }
 
 // A delivery takeover only transfers execution authority; it does not create
