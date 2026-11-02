@@ -539,6 +539,142 @@ test("claim rejects tasks already occupied by another execution and still allows
   assert.equal((await freeClaim.json()).after.status, "开发中");
 });
 
+test("developer claim enforces actual file overlap and actor/session exclusion", async (t) => {
+  const row = (id, writes) => [id, "F-" + id, "bugfix", "P0", "待开发", "开发AI",
+    "—", "—", "—", "—", "fixture", "plan.md", "trace/" + id,
+    "read/" + id + ".md", writes, "cp/" + id + ".md"];
+  async function verifyPair(firstWrite, secondWrite, secondActor, secondSession, expectedCode) {
+    const { base, secret, fixture } = await startFixture(t);
+    const headers = { Authorization: "Bearer " + secret, "Content-Type": "application/json" };
+    await fs.writeFile(fixture.registryPath,
+      registryText([row("A-10", firstWrite), row("C-10", secondWrite)]), "utf8");
+    async function claim(id, actorId, sessionId) {
+      await recordPreclaim(base, secret, id, { actorId, sessionId });
+      const task = await (await fetch(base + "/api/projects/fixture/tasks/" + id, { headers })).json();
+      const response = await fetch(base + "/api/projects/fixture/tasks/" + id + "/claim", {
+        method: "POST", headers, body: JSON.stringify({
+          operationId: "claim.exclusive." + id + "." + actorId + "." + sessionId,
+          expectedRevision: task.registryRevision, actorType: "developer_ai",
+          actorId, sessionId, assignee: actorId, sessionWindowName: sessionId
+        })
+      });
+      return { status: response.status, result: await response.json() };
+    }
+    assert.equal((await claim("A-10", "dev-A", "session-A")).status, 200);
+    const second = await claim("C-10", secondActor, secondSession);
+    assert.equal(second.status, expectedCode ? 409 : 200);
+    if (expectedCode) assert.equal(second.result.error.code, expectedCode);
+  }
+  await verifyPair("src/same.js", "src/same.js", "dev-B", "session-B", "CLAIM_WRITE_CONFLICT");
+  await verifyPair("src/components", "src/components/child.js", "dev-B", "session-B", "CLAIM_WRITE_CONFLICT");
+  await verifyPair("src/one.js", "src/two.js", "dev-A", "session-B", "CLAIM_DEVELOPER_BUSY");
+  await verifyPair("src/one.js", "src/two.js", "dev-B", "session-A", "CLAIM_DEVELOPER_BUSY");
+  await verifyPair("src/one.js", "src/two.js", "dev-B", "session-B", null);
+});
+
+test("two concurrent claims for overlapping files produce at most one owner", async (t) => {
+  const { base, secret, fixture } = await startFixture(t);
+  const headers = { Authorization: "Bearer " + secret, "Content-Type": "application/json" };
+  const row = (id) => [id, "F-" + id, "bugfix", "P0", "待开发", "开发AI",
+    "—", "—", "—", "—", "fixture", "plan.md", "trace/" + id,
+    "read/" + id + ".md", "src/shared.js", "cp/" + id + ".md"];
+  await fs.writeFile(fixture.registryPath, registryText([row("A-10"), row("C-10")]), "utf8");
+  await recordPreclaim(base, secret, "A-10", { actorId: "dev-A", sessionId: "session-A" });
+  await recordPreclaim(base, secret, "C-10", { actorId: "dev-B", sessionId: "session-B" });
+  const revision = (await (await fetch(base + "/api/projects/fixture/tasks/A-10", { headers })).json()).registryRevision;
+  const calls = [["A-10", "dev-A", "session-A"], ["C-10", "dev-B", "session-B"]];
+  const outcomes = await Promise.all(calls.map(async ([id, actorId, sessionId]) => {
+    const response = await fetch(base + "/api/projects/fixture/tasks/" + id + "/claim", {
+      method: "POST", headers, body: JSON.stringify({
+        operationId: "claim.concurrent." + id, expectedRevision: revision,
+        actorType: "developer_ai", actorId, sessionId, assignee: actorId,
+        sessionWindowName: sessionId
+      })
+    });
+    return response.status;
+  }));
+  assert.equal(outcomes.filter((value) => value === 200).length, 1);
+  assert.ok(outcomes.some((value) => value === 409 || value === 423));
+});
+
+test("overlapping registered project roots cannot claim the same physical file", async (t) => {
+  const fixture = await makeFixture();
+  const nested = path.join(fixture.projectRoot, "nested");
+  await fs.mkdir(nested, { recursive: true });
+  const row = (id, writes) => [id, "F-" + id, "bugfix", "P0", "待开发", "开发AI",
+    "—", "—", "—", "—", "fixture", "plan.md", "trace/" + id,
+    "read/" + id + ".md", writes, "cp/" + id + ".md"];
+  await fs.writeFile(fixture.registryPath, registryText([row("A-10", "nested/src/shared.js")]), "utf8");
+  await fs.writeFile(path.join(nested, "tasks.md"), registryText([row("C-10", "src/shared.js")]), "utf8");
+  const configPath = path.join(fixture.boardRoot, "config", "projects.json");
+  const config = JSON.parse(await fs.readFile(configPath, "utf8"));
+  config.projects.push({ ...config.projects[0], id: "nested", root: nested });
+  await fs.writeFile(configPath, JSON.stringify(config), "utf8");
+  const app = await createTaskboardServer({ rootDir: fixture.boardRoot, host: "127.0.0.1", port: 0 });
+  await new Promise((resolve) => app.server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    await new Promise((resolve) => app.server.close(resolve));
+    await fs.rm(fixture.boardRoot, { recursive: true, force: true });
+  });
+  const base = "http://127.0.0.1:" + app.server.address().port;
+  const secret = JSON.parse(await fs.readFile(path.join(fixture.boardRoot, "config", "admin-secret.json"), "utf8")).adminSecret;
+  const headers = { Authorization: "Bearer " + secret, "Content-Type": "application/json" };
+  async function claim(project, id, actorId) {
+    const pathPrefix = "/api/projects/" + project + "/tasks/" + id;
+    const preclaim = await fetch(base + pathPrefix + "/preclaim-report", {
+      method: "POST", headers, body: JSON.stringify({
+        operationId: "preclaim.cross." + id, actorType: "developer_ai",
+        actorId, sessionId: "sess-" + actorId, note: "formal fixture scope preclaim"
+      })
+    });
+    assert.equal(preclaim.status, 200);
+    const task = await (await fetch(base + pathPrefix, { headers })).json();
+    const result = await fetch(base + pathPrefix + "/claim", {
+      method: "POST", headers, body: JSON.stringify({
+        operationId: "claim.cross." + id, expectedRevision: task.registryRevision,
+        actorType: "developer_ai", actorId, assignee: actorId,
+        sessionId: "sess-" + actorId, sessionWindowName: "window-" + actorId
+      })
+    });
+    return { code: result.status, body: await result.json() };
+  }
+  assert.equal((await claim("fixture", "A-10", "dev-A")).code, 200);
+  const conflicting = await claim("nested", "C-10", "dev-B");
+  assert.equal(conflicting.code, 409);
+  assert.equal(conflicting.body.error.code, "CLAIM_WRITE_CONFLICT");
+});
+
+test("handoff releases execution identity but reserves file scope until delivery", async (t) => {
+  const { base, secret, fixture } = await startFixture(t);
+  const headers = { Authorization: "Bearer " + secret, "Content-Type": "application/json" };
+  const row = (id, writes) => [id, "F-" + id, "bugfix", "P0", "待开发", "开发AI",
+    "—", "—", "—", "—", "fixture", "plan.md", "trace/" + id,
+    "read/" + id + ".md", writes, "cp/" + id + ".md"];
+  await fs.writeFile(fixture.registryPath, registryText([
+    row("A-10", "src/module"), row("C-10", "src/module/file.js"), row("D-10", "src/unrelated.js")
+  ]), "utf8");
+  async function request(id, actorId, sessionId, endpoint, operationId) {
+    if (endpoint === "claim") await recordPreclaim(base, secret, id, { actorId, sessionId });
+    const task = await (await fetch(base + "/api/projects/fixture/tasks/" + id, { headers })).json();
+    const response = await fetch(base + "/api/projects/fixture/tasks/" + id + "/" + endpoint, {
+      method: "POST", headers, body: JSON.stringify({
+        operationId, expectedRevision: task.registryRevision, actorType: "developer_ai",
+        actorId, sessionId, assignee: actorId, sessionWindowName: sessionId
+      })
+    });
+    return { status: response.status, body: await response.json() };
+  }
+  assert.equal((await request("A-10", "dev-A", "session-A", "claim", "claim.scope.handoff.001")).status, 200);
+  const handedOff = await request("A-10", "dev-A", "session-A", "complete-execution", "handoff.scope.001");
+  assert.equal(handedOff.status, 200);
+  assert.equal(handedOff.body.after.status, "待独测");
+  assert.equal(handedOff.body.after.sessionId, "");
+  const conflict = await request("C-10", "dev-B", "session-B", "claim", "claim.scope.block.002");
+  assert.equal(conflict.status, 409);
+  assert.equal(conflict.body.error.code, "CLAIM_WRITE_CONFLICT");
+  assert.equal((await request("D-10", "dev-A", "session-A", "claim", "claim.scope.free.003")).status, 200);
+});
+
 test("direct HTTP claim requires a current preclaim report and rejects stale reports", async (t) => {
   const { base, secret } = await startFixture(t);
   const headers = { Authorization: "Bearer " + secret, "Content-Type": "application/json" };
