@@ -166,8 +166,19 @@ async function loadScanStatus(){
 function developerCandidateFor(task){
   return (state.scanStatus?.developerCandidates||[]).find(item=>item.projectId===state.projectId&&item.taskId===task.id)||null;
 }
+function isReadyTask(task){
+  if(task.status==="待执行")return true;
+  if(!["待开发","待准备"].includes(task.status))return false;
+  return developerCandidateFor(task)?.eligible===true;
+}
 function boardTasksForColumn(column){
-  return tasksForColumn(state.filtered,column.statuses);
+  if(column.id==="awaiting_work"){
+    const order=new Map((state.scanStatus?.developerCandidates||[]).filter(item=>item.projectId===state.projectId).map((item,index)=>[item.taskId,index]));
+    return state.filtered.filter(task=>isReadyTask(task)||["待独测","待复测"].includes(task.status)).sort((a,b)=>
+      (order.get(a.id)??99999)-(order.get(b.id)??99999)||String(a.id).localeCompare(String(b.id)));
+  }
+  const tasks=tasksForColumn(state.filtered,column.statuses);
+  return column.id==="todo"?tasks.filter(task=>!isReadyTask(task)):tasks;
 }
 function renderScanStatus(){
   const data=state.scanStatus;
@@ -326,6 +337,7 @@ function renderSummary(){
   const tasks=state.snapshot?.tasks||[];
   const defs=[
     ["总任务",tasks.length],
+    ["待执行",tasks.filter(isReadyTask).length],
     ["最高优先级",tasks.filter(t=>t.priority==="P0"&&!["已完成","已取消"].includes(t.status)).length],
     ["执行中",tasks.filter(t=>["开发中","修复中","独测中","复测中","交付中"].includes(t.status)).length],
     ["待测试",tasks.filter(t=>["待独测","待复测"].includes(t.status)).length],
@@ -364,11 +376,14 @@ function taskCard(task){
   const badges=document.createElement("div");badges.className="badges";
   badges.append(badge(trackLabel(task.track)),badge(priorityLabel(task.priority),task.priority?.toLowerCase()),badge(statusLabel(task.status)));
   if(["待开发","待准备"].includes(task.status)&&task.plannedRole==="开发AI"){const candidate=developerCandidateFor(task);badges.append(badge(candidate?.eligible===true?"待认领":"待处理",candidate?.eligible===true?"claimable":"waiting"));}
+  else if(task.status==="待执行"&&task.plannedRole==="开发AI"){badges.append(badge("待执行","claimable"));}
   const plan=mainPlan(task);const planRow=document.createElement("div");planRow.className="card-plan";
   if(plan)planRow.append(planButton(task.id,plan,true));else planRow.textContent="主计划：未绑定";
   const responsibility=document.createElement("div");responsibility.className="task-responsibility";responsibility.textContent="本任务负责："+(task.presentation?.responsibility||task.boundary||"未填写");
   const progress=document.createElement("div");progress.className="task-progress";progress.textContent="当前进展："+(task.presentation?.currentProgress||statusLabel(task.status));
   card.append(id,h4,badges,planRow,responsibility,progress);
+  const candidate=developerCandidateFor(task);
+  if(candidate?.blockers?.length){const why=document.createElement("div");why.className="task-user-assistance";why.textContent="暂不能执行："+candidate.blockers.join("；");card.append(why);}
   const assistanceText=task.presentation?.userAssistance||"";
   if(assistanceText&&!assistanceText.startsWith("当前无需你操作")){
     const assistance=document.createElement("div");assistance.className="task-user-assistance";assistance.textContent="需要你配合："+assistanceText;card.append(assistance);

@@ -21,6 +21,65 @@ async function fixtureWithLedger(t) {
   return fixture;
 }
 
+test("ready queue derives real dependencies, unlock impact, user urgency and legacy status without mutating tasks",async(t)=>{
+  const f=await fixtureWithLedger(t);
+  const row=(id,status,dependency="")=>[
+    id,"F-READY","product","P0",status,status==="已完成"?"":"开发AI","—","—","—","2026-11-03T01:00:00Z",
+    "ready queue test","测试计划.md","tests/source.md",dependency,"write/"+id+".js","cp/"+id+".md"
+  ];
+  const rows=[
+    row("A-READY","待开发"),
+    row("Z-READY","待执行"),
+    row("B-WAIT","待开发","Z-READY 完成"),
+    row("C-WAIT","待开发","NOT-REGISTERED 完成"),
+    row("D-CYCLE","待开发","E-CYCLE 完成"),
+    row("E-CYCLE","待开发","D-CYCLE 完成")
+  ];
+  await fs.writeFile(f.registryPath,registryText(rows),"utf8");
+  const taskStore=await new TaskStore(f.boardRoot).init();
+  const requirementStore=await new RequirementStore(f.boardRoot).init();
+  const evaluator=new CandidateEvaluator(f.boardRoot,{taskStore,requirementStore});
+  const scanStore=await new ScanStore(f.boardRoot).init();
+  const first=await evaluator.evaluateProject("fixture");
+  const byId=new Map(first.candidates.map(x=>[x.task_id,x]));
+  assert.equal(byId.get("A-READY").eligible,true);
+  assert.equal(byId.get("Z-READY").eligible,true);
+  assert.equal(byId.get("Z-READY").eligible_role,"developer_ai");
+  assert.equal(byId.get("Z-READY").unlocks_count,1);
+  assert.equal(byId.get("B-WAIT").eligible,false);
+  assert.match(byId.get("B-WAIT").blockers.join(" " ),/Z-READY未完成/);
+  assert.match(byId.get("C-WAIT").blockers.join(" "),/未登记/);
+  assert.equal(byId.get("D-CYCLE").eligible,false);
+  await scanStore.upsertScan({runId:"ready.scan.1",detectedAt:first.detected_at,projectResults:[first]});
+  const queue=await scanStore.list();
+  assert.equal(queue.filter(x=>x.eligible).length,2);
+  assert.equal(queue[0].task_id,"Z-READY","unlocks one blocked dependent ahead of same-priority A");
+
+  await taskStore.appendTaskEvent("fixture","A-READY",{
+    operationId:"ready.user.urgent",eventType:"priority_change",
+    actorType:"user",actorId:"user",sessionId:"user",
+    metadata:{urgent:true}
+  });
+  const second=await evaluator.evaluateProject("fixture");
+  await scanStore.upsertScan({runId:"ready.scan.2",detectedAt:second.detected_at,projectResults:[second]});
+  assert.equal((await scanStore.list())[0].task_id,"A-READY","user explicit urgency wins");
+  await taskStore.appendTaskEvent("fixture","A-READY",{
+    operationId:"ready.user.urgent.cleared",eventType:"priority_change",
+    actorType:"user",actorId:"user",sessionId:"user",
+    metadata:{urgent:false}
+  });
+  const third=await evaluator.evaluateProject("fixture");
+  assert.equal(third.candidates.find(x=>x.task_id==="A-READY").user_urgent,false,"latest explicit user clear takes effect");
+  await scanStore.upsertScan({runId:"ready.scan.3",detectedAt:third.detected_at,projectResults:[third]});
+  assert.equal((await scanStore.list())[0].task_id,"Z-READY","latest user decision removes urgency");
+
+  rows[1]=row("Z-READY","已完成");
+  await fs.writeFile(f.registryPath,registryText(rows),"utf8");
+  const changed=await evaluator.evaluateProject("fixture");
+  assert.equal(changed.candidates.find(x=>x.task_id==="B-WAIT").eligible,true,"dependency completion unblocks existing task");
+  assert.equal(changed.candidates.some(x=>x.task_id==="Z-READY"),false);
+});
+
 test("scanner creates role-aware candidates, dedupes repeated scans and expires after 30 minutes", async (t) => {
   const fixture = await fixtureWithLedger(t);
   let now = Date.parse("2026-09-29T00:00:00Z");

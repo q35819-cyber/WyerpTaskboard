@@ -20,14 +20,15 @@ const deliveryActionTypes = [
 ];
 const deliveryActionSet = new Set(deliveryActionTypes);
 const statuses = [
-  "待确认", "待准备", "待开发", "开发中", "待独测", "独测中",
+  "待确认", "待准备", "待开发", "待执行", "开发中", "待独测", "独测中",
   "测试失败待修复", "修复中", "待复测", "复测中", "待交付", "交付中",
   "待用户验收", "已完成", "阻断", "HOLD", "已取消"
 ];
 const transitions = new Map([
   ["待确认", new Set(["待准备", "HOLD", "已取消"])],
-  ["待准备", new Set(["开发中", "待开发", "待独测", "待复测", "阻断", "HOLD", "已取消"])],
-  ["待开发", new Set(["开发中", "阻断", "HOLD", "已取消"])],
+  ["待准备", new Set(["开发中", "待开发", "待执行", "待独测", "待复测", "阻断", "HOLD", "已取消"])],
+  ["待开发", new Set(["待执行", "开发中", "阻断", "HOLD", "已取消"])],
+  ["待执行", new Set(["开发中", "待开发", "阻断", "HOLD", "已取消"])],
   ["开发中", new Set(["待独测", "阻断", "HOLD"])],
   ["待独测", new Set(["独测中", "测试失败待修复", "待准备", "待确认", "阻断", "HOLD"])],
   ["独测中", new Set(["待交付", "待用户验收", "已完成", "测试失败待修复", "待准备", "阻断", "HOLD"])],
@@ -38,14 +39,14 @@ const transitions = new Map([
   ["待交付", new Set(["交付中", "待独测", "阻断", "HOLD"])],
   ["交付中", new Set(["已完成", "待用户验收", "待复测", "阻断", "HOLD"])],
   ["待用户验收", new Set(["已完成", "测试失败待修复", "待准备", "待确认", "HOLD"])],
-  ["阻断", new Set(["待确认", "待准备", "待开发", "待独测", "待复测", "HOLD", "已取消"])],
-  ["HOLD", new Set(["待确认", "待准备", "待开发", "测试失败待修复", "待独测", "待复测", "待交付", "已取消"])],
+  ["阻断", new Set(["待确认", "待准备", "待开发", "待执行", "待独测", "待复测", "HOLD", "已取消"])],
+  ["HOLD", new Set(["待确认", "待准备", "待开发", "待执行", "测试失败待修复", "待独测", "待复测", "待交付", "已取消"])],
   ["已完成", new Set()],
   ["已取消", new Set()],
 ]);
 
 const fixedPlannedRoleByStatus = new Map([
-  ["待确认", "用户"], ["待准备", "开发AI"], ["待开发", "开发AI"], ["开发中", "开发AI"],
+  ["待确认", "用户"], ["待准备", "开发AI"], ["待开发", "开发AI"], ["待执行", "开发AI"], ["开发中", "开发AI"],
   ["待独测", "独立测试AI"], ["独测中", "独立测试AI"], ["测试失败待修复", "开发AI"], ["修复中", "开发AI"],
   ["待复测", "独立测试AI"], ["复测中", "独立测试AI"], ["待用户验收", "用户"],
   ["已完成", ""], ["HOLD", ""], ["已取消", ""]
@@ -62,7 +63,7 @@ export const wyerpAiFlowV1 = {
   roles: ["开发AI", "独立测试AI", "用户", "—"],
   boardColumns: [
     { id: "todo", title: "待处理 / 待认领", statuses: ["待确认", "待准备", "待开发"], derived: "developer_candidate_state" },
-    { id: "awaiting_work", title: "待执行", statuses: ["待独测", "待复测"] },
+    { id: "awaiting_work", title: "待执行", statuses: ["待执行", "待独测", "待复测"], derived: "eligible_developer_candidates" },
     { id: "executing", title: "执行中", statuses: ["开发中", "修复中", "交付中", "独测中", "复测中"] },
     { id: "awaiting_delivery_user", title: "待交付 / 待用户", statuses: ["待交付", "待用户验收"] },
     { id: "blocked", title: "失败 / 阻断 / 暂停", statuses: ["测试失败待修复", "阻断", "HOLD"] },
@@ -112,7 +113,7 @@ export const wyerpAiFlowV1 = {
     if (statusChanging) {
       this.assertTransition(task.status, targetStatus);
       const claimRole = (
-        (["待准备", "待开发"].includes(task.status) && targetStatus === "开发中")
+        (["待准备", "待开发", "待执行"].includes(task.status) && targetStatus === "开发中")
         || (task.status === "待独测" && targetStatus === "独测中")
         || (task.status === "待复测" && targetStatus === "复测中")
         || (task.status === "待交付" && targetStatus === "交付中")

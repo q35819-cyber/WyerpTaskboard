@@ -294,6 +294,8 @@ export class ScanStore {
           existing.write_targets = candidate.write_targets;
           existing.checkpoint_report_refs = candidate.checkpoint_report_refs;
           existing.eligible_role = candidate.eligible_role;
+          existing.user_urgent = candidate.user_urgent;
+          existing.unlocks_count = candidate.unlocks_count;
           existing.eligible = candidate.eligible;
           existing.blockers = candidate.blockers;
           existing.reason = candidate.reason;
@@ -332,13 +334,13 @@ export class ScanStore {
   async list({ includeInactive = false } = {}) {
     const state = await this.readState();
     const items = includeInactive ? Object.values(state.candidates) : this.activeFromState(state);
-    const statusRank = { "待交付": 0, "测试失败待修复": 1, "阻断": 1, "待开发": 2, "待复测": 3, "待独测": 4, "待准备": 5 };
+    const statusRank = { "待交付": 0, "测试失败待修复": 1, "阻断": 1, "待执行": 2, "待开发": 3, "待复测": 4, "待独测": 5, "待准备": 6 };
     const priorityRank = { P0: 0, P1: 1, P2: 2 };
     const queueRank = (item) => {
       if (item.eligible_role === "developer_ai") {
         if (item.status === "待交付") return 0;
         if (["测试失败待修复", "阻断"].includes(item.status)) return 1;
-        if (item.status === "待开发") return 2;
+        if (["待执行", "待开发"].includes(item.status)) return 2;
         return 3;
       }
       if (item.eligible_role === "test_ai") {
@@ -350,6 +352,8 @@ export class ScanStore {
     return items.sort((a, b) =>
       Number(Boolean(b.eligible)) - Number(Boolean(a.eligible)) ||
       queueRank(a) - queueRank(b) ||
+      Number(Boolean(b.user_urgent)) - Number(Boolean(a.user_urgent)) ||
+      Number(b.unlocks_count || 0) - Number(a.unlocks_count || 0) ||
       (priorityRank[a.priority] ?? 9) - (priorityRank[b.priority] ?? 9) ||
       (statusRank[a.status] ?? 9) - (statusRank[b.status] ?? 9) ||
       String(a.first_detected_at).localeCompare(String(b.first_detected_at)) ||

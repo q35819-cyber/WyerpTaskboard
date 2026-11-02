@@ -75,9 +75,9 @@ function activeTestTask(task) {
   return ["独测中", "复测中"].includes(task.status) && Boolean(task.assignee || task.sessionId);
 }
 const TEST_WATCH_STATUSES = new Set(["待独测", "独测中", "待复测", "复测中"]);
-const DEVELOPER_WATCH_STATUSES = new Set(["待准备", "待开发", "开发中", "测试失败待修复", "修复中", "待交付", "交付中"]);
+const DEVELOPER_WATCH_STATUSES = new Set(["待准备", "待开发", "待执行", "开发中", "测试失败待修复", "修复中", "待交付", "交付中"]);
 function roleFor(task) {
-  if (["待开发", "测试失败待修复", "待交付"].includes(task.status)) return "developer_ai";
+  if (["待开发", "待执行", "测试失败待修复", "待交付"].includes(task.status)) return "developer_ai";
   if (["待独测", "待复测"].includes(task.status)) return "test_ai";
   if (task.status === "待准备" && task.plannedRole === "开发AI") return "developer_ai";
   return null;
@@ -86,7 +86,7 @@ function reasonFor(task, eligibleRole, blockers) {
   if (blockers.length) return blockers.join("；");
   if (eligibleRole === "developer_ai") {
     if (task.status === "测试失败待修复") return "已有缺陷等待开发修复";
-    if (task.status === "待交付") return "已登记真实交付动作，等待开发AI执行交付";
+    if (task.status === "待交付") return "已登记真实交付动作，等待总控AI交付";
     if (task.status === "待准备") return "准备条件需要开发AI补齐";
     return "开发任务已就绪";
   }
@@ -131,6 +131,15 @@ export class CandidateEvaluator {
     const candidates = [];
     const activeDeveloperTasks = parsed.tasks.filter(activeDeveloperTask);
     const tasksById = new Map(parsed.tasks.map((task) => [task.id, task]));
+    const unlockCounts = new Map(parsed.tasks.map((task) => [task.id, 0]));
+    for (const dependent of parsed.tasks) {
+      if (["已完成", "已取消"].includes(dependent.status)) continue;
+      for (const dep of new Set(splitRefs(dependent.readDependencies).map(hardTaskDependencyId).filter(Boolean))) {
+        if (dep !== dependent.id && tasksById.has(dep) && tasksById.get(dep).status !== "已完成") {
+          unlockCounts.set(dep, (unlockCounts.get(dep) || 0) + 1);
+        }
+      }
+    }
 
     for (const task of parsed.tasks) {
       let delivery = null;
@@ -155,6 +164,14 @@ export class CandidateEvaluator {
       if (unresolved) blockers.push("存在尚未获得AI回复的最新用户留言");
       const readDependencies = splitRefs(task.readDependencies);
       const writeTargets = splitRefs(task.writeTargets);
+      const userEvents = eligibleRole === "developer_ai"
+        ? await this.taskStore.taskHistory(projectId, task.id, { limit: 100 }).catch(() => [])
+        : [];
+      const urgencyEvent = [...userEvents].reverse().find((entry) => entry.actor_type === "user"
+        && (typeof entry.metadata?.urgent === "boolean" || entry.event_type === "priority_change"));
+      const userUrgent = typeof urgencyEvent?.metadata?.urgent === "boolean"
+        ? urgencyEvent.metadata.urgent
+        : urgencyEvent?.event_type === "priority_change" && urgencyEvent.new_priority === "P0";
       if (eligibleRole === "developer_ai") {
         if (!writeTargets.length) blockers.push("未声明计划写文件，不能进入待认领");
         const candidateWrites = normalizedFileRefs(task.writeTargets);
@@ -191,6 +208,8 @@ export class CandidateEvaluator {
         checkpoint_report_refs: splitRefs(task.targets),
         delivery_evidence_event_id: delivery?.eventId || null,
         eligible_role: eligibleRole,
+        user_urgent: userUrgent,
+        unlocks_count: unlockCounts.get(task.id) || 0,
         eligible_actor_id: delivery?.developerActorId || null,
         eligible_session_id: delivery?.developerSessionId || null,
         eligible: Boolean(blockers.length === 0),
