@@ -69,21 +69,23 @@ export function deliveryEvidence(history, workflow) {
 }
 
 function activeDeveloperTask(task) {
-  return ["开发中", "修复中", "交付中"].includes(task.status) && Boolean(task.assignee || task.sessionId);
+  return ["开发中", "修复中"].includes(task.status) && Boolean(task.assignee || task.sessionId);
 }
 function activeTestTask(task) {
   return ["独测中", "复测中"].includes(task.status) && Boolean(task.assignee || task.sessionId);
 }
 const TEST_WATCH_STATUSES = new Set(["待独测", "独测中", "待复测", "复测中"]);
-const DEVELOPER_WATCH_STATUSES = new Set(["待准备", "待开发", "待执行", "开发中", "测试失败待修复", "修复中", "待交付", "交付中"]);
+const DEVELOPER_WATCH_STATUSES = new Set(["待准备", "待开发", "待执行", "开发中", "测试失败待修复", "修复中"]);
 function roleFor(task) {
-  if (["待开发", "待执行", "测试失败待修复", "待交付"].includes(task.status)) return "developer_ai";
+  if (["待开发", "待执行", "测试失败待修复"].includes(task.status)) return "developer_ai";
+  if (task.status === "待交付") return "controller_ai";
   if (["待独测", "待复测"].includes(task.status)) return "test_ai";
   if (task.status === "待准备" && task.plannedRole === "开发AI") return "developer_ai";
   return null;
 }
 function reasonFor(task, eligibleRole, blockers) {
   if (blockers.length) return blockers.join("；");
+  if (eligibleRole === "controller_ai") return "已登记真实交付动作，等待总控AI交付";
   if (eligibleRole === "developer_ai") {
     if (task.status === "测试失败待修复") return "已有缺陷等待开发修复";
     if (task.status === "待交付") return "已登记真实交付动作，等待总控AI交付";
@@ -210,8 +212,8 @@ export class CandidateEvaluator {
         eligible_role: eligibleRole,
         user_urgent: userUrgent,
         unlocks_count: unlockCounts.get(task.id) || 0,
-        eligible_actor_id: delivery?.developerActorId || null,
-        eligible_session_id: delivery?.developerSessionId || null,
+        eligible_actor_id: eligibleRole === "controller_ai" ? null : (delivery?.developerActorId || null),
+        eligible_session_id: eligibleRole === "controller_ai" ? null : (delivery?.developerSessionId || null),
         eligible: Boolean(blockers.length === 0),
         blockers,
         reason: reasonFor(task, eligibleRole, blockers),

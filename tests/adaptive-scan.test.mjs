@@ -12,6 +12,41 @@ async function root(t) {
   return value;
 }
 
+test("ready queue UI fails closed on STOP, stale/missing candidates and keeps blocked tasks visible", async () => {
+  const source=await fs.readFile(path.resolve(import.meta.dirname,"..","web","app.js"),"utf8");
+  const readySource=source.match(/function isReadyTask\(task\)\{[\s\S]*?\n\}/)?.[0];
+  const boardSource=source.match(/function boardTasksForColumn\(column\)\{[\s\S]*?\n\}/)?.[0];
+  assert.ok(readySource && boardSource,"test real UI functions, not a copied implementation");
+  const task={id:"READY-1",status:"待执行",plannedRole:"开发AI",assignee:"",sessionId:""};
+  const state={projectId:"fixture",filtered:[task],scanStatus:{scan:{last_scan_at:new Date().toISOString()}}};
+  let candidate={projectId:"fixture",taskId:"READY-1",status:"待执行",eligible:true,blockers:[]};
+  const lookup=()=>candidate;
+  const ready=new Function("state","developerCandidateFor",readySource+"\nreturn isReadyTask;")(state,lookup);
+  const board=new Function("state","developerCandidateFor","isReadyTask","tasksForColumn",boardSource+"\nreturn boardTasksForColumn;")
+    (state,lookup,ready,(tasks,statuses)=>tasks.filter(item=>statuses.includes(item.status)));
+  const todo={id:"todo",statuses:["待确认","待准备","待开发"]};
+  const awaiting={id:"awaiting_work",statuses:["待执行","待独测","待复测"]};
+  assert.equal(ready(task),true);
+  assert.deepEqual(board(awaiting).map(item=>item.id),["READY-1"]);
+  candidate={...candidate,eligible:false,blockers:["STOP"]};
+  assert.equal(ready(task),false);
+  assert.deepEqual(board(awaiting),[]);
+  assert.deepEqual(board(todo).map(item=>item.id),["READY-1"]);
+  candidate={...candidate,eligible:true,blockers:["前置未完成"]};
+  assert.equal(ready(task),false);
+  candidate=null;
+  assert.equal(ready(task),false);
+  candidate={projectId:"fixture",taskId:"READY-1",status:"待执行",eligible:true,blockers:[]};
+  state.scanStatus.scan.last_scan_at=new Date(Date.now()-31*60*1000).toISOString();
+  assert.equal(ready(task),false,"expired scan must not count as ready");
+  state.scanStatus.scan.last_scan_at=new Date().toISOString();
+  candidate.status="待开发";
+  assert.equal(ready(task),false,"candidate from a previous status cannot authorize this task");
+  candidate.status="待执行";
+  assert.equal(ready({...task,assignee:"other-ai"}),false);
+  assert.equal(ready({...task,plannedRole:"总控AI"}),false);
+});
+
 test("scheduled dispatcher scans busy or idle mode only when due", async (t) => {
   const dir = await root(t);
   let now = Date.parse("2026-09-29T00:00:00Z");

@@ -192,10 +192,10 @@ test("delivery candidates require a recorded non-empty real delivery action", as
   assert.ok(empty.blockers.some((item) => item.includes("缺少有效的最新独立测试PASS")));
   const real = evaluated.candidates.find((item) => item.task_id === "D-REAL");
   assert.ok(real);
-  assert.equal(real.eligible_role, "developer_ai");
+  assert.equal(real.eligible_role, "controller_ai");
   assert.equal(real.eligible, true);
-  assert.equal(real.eligible_actor_id, "developer");
-  assert.equal(real.eligible_session_id, "developer-session");
+  assert.equal(real.eligible_actor_id, null);
+  assert.equal(real.eligible_session_id, null);
   assert.match(real.reason, /真实交付动作/);
 });
 
@@ -429,7 +429,7 @@ test("developer claimable eligibility is recalculated when write conflicts appea
   assert.deepEqual(restored.blockers, []);
 });
 
-test("developer candidate queue order prefers delivery then failures then waiting development before priority", async (t) => {
+test("developer queue prefers failed tasks and excludes controller-owned delivery", async (t) => {
   const fixture = await fixtureWithLedger(t);
   await fs.writeFile(fixture.registryPath, registryText([
     ["DEV-DELIVERY","F-D","product","P2","待交付","开发AI","—","—","—","2026-09-29T00:00:00Z","交付","计划D.md","trace/D.md","read/d.md","src/delivery.js","cp/DEV-DELIVERY.md"],
@@ -462,8 +462,14 @@ test("developer candidate queue order prefers delivery then failures then waitin
   const scanStore = await new ScanStore(fixture.boardRoot).init();
   const scanner = await new TaskScanner(fixture.boardRoot, { taskStore, requirementStore, scanStore }).init();
   await scanner.scanOnce();
-  const developer = (await scanStore.list()).filter((x) => x.eligible_role === "developer_ai");
-  assert.deepEqual(developer.map((x) => x.task_id), ["DEV-DELIVERY","DEV-FAIL","DEV-WAIT"]);
+  const candidates = await scanStore.list();
+  const developer = candidates.filter((x) => x.eligible_role === "developer_ai");
+  assert.deepEqual(developer.map((x) => x.task_id), ["DEV-FAIL","DEV-WAIT"]);
+  const controller = candidates.find((x) => x.task_id === "DEV-DELIVERY");
+  assert.equal(controller?.eligible_role, "controller_ai");
+  assert.equal(controller?.eligible, true);
+  assert.equal(controller?.eligible_actor_id, null);
+  assert.equal(controller?.eligible_session_id, null);
   const testCandidates = (await scanStore.list()).filter((x) => x.eligible_role === "test_ai");
   assert.deepEqual(testCandidates.map((x) => x.status), ["待复测"]);
 });
