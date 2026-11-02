@@ -34,6 +34,35 @@ test("universal template has a complete portable Ponytail-based three-role entry
     assert.equal(snapshot, source, `${file} must match the sole authoritative workflow`);
     assert.match(source, /ponytail\/SKILL\.md|Ponytail|三轮/);
   }
+  const handoffRules = [
+    "AGENTS.md", "流程文档/00_统一入口.md",
+    "流程文档/开发/00_角色入口.md",
+    "流程文档/独测/00_角色入口.md",
+    "流程文档/总控/00_角色入口.md",
+    "templates/webcodex-v1/AGENTS.md",
+    "templates/webcodex-v1/DEV_PROMPT.md",
+    "templates/webcodex-v1/TEST_PROMPT.md"
+  ];
+  for (const file of handoffRules) {
+    const body = await fs.readFile(path.resolve(file), "utf8");
+    assert.ok(body.includes("总控"), `${file} must reference controller delivery`);
+    assert.ok(!body.includes("独测PASS后原开发执行Git合并"),
+      `${file} cannot assign delivery to the developer`);
+    assert.ok(!body.includes("PASS 原开发 Git 合并"),
+      `${file} cannot assign post-QA merge to the developer`);
+  }
+  for (const file of [
+    "开发/D09_NEXT_续接开发队列.md",
+    "总控/C04_MERGE_MAIN_受控合并main.md",
+    "总控/C05_POSTMERGE_主目录升级与回归.md",
+    "总控/C06_CLEANUP_安全清理交付工作区.md",
+    "总控/C07_COMPLETE_交付关单.md",
+    "总控/C08_NEXT_核验交接与续办.md"
+  ]) {
+    const relative = `流程文档/${file}`;
+    assert.equal(await fs.readFile(path.resolve(relative), "utf8"),
+      await fs.readFile(path.join(templateRoot, relative), "utf8"));
+  }
   for (const oldRole of ["总控AI.md", "开发AI.md", "独立测试AI.md"]) {
     await assert.rejects(fs.access(path.resolve(oldRole)), (error) => error.code === "ENOENT");
     await assert.rejects(fs.access(path.join(templateRoot, oldRole)), (error) => error.code === "ENOENT");
