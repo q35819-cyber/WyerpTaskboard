@@ -4,7 +4,7 @@
                      {
                          "id":  "wyerp-taskboard",
                          "name":  "WyerpTaskboard",
-                         "root":  "C:\\WyerpTaskboard",
+                         "root":  ".",
                          "adapter":  "markdown-task-registry-v1",
                          "registryFormatVersion":  1,
                          "workflowProfile":  "wyerp-ai-flow-v1",

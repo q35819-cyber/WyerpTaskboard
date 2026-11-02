@@ -5,7 +5,7 @@ A local Windows-based multiproject taskboard for AI development and independent 
 ## Quick start / 快速启动
 
 1. Install Node.js 24 or later and clone this repository on Windows.
-2. Copy config/projects.example.json to config/projects.json and change the root path to the actual clone directory.
+2. Copy config/projects.example.json to config/projects.json. The example uses `"root": "."` for the current project; run the service from the repository root so that this relative path resolves correctly. Registered additional projects use their actual local roots at runtime.
 3. The browser taskboard is local-only and opens directly without a password. The service retains a private API bearer token in config/admin-secret.json for trusted AI/CLI integrations; it is not used for browser login.
 4. Use node cli/service.mjs start to start the local service, then open http://127.0.0.1:47831.
 5. If startup requires a task registry, create an empty registry using the included blank template; store all real tasks locally, not in Git.
@@ -16,7 +16,7 @@ A local Windows-based multiproject taskboard for AI development and independent 
 - **本机访问规则（P0 任务已完成，具体运行状态以当前服务为准）**：本机免登录浏览器写请求要求严格匹配的 Origin，并在浏览器提供时校验 Sec-Fetch-Site=same-origin；不要求浏览器 CSRF token。服务必须仅监听 127.0.0.1，不允许暴露到局域网或公网。部署版本实际行为以通过独立测试的代码为准，修复任务为 WTB-P0-USER-ACCEPTANCE-SYSTEM-GATES-20261031-T1。
 - config/admin-secret.json 仅保留给受信任的 AI/CLI Bearer API 调用，不是网页登录密码；不要删除、分享或提交到 GitHub，否则会破坏已有 AI/CLI 自动化接入。
 - 如需查看本机 API Bearer 令牌，可在自己的终端运行 node cli/service.mjs secret；不要截图、分享或提交到 GitHub。
-- **部署路径**：如果克隆位置不是 D:\WyerpTaskboard，先在 PowerShell 设置 $env:WYERP_TASKBOARD_ROOT = (Get-Location).Path。
+- **部署路径**：在仓库根目录运行时，PowerShell 使用 $env:WYERP_TASKBOARD_ROOT = (Get-Location).Path；流程与模板路径全部以当前项目根目录为准，禁止复制固定盘符目录。
 
 ## 中文说明
 
@@ -31,15 +31,15 @@ A local Windows-based multiproject taskboard for AI development and independent 
 - Example paths in configuration must be replaced for each installation; the code includes Windows-specific service tooling.
 
 ## AI workflow governance
-- Start here: root `AGENTS.md` and `WORKFLOW.md`. The complete authoritative role rules are directly in root `总控AI.md`, `开发AI.md`, and `独立测试AI.md`; do not maintain a second conflicting role manual.
+- Start here: `AGENTS.md` → `流程文档/00_统一入口.md` → `流程文档/总控/00_角色入口.md`, `流程文档/开发/00_角色入口.md`, or `流程文档/独测/00_角色入口.md` depending on the current role. Root `WORKFLOW.md` is only a compatibility pointer.
 
 
 - Private/local product requirement records (if present under `docs/产品需求/`) are **not included in the published repository**. The published workflow entry points, role rules and Git delivery standard below are self-contained; do not block a fresh clone on private documents.
-- Root `WORKFLOW.md` is the entry for the minimal three-role flow. `docs/流程标准/开发独测Git合并闭环.md` retains detailed Git/delivery compatibility notes; do not duplicate or override the current root rules.
-- The three root role files are the sole authoritative responsibility manuals. `docs/governance/` retains short legacy-path compatibility pointers. `templates/webcodex-v1/` provides supporting prompts, not another role authority. There are only three standing AI roles.
+- `流程文档/00_统一入口.md` is the sole authority for the three-role flow; root `WORKFLOW.md` is a pointer. `docs/流程标准/开发独测Git合并闭环.md` retains historical compatibility notes only.
+- `docs/governance/` contains historical-path pointers to the new role directories. `templates/webcodex-v1/` is a portable snapshot, not another role authority. There are only three standing AI roles.
 - Historical audit reports (including older NO-GO findings) are not live task statuses. Use the taskboard's current task events, accepted candidate and independent QA outcome; writing a rule is not proof that a production gate is implemented.
-- Legacy scripts may resolve `docs/governance/` pointers, but must read the full corresponding root role file before executing.
-- `templates/webcodex-v1/` is the portable **manual** onboarding baseline: three root role files, `AGENTS.md`, `WORKFLOW.md`, `.agents/skills/ponytail/SKILL.md`, project configuration, Node/Python runnable examples and prompt templates. Ponytail full is mandatory for code changes. Auto onboarding is **not yet implemented**.
+- Legacy scripts may resolve `docs/governance/` pointers, but must follow `流程文档/` rather than removed root role files.
+- `templates/webcodex-v1/` is the portable **manual** onboarding baseline: `AGENTS.md`, `WORKFLOW.md`, `流程文档/`, `.agents/skills/ponytail/SKILL.md`, project configuration, Node/Python runnable examples and short role pointers. Ponytail full is mandatory. Auto onboarding is **not yet implemented**.
 
 ## Quality checks
 
