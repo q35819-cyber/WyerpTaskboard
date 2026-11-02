@@ -153,7 +153,7 @@ export class TaskStepCheckpoint {
         && (authority.actor_id !== actorId || authority.session_id !== sessionId)) {
         throw invalid("CHECKPOINT_SESSION_MISMATCH", "独测必须由最新正式认领会话执行", 403);
       }
-      if (actorType === "test_ai" && stepId === "Q01_ADMISSION" && !eventId
+      if (actorType === "test_ai" && stepId === "Q01_ADMISSION" && result === "PASS" && !eventId
         && !state.records.some((entry) => entry.stepId === "D08_HANDOFF"
           && entry.result === "PASS" && entry.attempt === state.attempts)) {
         throw invalid("CHECKPOINT_PREDECESSOR_REQUIRED", "开发尚未正式交独测");
@@ -216,7 +216,12 @@ export class TaskStepCheckpoint {
         const devAuthority = history.slice(0, handoffIndex).reverse().find((entry) =>
           entry.actor_type === "developer_ai" && ["claim", "takeover"].includes(entry.event_type));
         const qaClaimIndex = history.indexOf(event);
-        if (state.cursors.developer_ai !== "D08_HANDOFF" || !handoff || handoffIndex < 0
+        const recordedSteps = state.records.filter((entry) => entry.actorType === "developer_ai"
+          && entry.attempt === state.attempts);
+        const legacyEmpty = state.cursors.developer_ai === "D01_CLAIM" && recordedSteps.length === 0
+          && state.records.every((entry) => entry.actorType === "test_ai"
+            && entry.stepId === "Q01_ADMISSION" && entry.result === "FAIL");
+        if ((!legacyEmpty && state.cursors.developer_ai !== "D08_HANDOFF") || !handoff || handoffIndex < 0
           || !devAuthority || !event || !["claim", "takeover"].includes(event.event_type)
           || event.actor_type !== "test_ai" || event.actor_id !== actorId
           || event.session_id !== sessionId || qaClaimIndex <= handoffIndex
@@ -233,16 +238,20 @@ export class TaskStepCheckpoint {
         }
         const recovered = {
           operationId: "recovered." + handoff.event_id,
-          stepId: "D08_HANDOFF", actorType: "developer_ai",
+          stepId: legacyEmpty ? "HISTORICAL_HANDOFF" : "D08_HANDOFF", actorType: "developer_ai",
           actorId: handoff.actor_id, sessionId: handoff.session_id,
-          result: "PASS", substepId: null, attempt: state.attempts,
+          result: legacyEmpty ? "RECOVERED" : "PASS", substepId: null, attempt: state.attempts,
           at: new Date().toISOString(),
           evidence: "基于已发生的正式handoff事件恢复缺失断点",
           eventId: handoff.event_id, verdict: null,
-          note: "历史事件投影恢复，原开发会话不获得新的执行权"
+          note: legacyEmpty
+            ? "历史空断点仅登记可信交接，不补造D01-D08的开发步骤PASS"
+            : "历史事件投影恢复，原开发会话不获得新的执行权"
         };
         state.records.push(recovered);
-        state.cursors.developer_ai = ROLE_STEPS.developer_ai[ROLE_STEPS.developer_ai.indexOf("D08_HANDOFF") + 1];
+        if (!legacyEmpty) {
+          state.cursors.developer_ai = ROLE_STEPS.developer_ai[ROLE_STEPS.developer_ai.indexOf("D08_HANDOFF") + 1];
+        }
       }
       const item = {
         operationId, stepId, actorType, actorId, sessionId, result, substepId,

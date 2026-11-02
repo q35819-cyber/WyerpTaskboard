@@ -205,6 +205,93 @@ test("missing D08 recovers only from a genuine latest handoff bound to the owner
     (e)=>e.code==="CHECKPOINT_QA_PASS_REQUIRED");
   assert.equal((await cp.show("fixture","A-10")).state.records.filter(r=>r.operationId===recovered.operationId).length,1);
 });
+test("real handoff and latest QA claim restore Q01 when the entire developer checkpoint is absent", async(t) => {
+  const {cp,taskStore}=await fixture(t);
+  const devClaim=await claimDev(taskStore);
+  const handoff=await taskStore.updateTask("fixture","A-10",{
+    status:"待独测",assignee:"",sessionId:"",sessionWindowName:""
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.zero-checkpoint.handoff",eventType:"handoff",
+    actorType:"developer_ai",actorId:"developer",sessionId:"developer_ai.session",
+    metadata:{atomicLifecycle:true,completedFromStatus:"开发中",handoffTarget:"待独测"}
+  });
+  const qaClaim=await taskStore.updateTask("fixture","A-10",{
+    status:"独测中",assignee:"qa",sessionId:"test_ai.session",sessionWindowName:"qa"
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.zero-checkpoint.qa",eventType:"claim",
+    actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session"
+  });
+  const empty=await cp.show("fixture","A-10");
+  assert.equal(empty.state.records.length,0);
+  assert.equal(empty.state.cursors.developer_ai,"D01_CLAIM");
+  await assert.rejects(step(cp,"test_ai","Q01_ADMISSION",{eventId:devClaim.eventId}),
+    e=>e.code==="CHECKPOINT_FORMAL_EVENT_REQUIRED");
+  assert.equal((await cp.show("fixture","A-10")).sha256,empty.sha256);
+  const recovered=await step(cp,"test_ai","Q01_ADMISSION",{eventId:qaClaim.eventId});
+  assert.equal(recovered.state.cursors.test_ai,"Q02_TEST");
+  assert.equal(recovered.state.cursors.developer_ai,"D01_CLAIM");
+  assert.equal(recovered.state.records.filter(r=>/^D0[1-8]_/.test(r.stepId)).length,0);
+  const marker=recovered.state.records.find(r=>r.operationId==="recovered."+handoff.eventId);
+  assert.equal(marker.stepId,"HISTORICAL_HANDOFF");
+  assert.equal(marker.result,"RECOVERED");
+  assert.equal(marker.eventId,handoff.eventId);
+  assert.match(marker.note,/不补造D01-D08/);
+  assert.equal(recovered.state.records.length,2);
+});
+test("existing Q01 FAIL history may be retained during zero-developer-checkpoint recovery", async(t)=>{
+  const {cp,taskStore}=await fixture(t);
+  await claimDev(taskStore);
+  const handoff=await taskStore.updateTask("fixture","A-10",{
+    status:"待独测",assignee:"",sessionId:"",sessionWindowName:""
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.zero-fail.handoff",eventType:"handoff",
+    actorType:"developer_ai",actorId:"developer",sessionId:"developer_ai.session",
+    metadata:{atomicLifecycle:true,completedFromStatus:"开发中",handoffTarget:"待独测"}
+  });
+  const qaClaim=await taskStore.updateTask("fixture","A-10",{
+    status:"独测中",assignee:"qa",sessionId:"test_ai.session",sessionWindowName:"qa"
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.zero-fail.qa",eventType:"claim",
+    actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session"
+  });
+  const initial=await step(cp,"test_ai","Q01_ADMISSION",{result:"FAIL"});
+  assert.equal(initial.state.cursors.test_ai,"Q01_ADMISSION");
+  const recovered=await step(cp,"test_ai","Q01_ADMISSION",{eventId:qaClaim.eventId});
+  assert.equal(recovered.state.records[0].result,"FAIL");
+  assert.equal(recovered.state.records[1].stepId,"HISTORICAL_HANDOFF");
+  assert.equal(recovered.state.records[1].eventId,handoff.eventId);
+  assert.equal(recovered.state.records[2].result,"PASS");
+});
+test("partially written developer steps cannot be silently skipped by historical handoff projection",async(t)=>{
+  const {cp,taskStore}=await fixture(t);
+  await controllerReady(taskStore,cp);
+  const claimed=await claimDev(taskStore);
+  await step(cp,"developer_ai","D01_CLAIM",{eventId:claimed.eventId});
+  const handoff=await taskStore.updateTask("fixture","A-10",{
+    status:"待独测",assignee:"",sessionId:"",sessionWindowName:""
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.partial.handoff",eventType:"handoff",
+    actorType:"developer_ai",actorId:"developer",sessionId:"developer_ai.session",
+    metadata:{atomicLifecycle:true,completedFromStatus:"开发中",handoffTarget:"待独测"}
+  });
+  assert.ok(handoff.eventId);
+  const claim=await taskStore.updateTask("fixture","A-10",{
+    status:"独测中",assignee:"qa",sessionId:"test_ai.session",sessionWindowName:"qa"
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.partial.qa",eventType:"claim",
+    actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session"
+  });
+  const before=await cp.show("fixture","A-10");
+  await assert.rejects(step(cp,"test_ai","Q01_ADMISSION",{eventId:claim.eventId}),
+    e=>e.code==="CHECKPOINT_PREDECESSOR_REQUIRED");
+  assert.equal((await cp.show("fixture","A-10")).sha256,before.sha256);
+});
 test("an old Session cannot forge the latest handoff after a developer takeover",async(t)=>{
   const {cp,taskStore}=await fixture(t);
   await controllerReady(taskStore,cp);
