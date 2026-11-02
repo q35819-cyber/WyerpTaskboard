@@ -7,6 +7,7 @@ import { TaskboardError } from "./core/errors.mjs";
 import { atomicWriteText } from "./core/atomic-files.mjs";
 import { resolveProjectPath } from "./core/path-safety.mjs";
 import { withProjectLock } from "./core/project-lock.mjs";
+import isPathInside from "./core/vendor/is-path-inside.mjs";
 import { ProjectRegistry } from "./project-registry.mjs";
 import { EventStore } from "./event-store.mjs";
 import { TransactionStore } from "./transaction-store.mjs";
@@ -121,6 +122,58 @@ function currentProgressText(task, events = []) {
 }
 const execFileAsync = promisify(execFile);
 const GIT_SHA = /^[a-f0-9]{40}$/i;
+const EXECUTING_DEVELOPER = new Set(["开发中", "修复中", "交付中"]);
+const RESERVED_WRITES = new Set(["开发中", "修复中", "交付中", "待独测", "独测中",
+  "测试失败待修复", "待复测", "复测中", "待交付", "待用户验收", "阻断"]);
+function writePaths(root, value) {
+  return String(value || "").split(/[；;]/).map((item) => item.replace(/`/g, "").trim())
+    .filter(Boolean).map((item) => {
+      const resolved = path.resolve(root, item.replace(/\\/g, "/"));
+      return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+    });
+}
+async function assertDeveloperClaimExclusive(store, projectId, context, parsed, task, actorId, sessionId) {
+  const requested = writePaths(context.rootRealPath, task.writeTargets);
+  if (!requested.length) throw new TaskboardError("开发认领必须声明计划写文件", {
+    code: "CLAIM_WRITE_TARGETS_REQUIRED", status: 409
+  });
+  for (const registered of store.projects.list()) {
+    const otherProject = registered.id;
+    const otherContext = otherProject === projectId ? context : await store.projects.context(otherProject);
+    const otherTasks = otherProject === projectId ? parsed.tasks :
+      (await otherContext.adapter.readMarkdownTaskRegistry(otherContext.registryPath, otherContext.project)).tasks;
+    for (const other of otherTasks) {
+      if (otherProject === projectId && other.id === task.id) continue;
+      const active = EXECUTING_DEVELOPER.has(other.status) && Boolean(other.assignee || other.sessionId);
+      const otherPaths = writePaths(otherContext.rootRealPath, other.writeTargets);
+      const overlapping = otherPaths.some((item) => requested.some((candidate) =>
+        candidate === item || isPathInside(candidate, item) || isPathInside(item, candidate)));
+      if (!active && !overlapping) continue;
+      let history;
+      if (active && sessionId && sessionId === other.sessionId) {
+        throw new TaskboardError("同一开发Session不能同时认领多个任务", {
+          code: "CLAIM_DEVELOPER_BUSY", status: 409, details: { taskId: other.id, projectId: otherProject }
+        });
+      }
+      if (active || (overlapping && other.status === "HOLD")) {
+        history = await store.events.listTaskEvents(otherProject, other.id, { all: true });
+      }
+      if (active && actorId && [...history].reverse().find((event) =>
+        event.actor_type === "developer_ai" && ["claim", "takeover"].includes(event.event_type))?.actor_id === actorId) {
+        throw new TaskboardError("同一开发actor不能同时认领多个任务", {
+          code: "CLAIM_DEVELOPER_BUSY", status: 409, details: { taskId: other.id, projectId: otherProject }
+        });
+      }
+      if (overlapping && (RESERVED_WRITES.has(other.status) ||
+        (other.status === "HOLD" && history?.some((event) =>
+          event.event_type === "claim" && event.actor_type === "developer_ai")))) {
+        throw new TaskboardError("计划写文件与未交付任务冲突", {
+          code: "CLAIM_WRITE_CONFLICT", status: 409, details: { taskId: other.id, projectId: otherProject }
+        });
+      }
+    }
+  }
+}
 async function runGit(root, args) {
   try {
     const result = await execFileAsync("git", ["-C", root, ...args], {
@@ -521,7 +574,7 @@ export class TaskStore {
       code: "EXPECTED_REVISION_REQUIRED", status: 428,
     });
 
-    return withProjectLock(this.rootDir, projectId, operationId, async () => {
+    const update = () => withProjectLock(this.rootDir, projectId, operationId, async () => {
       let existing = await this.transactions.read(operationId);
       if (existing?.state === "committed") return { ...existing.result, idempotentReplay: true };
       if (existing && existing.projectId !== projectId) throw new TaskboardError("operation_id已用于其它项目", {
@@ -553,6 +606,9 @@ export class TaskStore {
 
       const currentTask = parsed.tasks.find((item) => item.id === taskId);
       if (!currentTask) throw new TaskboardError("未知任务ID: " + taskId, { code: "TASK_NOT_FOUND", status: 404 });
+      if (eventType === "claim" && actorType === "developer_ai") {
+        await assertDeveloperClaimExclusive(this, projectId, context, parsed, currentTask, actorId, sessionId);
+      }
       let effectiveMetadata = metadata;
       let effectivePatchInput = patch;
       if (["user_accept", "user_reject"].includes(eventType)) {
@@ -646,6 +702,10 @@ export class TaskStore {
       await this.rearmScanner("task_write", { projectId, taskId, eventType });
       return result;
     });
+    // Reuse the existing short-lived project lock to serialize developer claims across projects.
+    return eventType === "claim" && actorType === "developer_ai"
+      ? withProjectLock(this.rootDir, "developer-claim", operationId, update)
+      : update();
   }
 
   async createTask(projectId, taskInput, {
