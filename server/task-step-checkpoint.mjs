@@ -18,9 +18,9 @@ const ROLE_STEPS = Object.freeze({
 });
 const EVENT_REQUIRED = {
   C03_DISPATCH: ["controller_dispatch", "task_created"],
-  D01_CLAIM: ["claim"], D08_HANDOFF: ["handoff"],
+  D01_CLAIM: ["claim", "takeover"], D08_HANDOFF: ["handoff"],
   D12_COMPLETE: ["delivery_complete"],
-  Q01_ADMISSION: ["claim"], Q03_RESULT: ["test_result"]
+  Q01_ADMISSION: ["claim", "takeover"], Q03_RESULT: ["test_result"]
 };
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const CLOSED = new Set(["已完成", "已取消"]);
@@ -72,7 +72,9 @@ async function writeFileAtomically(filename, text) {
     await fs.writeFile(tmp, text, { flag: "wx" });
     await fs.rename(tmp, filename);
   } finally {
-    await fs.rm(tmp, { force: true }).catch(() => {});
+    await fs.rm(tmp, { force: true }).catch((error) => {
+      if (error.code !== "ENOENT") throw error;
+    });
   }
 }
 
@@ -138,14 +140,27 @@ export class TaskStepCheckpoint {
       if (state.cursors[actorType] !== stepId) {
         throw invalid("CHECKPOINT_STEP_ORDER", "上一步尚未通过，不得越级执行；请先读取唯一下一步");
       }
+      const history = await this.taskStore.taskHistory(projectId, taskId, { all: true });
+      const authority = [...history].reverse().find((entry) =>
+        entry.actor_type === actorType && ["claim", "takeover"].includes(entry.event_type));
+      const lastTakeover = [...history].reverse().find((entry) =>
+        entry.actor_type === actorType && entry.event_type === "takeover");
+      // A takeover invalidates the former actor/Session even if its old claim is still in history.
+      if (lastTakeover && (authority?.actor_id !== actorId || authority?.session_id !== sessionId)) {
+        throw invalid("CHECKPOINT_SESSION_MISMATCH", "接管后旧actor或Session已失去步骤写入权", 403);
+      }
+      if (actorType === "test_ai" && stepId === "Q01_ADMISSION" && authority
+        && (authority.actor_id !== actorId || authority.session_id !== sessionId)) {
+        throw invalid("CHECKPOINT_SESSION_MISMATCH", "独测必须由最新正式认领会话执行", 403);
+      }
+      if (actorType === "test_ai" && stepId === "Q01_ADMISSION" && !eventId
+        && !state.records.some((entry) => entry.stepId === "D08_HANDOFF"
+          && entry.result === "PASS" && entry.attempt === state.attempts)) {
+        throw invalid("CHECKPOINT_PREDECESSOR_REQUIRED", "开发尚未正式交独测");
+      }
       const [index] = [steps.indexOf(stepId)];
       if (actorType === "developer_ai" && stepId === "D01_CLAIM"
         && state.cursors.controller_ai !== null) throw invalid("CHECKPOINT_PREDECESSOR_REQUIRED", "总控未完成派工");
-      if (actorType === "test_ai" && stepId === "Q01_ADMISSION"
-        && !state.records.some((r) => r.stepId === "D08_HANDOFF" && r.result === "PASS"
-          && r.attempt === state.attempts)) {
-        throw invalid("CHECKPOINT_PREDECESSOR_REQUIRED", "开发尚未正式交独测");
-      }
       if (actorType === "developer_ai" && stepId === "D09_MERGE_MAIN"
         && (!state.records.some((r) => r.stepId === "Q03_RESULT" && r.result === "PASS"
           && r.verdict === "pass" && r.attempt === state.attempts)
@@ -157,16 +172,13 @@ export class TaskStepCheckpoint {
           && r.attempt === state.attempts)) {
         throw invalid("CHECKPOINT_CLEANUP_REQUIRED", "清理未完成不能关闭任务");
       }
-      const history = await this.taskStore.taskHistory(projectId, taskId, { all: true });
-      const lastClaim = [...history].reverse().find((entry) =>
-        entry.event_type === "claim" && entry.actor_type === actorType);
       if (actorType !== "controller_ai" && !["D01_CLAIM","Q01_ADMISSION"].includes(stepId)
-        && (!lastClaim || lastClaim.actor_id !== actorId || lastClaim.session_id !== sessionId)) {
+        && (!authority || authority.actor_id !== actorId || authority.session_id !== sessionId)) {
         throw invalid("CHECKPOINT_SESSION_MISMATCH", "未用当前正式认领身份写断点", 403);
       }
       if (actorType === "controller_ai" && stepId !== "C01_SCAN") {
         const controllerStart = state.records.find((entry) => entry.stepId === "C01_SCAN" && entry.result === "PASS");
-        if (!controllerStart || controllerStart.actorId !== actorId || controllerStart.sessionId !== sessionId) {
+        if (!controllerStart || (!lastTakeover && (controllerStart.actorId !== actorId || controllerStart.sessionId !== sessionId))) {
           throw invalid("CHECKPOINT_SESSION_MISMATCH", "总控换窗口须先进行合法接管", 403);
         }
       }
@@ -180,6 +192,11 @@ export class TaskStepCheckpoint {
       if (result === "PASS" && stepId === "D01_CLAIM" && !["开发中", "修复中", "交付中"].includes(event?.new_status)) {
         throw invalid("CHECKPOINT_FORMAL_EVENT_REQUIRED", "开发正式认领事件阶段错误");
       }
+      if (result === "PASS" && stepId === "Q01_ADMISSION"
+        && (!["独测中", "复测中"].includes(event?.new_status)
+          || (authority && event?.event_id !== authority.event_id))) {
+        throw invalid("CHECKPOINT_FORMAL_EVENT_REQUIRED", "独测准入必须关联最新有效认领事件");
+      }
       if (result === "PASS" && stepId === "D08_HANDOFF" && !["待独测", "待复测"].includes(event?.new_status)) {
         throw invalid("CHECKPOINT_FORMAL_EVENT_REQUIRED", "未真实进入独测队列");
       }
@@ -188,6 +205,44 @@ export class TaskStepCheckpoint {
       }
       if (result === "PASS" && stepId === "D12_COMPLETE" && event?.new_status !== "已完成") {
         throw invalid("CHECKPOINT_DELIVERY_NOT_CLOSED", "任务未在真实看板关闭");
+      }
+      if (result === "PASS" && stepId === "Q01_ADMISSION"
+        && !state.records.some((r) => r.stepId === "D08_HANDOFF" && r.result === "PASS"
+          && r.attempt === state.attempts)) {
+        // The formal handoff may have released the developer before D08 could be saved.
+        // Recover only from an authentic handoff preceding this QA claim, never from a note.
+        const handoff = [...history].reverse().find((entry) => entry.event_type === "handoff");
+        const handoffIndex = history.indexOf(handoff);
+        const devAuthority = history.slice(0, handoffIndex).reverse().find((entry) =>
+          entry.actor_type === "developer_ai" && ["claim", "takeover"].includes(entry.event_type));
+        const qaClaimIndex = history.indexOf(event);
+        if (state.cursors.developer_ai !== "D08_HANDOFF" || !handoff || handoffIndex < 0
+          || !devAuthority || !event || !["claim", "takeover"].includes(event.event_type)
+          || event.actor_type !== "test_ai" || event.actor_id !== actorId
+          || event.session_id !== sessionId || qaClaimIndex <= handoffIndex
+          || !["待独测", "待复测"].includes(handoff.new_status)
+          || handoff.metadata?.atomicLifecycle !== true
+          || handoff.metadata?.handoffTarget !== handoff.new_status
+          || handoff.actor_type !== "developer_ai"
+          || handoff.actor_id !== devAuthority.actor_id
+          || handoff.session_id !== devAuthority.session_id
+          || history.slice(handoffIndex + 1).some((entry) =>
+            entry.event_type === "test_result" || (entry.actor_type === "developer_ai"
+              && ["claim", "takeover"].includes(entry.event_type)))) {
+          throw invalid("CHECKPOINT_PREDECESSOR_REQUIRED", "缺少本轮可信正式开发交接事件，不能进入独测");
+        }
+        const recovered = {
+          operationId: "recovered." + handoff.event_id,
+          stepId: "D08_HANDOFF", actorType: "developer_ai",
+          actorId: handoff.actor_id, sessionId: handoff.session_id,
+          result: "PASS", substepId: null, attempt: state.attempts,
+          at: new Date().toISOString(),
+          evidence: "基于已发生的正式handoff事件恢复缺失断点",
+          eventId: handoff.event_id, verdict: null,
+          note: "历史事件投影恢复，原开发会话不获得新的执行权"
+        };
+        state.records.push(recovered);
+        state.cursors.developer_ai = ROLE_STEPS.developer_ai[ROLE_STEPS.developer_ai.indexOf("D08_HANDOFF") + 1];
       }
       const item = {
         operationId, stepId, actorType, actorId, sessionId, result, substepId,

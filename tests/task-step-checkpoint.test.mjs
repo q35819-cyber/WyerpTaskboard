@@ -141,6 +141,202 @@ test("substep PROGRESS saves a durable checkpoint and rejects forged developer S
   const done=await step(cp,"developer_ai","D02_WORKTREE");
   assert.equal(done.state.cursors.developer_ai,"D03_WRITE_SCOPE");
 });
+test("takeover revokes the old developer Session for PASS and PROGRESS; new owner resumes the same cursor", async(t) => {
+  const {cp,taskStore}=await fixture(t);
+  await controllerReady(taskStore,cp);
+  const claimed=await claimDev(taskStore);
+  await step(cp,"developer_ai","D01_CLAIM",{eventId:claimed.eventId});
+  await step(cp,"developer_ai","D02_WORKTREE");
+  await step(cp,"developer_ai","D03_WRITE_SCOPE");
+  const taken=await taskStore.updateTask("fixture","A-10",{
+    assignee:"replacement",sessionWindowName:"replacement",sessionId:"replacement-session"
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.takeover.dev.0001",eventType:"takeover",
+    actorType:"developer_ai",actorId:"replacement",sessionId:"replacement-session"
+  });
+  assert.ok(taken.eventId);
+  await assert.rejects(step(cp,"developer_ai","D04_IMPLEMENT"),
+    (e)=>e.code==="CHECKPOINT_SESSION_MISMATCH");
+  await assert.rejects(step(cp,"developer_ai","D04_IMPLEMENT",{
+    result:"PROGRESS",substepId:"BAD_STALE_PROGRESS"
+  }),(e)=>e.code==="CHECKPOINT_SESSION_MISMATCH");
+  await assert.rejects(step(cp,"developer_ai","D04_IMPLEMENT",{
+    actorId:"replacement",sessionId:"developer_ai.session"
+  }),(e)=>e.code==="CHECKPOINT_SESSION_MISMATCH");
+  const resumed=await step(cp,"developer_ai","D04_IMPLEMENT",{
+    actorId:"replacement",sessionId:"replacement-session"
+  });
+  assert.equal(resumed.state.lastAction.actorId,"replacement");
+  assert.equal(resumed.state.cursors.developer_ai,"D05_TEST_1");
+});
+test("missing D08 recovers only from a genuine latest handoff bound to the owner before QA claim", async(t) => {
+  const {cp,taskStore}=await fixture(t);
+  await controllerReady(taskStore,cp);
+  const claimed=await claimDev(taskStore);
+  await step(cp,"developer_ai","D01_CLAIM",{eventId:claimed.eventId});
+  for(const id of ROLE_STAGE_STEPS.developer_ai.slice(1,7))await step(cp,"developer_ai",id);
+  const handoff=await taskStore.updateTask("fixture","A-10",{status:"待独测",assignee:"",sessionId:"",sessionWindowName:""},{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.lost-d08.handoff.0001",eventType:"handoff",
+    actorType:"developer_ai",actorId:"developer",sessionId:"developer_ai.session",
+    metadata:{atomicLifecycle:true,completedFromStatus:"开发中",handoffTarget:"待独测"}
+  });
+  const qaClaim=await taskStore.updateTask("fixture","A-10",{
+    status:"独测中",assignee:"qa",sessionId:"test_ai.session",sessionWindowName:"qa"
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.lost-d08.qaclaim.0001",eventType:"claim",
+    actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session"
+  });
+  const before=await cp.show("fixture","A-10");
+  assert.equal(before.state.cursors.developer_ai,"D08_HANDOFF");
+  await assert.rejects(step(cp,"test_ai","Q01_ADMISSION",{eventId:"evt_fake"}),
+    (e)=>e.code==="CHECKPOINT_FORMAL_EVENT_REQUIRED");
+  assert.equal((await cp.show("fixture","A-10")).sha256,before.sha256);
+  const accepted=await step(cp,"test_ai","Q01_ADMISSION",{eventId:qaClaim.eventId});
+  const recovered=accepted.state.records.find(r=>r.operationId==="recovered."+handoff.eventId);
+  assert.equal(recovered.eventId,handoff.eventId);
+  assert.equal(recovered.actorId,"developer");
+  assert.match(recovered.note,/历史事件投影恢复/);
+  assert.equal(accepted.state.cursors.developer_ai,"D09_MERGE_MAIN");
+  assert.equal(accepted.state.cursors.test_ai,"Q02_TEST");
+  await assert.rejects(step(cp,"developer_ai","D09_MERGE_MAIN"),
+    (e)=>e.code==="CHECKPOINT_QA_PASS_REQUIRED");
+  assert.equal((await cp.show("fixture","A-10")).state.records.filter(r=>r.operationId===recovered.operationId).length,1);
+});
+test("an old Session cannot forge the latest handoff after a developer takeover",async(t)=>{
+  const {cp,taskStore}=await fixture(t);
+  await controllerReady(taskStore,cp);
+  const claimed=await claimDev(taskStore);
+  await step(cp,"developer_ai","D01_CLAIM",{eventId:claimed.eventId});
+  for(const id of ROLE_STAGE_STEPS.developer_ai.slice(1,7))await step(cp,"developer_ai",id);
+  await taskStore.updateTask("fixture","A-10",{
+    assignee:"replacement",sessionId:"replacement-session",sessionWindowName:"replacement"
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.stale-handoff.takeover.0001",eventType:"takeover",
+    actorType:"developer_ai",actorId:"replacement",sessionId:"replacement-session"
+  });
+  await taskStore.updateTask("fixture","A-10",{
+    status:"待独测",assignee:"",sessionId:"",sessionWindowName:""
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.stale-handoff.legit.0001",eventType:"handoff",
+    actorType:"developer_ai",actorId:"replacement",sessionId:"replacement-session",
+    metadata:{atomicLifecycle:true,completedFromStatus:"开发中",handoffTarget:"待独测"}
+  });
+  // Inject a historical event with the old identity after the authentic handoff.
+  await taskStore.appendTaskEvent("fixture","A-10",{
+    operationId:"fixture.stale-handoff.fake.0001",eventType:"handoff",
+    actorType:"developer_ai",actorId:"developer",sessionId:"developer_ai.session"
+  });
+  const qaClaim=await taskStore.updateTask("fixture","A-10",{
+    status:"独测中",assignee:"qa",sessionId:"test_ai.session",sessionWindowName:"qa"
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.stale-handoff.qaclaim.0001",eventType:"claim",
+    actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session"
+  });
+  const before=await cp.show("fixture","A-10");
+  await assert.rejects(step(cp,"test_ai","Q01_ADMISSION",{eventId:qaClaim.eventId}),
+    e=>e.code==="CHECKPOINT_PREDECESSOR_REQUIRED");
+  assert.equal((await cp.show("fixture","A-10")).sha256,before.sha256);
+});
+test("controller takeover invalidates its former Session without losing the already recorded scan",async(t)=>{
+  const {cp,taskStore}=await fixture(t);
+  await step(cp,"controller_ai","C01_SCAN");
+  await taskStore.appendTaskEvent("fixture","A-10",{
+    operationId:"fixture.controller.takeover.0001",eventType:"takeover",
+    actorType:"controller_ai",actorId:"controller-new",sessionId:"controller-new-session"
+  });
+  const before=await cp.show("fixture","A-10");
+  await assert.rejects(step(cp,"controller_ai","C02_TRIAGE"),
+    e=>e.code==="CHECKPOINT_SESSION_MISMATCH");
+  assert.equal((await cp.show("fixture","A-10")).sha256,before.sha256);
+  const resumed=await step(cp,"controller_ai","C02_TRIAGE",{
+    actorId:"controller-new",sessionId:"controller-new-session"
+  });
+  assert.equal(resumed.state.cursors.controller_ai,"C03_DISPATCH");
+});
+test("independent QA takeover revokes old QA before Q02, preserving the predecessor event",async(t)=>{
+  const {cp,taskStore}=await fixture(t);
+  await controllerReady(taskStore,cp);
+  const claimed=await claimDev(taskStore);
+  await step(cp,"developer_ai","D01_CLAIM",{eventId:claimed.eventId});
+  for(const id of ROLE_STAGE_STEPS.developer_ai.slice(1,7))await step(cp,"developer_ai",id);
+  const handed=await taskStore.updateTask("fixture","A-10",{
+    status:"待独测",assignee:"",sessionId:"",sessionWindowName:""
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.qa-takeover.handoff.0001",eventType:"handoff",
+    actorType:"developer_ai",actorId:"developer",sessionId:"developer_ai.session",
+    metadata:{atomicLifecycle:true,completedFromStatus:"开发中",handoffTarget:"待独测"}
+  });
+  await step(cp,"developer_ai","D08_HANDOFF",{eventId:handed.eventId});
+  const qaClaim=await taskStore.updateTask("fixture","A-10",{
+    status:"独测中",assignee:"qa",sessionId:"test_ai.session",sessionWindowName:"qa"
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.qa-takeover.claim.0001",eventType:"claim",
+    actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session"
+  });
+  await step(cp,"test_ai","Q01_ADMISSION",{eventId:qaClaim.eventId});
+  await taskStore.updateTask("fixture","A-10",{
+    assignee:"qa-new",sessionId:"qa-new-session",sessionWindowName:"qa-new"
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.qa-takeover.transfer.0001",eventType:"takeover",
+    actorType:"test_ai",actorId:"qa-new",sessionId:"qa-new-session"
+  });
+  const before=await cp.show("fixture","A-10");
+  await assert.rejects(step(cp,"test_ai","Q02_TEST"),
+    e=>e.code==="CHECKPOINT_SESSION_MISMATCH");
+  assert.equal((await cp.show("fixture","A-10")).sha256,before.sha256);
+  const resumed=await step(cp,"test_ai","Q02_TEST",{
+    actorId:"qa-new",sessionId:"qa-new-session"
+  });
+  assert.equal(resumed.state.cursors.test_ai,"Q03_RESULT");
+});
+test("QA can enter Q01 via latest formal takeover when handoff D08 was not recorded",async(t)=>{
+  const {cp,taskStore}=await fixture(t);
+  await controllerReady(taskStore,cp);
+  const dev=await claimDev(taskStore);
+  await step(cp,"developer_ai","D01_CLAIM",{eventId:dev.eventId});
+  for(const id of ROLE_STAGE_STEPS.developer_ai.slice(1,7))await step(cp,"developer_ai",id);
+  const handoff=await taskStore.updateTask("fixture","A-10",{
+    status:"待独测",assignee:"",sessionId:"",sessionWindowName:""
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.q01-takeover.handoff",eventType:"handoff",
+    actorType:"developer_ai",actorId:"developer",sessionId:"developer_ai.session",
+    metadata:{atomicLifecycle:true,completedFromStatus:"开发中",handoffTarget:"待独测"}
+  });
+  assert.ok(handoff.eventId);
+  const oldClaim=await taskStore.updateTask("fixture","A-10",{
+    status:"独测中",assignee:"qa",sessionId:"test_ai.session",sessionWindowName:"qa"
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.q01-takeover.claim",eventType:"claim",
+    actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session"
+  });
+  const takeover=await taskStore.updateTask("fixture","A-10",{
+    assignee:"qa-new",sessionId:"qa-new-session",sessionWindowName:"qa-new"
+  },{
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    operationId:"fixture.q01-takeover.transfer",eventType:"takeover",
+    actorType:"test_ai",actorId:"qa-new",sessionId:"qa-new-session"
+  });
+  const before=await cp.show("fixture","A-10");
+  await assert.rejects(step(cp,"test_ai","Q01_ADMISSION",{eventId:oldClaim.eventId}),
+    e=>e.code==="CHECKPOINT_SESSION_MISMATCH");
+  assert.equal((await cp.show("fixture","A-10")).sha256,before.sha256);
+  const accepted=await step(cp,"test_ai","Q01_ADMISSION",{
+    actorId:"qa-new",sessionId:"qa-new-session",eventId:takeover.eventId
+  });
+  assert.equal(accepted.state.cursors.test_ai,"Q02_TEST");
+  assert.equal(accepted.state.records.filter(e=>e.stepId==="D08_HANDOFF" && e.eventId===handoff.eventId).length,1);
+});
 test("QA FAIL returns to developer without reusing the prior PASS attempt",async(t)=>{
   const {cp,taskStore}=await fixture(t);
   await controllerReady(taskStore,cp);
