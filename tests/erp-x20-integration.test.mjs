@@ -1,9 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { TaskStore } from "../server/task-store.mjs";
+import path from "node:path";
 
-test("real erp-x20 registry is readable through independent project mapping", async () => {
-  const store = await new TaskStore("D:\\WyerpTaskboard").init();
+test("real erp-x20 registry is readable through independent project mapping", {
+  skip: process.env.WYERP_ERP_X20_INTEGRATION !== "1" && "external ERP not registered: set WYERP_ERP_X20_INTEGRATION=1 to test real connection"
+}, async () => {
+  const store = await new TaskStore(process.env.WYERP_ERP_X20_TASKBOARD_ROOT || path.resolve(import.meta.dirname,"..")).init();
   const health = await store.projects.health("erp-x20");
   assert.equal(health.status, "healthy");
   const snap = await store.snapshot("erp-x20");

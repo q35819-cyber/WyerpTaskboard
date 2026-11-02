@@ -71,7 +71,7 @@ test("three managed projects share the same workflow without cross-task state or
  await x.claim("A","test_ai","tester-A","sess-A-retest");
  const pass=await x.outcome("A","tester-A","sess-A-retest","pass");
  assert.equal(pass.after.status,"待交付");
- assert.equal(pass.after.plannedRole,"开发AI");
+ assert.equal(pass.after.plannedRole,"总控AI");
  assert.equal((await x.get("B")).status,"开发中");
  assert.equal((await x.get("C")).status,"待开发");
  const history=async id=>{

@@ -51,6 +51,45 @@ test("query-process returns CommandLineToArgvW argv for current node process", a
   assert.match(path.basename(proc.executablePath).toLowerCase(), /^node\.exe$/);
 });
 
+test("Windows query-process preserves Chinese command-line paths in UTF-8", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "wyerp-中文命令行-"));
+  const script = path.join(dir, "测试服务.js");
+  await fs.writeFile(script, "setInterval(()=>{},1000);\n");
+  const child = spawn(process.execPath, [script], { windowsHide: true, stdio: "ignore" });
+  t.after(async () => { await killChild(child); await fs.rm(dir, { recursive: true, force: true }); });
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  const info = await controllerFor(await freePort()).queryProcess(child.pid);
+  assert.equal(info.exists, true);
+  assert.ok(info.argv.includes(script), JSON.stringify(info.argv));
+  assert.equal(info.argv.some((arg) => arg.includes("�")), false);
+});
+
+
+test("Windows alias/Chinese root resolves to same instance only with matching PID, listener and token", async (t) => {
+  const tmp=await fs.mkdtemp(path.join(os.tmpdir(),"wyerp-中文路径-"));
+  t.after(()=>fs.rm(tmp,{recursive:true,force:true}));
+  const actual=path.join(tmp,"项目真实目录"),alias=path.join(tmp,"看板别名");
+  await fs.mkdir(path.join(actual,"server"),{recursive:true});
+  await fs.writeFile(path.join(actual,"server","main.mjs"),"// fixture\n");
+  try { await fs.symlink(actual,alias,process.platform==="win32"?"junction":"dir"); }
+  catch(error){ t.skip("junction unavailable: "+error.code); return; }
+  const c=new ServiceController(alias,{port:47837});
+  c.instanceFile=path.join(alias,"instance.json");
+  const instance={version:1,pid:31837,port:47837,host:"127.0.0.1",
+    entryPath:path.join(actual,"server","main.mjs"),rootDir:actual,
+    nodeExecutable:process.execPath,instanceToken:"test-real-token"};
+  await fs.writeFile(c.instanceFile,JSON.stringify(instance),"utf8");
+  const proc={exists:true,pid:31837,executablePath:process.execPath,argv:[
+    process.execPath,path.join(actual,"server","main.mjs"),"--root",actual,
+    "--instance-token","test-real-token","--port","47837","--host","127.0.0.1",
+    "--instance-file",path.join(actual,"instance.json")
+  ]};
+  assert.equal(c.verifyIdentity(instance,proc,{pids:[31837]}).ok,true);
+  const badToken={...proc,argv:proc.argv.map(x=>x==="test-real-token"?"wrong-token":x)};
+  assert.ok(c.verifyIdentity(instance,badToken,{pids:[31837]}).mismatches.includes("instance_token_mismatch"));
+  assert.ok(c.verifyIdentity(instance,proc,{pids:[9999]}).mismatches.includes("listener_pid_mismatch"));
+});
+
 test("other Node occupying port is never killed", async (t) => {
   const port = await freePort();
   const child = spawn(process.execPath, ["-e", `require('net').createServer().listen(${port},'127.0.0.1');setInterval(()=>{},1000)`], {

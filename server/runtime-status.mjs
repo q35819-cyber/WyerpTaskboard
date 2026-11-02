@@ -92,7 +92,13 @@ export class TaskboardRuntimeStatus {
       readJson(path.join(this.rootDir, "data", "runtime", "validation", "npm-test.json"), {
         version: 1, state: "never_run", failedFiles: null, failures: []
       }),
-      new ChatgptHealthMonitor(this.rootDir, { clock: this.clock }).init().then(m => m.status())
+      new ChatgptHealthMonitor(this.rootDir, { clock: this.clock }).init().then(m => m.status()).catch(error => {
+        const optional = path.join(this.rootDir, "config", "chatgpt-health.json");
+        if (error?.code === "ENOENT" && path.resolve(error.path || "") === path.resolve(optional)) {
+          return { state: "not_configured", healthy: false };
+        }
+        throw error;
+      })
     ]);
 
     const scanStore = await new ScanStore(this.rootDir, { clock: this.clock }).init();

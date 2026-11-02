@@ -48,6 +48,14 @@ async function fixture(t) {
   return {root,now};
 }
 
+test("optional ChatGPT health config may be absent without failing runtime snapshot", async(t)=>{
+  const {root,now}=await fixture(t);
+  await fs.rm(path.join(root,"config","chatgpt-health.json"));
+  const result=await new TaskboardRuntimeStatus(root,{clock:()=>now}).snapshot({liveProbes:false});
+  assert.ok(result);
+  assert.equal(result.schedulers.chatgpt_mcp_health.state,"installed");
+});
+
 test("runtime status light snapshot skips live scheduler probes and uses recorded scheduler truth", async (t) => {
   const {root,now}=await fixture(t);
   let probeCalls=0;
