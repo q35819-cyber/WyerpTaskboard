@@ -89,7 +89,7 @@ async function setup(t, { pass = true, missingReport = false, mergedGit = true, 
   }
   const takeoverBody = (revision) => ({
     operationId: "delivery.takeover.execute.0001", expectedRevision: revision,
-    actorType: "developer_ai", actorId: "new-dev", assignee: "新的开发AI",
+    actorType: "controller_ai", actorId: "new-dev", assignee: "新的总控AI",
     sessionId: "wc_sess_new", sessionWindowName: "新开发窗口",
     previousWorktree: "D:/original-worktree", nextWorktree: "D:/new-worktree",
     liveInspection: "已核验原Session与Job，没有未完成写入且dirty成果归档完整",
@@ -104,7 +104,7 @@ async function allowed(x) {
 }
 async function preclaim(x, actorId, sessionId) {
   return x.send("/preclaim-report", {
-    operationId: "delivery.preclaim." + actorId, actorType: "developer_ai", actorId, sessionId,
+    operationId: "delivery.preclaim." + actorId, actorType: "controller_ai", actorId, sessionId,
     note: "先核对独测候选与工作区并向用户汇报，准备正式认领"
   });
 }
@@ -112,7 +112,7 @@ async function claim(x, actorId, sessionId, op) {
   const current = await x.get();
   return x.send("/claim", {
     operationId: op, expectedRevision: current.registryRevision,
-    actorType: "developer_ai", actorId, sessionId, assignee: actorId,
+    actorType: "controller_ai", actorId, sessionId, assignee: actorId,
     sessionWindowName: "新窗口"
   });
 }
@@ -150,7 +150,7 @@ test("pending delivery rejects unauthorized takeover; authorized user retains QA
   assert.equal(oldReport.status, 200);
   const oldClaim = await claim(x, "old-dev", "wc_sess_old", "delivery.old.claim.after.takeover");
   assert.equal(oldClaim.status, 409);
-  assert.equal(oldClaim.data.error.code, "DELIVERY_ORIGINAL_DEVELOPER_REQUIRED");
+  assert.equal(oldClaim.data.error.code, "DELIVERY_CONTROLLER_IDENTITY_CONFLICT");
   assert.equal((await preclaim(x, "new-dev", "wc_sess_new")).status, 200);
   const newClaim = await claim(x, "new-dev", "wc_sess_new", "delivery.new.claim.after.takeover");
   assert.equal(newClaim.status, 200, JSON.stringify(newClaim.data));
@@ -247,7 +247,7 @@ test("authorized replacement completes already-merged candidate; old Session can
     const response = await fetch(x.base + x.root, {
       method: "PATCH", headers: x.bearer, body: JSON.stringify({
         operationId, eventType: "delivery_complete", expectedRevision: now.registryRevision,
-        actorType: "developer_ai", actorId, sessionId, patch: { status: "已完成" },
+        actorType: "controller_ai", actorId, sessionId, patch: { status: "已完成" },
         metadata: { postMergeReportPath: reportPath, postMergeRegressionResult: "PASS" }
       })
     });
