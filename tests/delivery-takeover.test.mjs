@@ -102,17 +102,17 @@ async function allowed(x) {
     operationId: "delivery.takeover.allow.0001", note: "我允许异常接管 D-PENDING"
   }, true);
 }
-async function preclaim(x, actorId, sessionId) {
+async function preclaim(x, actorId, sessionId, actorType = "developer_ai") {
   return x.send("/preclaim-report", {
-    operationId: "delivery.preclaim." + actorId, actorType: "developer_ai", actorId, sessionId,
+    operationId: "delivery.preclaim." + actorId, actorType, actorId, sessionId,
     note: "先核对独测候选与工作区并向用户汇报，准备正式认领"
   });
 }
-async function claim(x, actorId, sessionId, op) {
+async function claim(x, actorId, sessionId, op, actorType = "developer_ai") {
   const current = await x.get();
   return x.send("/claim", {
     operationId: op, expectedRevision: current.registryRevision,
-    actorType: "developer_ai", actorId, sessionId, assignee: actorId,
+    actorType, actorId, sessionId, assignee: actorId,
     sessionWindowName: "新窗口"
   });
 }
@@ -150,12 +150,16 @@ test("pending delivery rejects unauthorized takeover; authorized user retains QA
   assert.equal(oldReport.status, 200);
   const oldClaim = await claim(x, "old-dev", "wc_sess_old", "delivery.old.claim.after.takeover");
   assert.equal(oldClaim.status, 409);
-  assert.equal(oldClaim.data.error.code, "DELIVERY_ORIGINAL_DEVELOPER_REQUIRED");
+  assert.equal(oldClaim.data.error.code, "DELIVERY_CONTROLLER_REQUIRED");
   assert.equal((await preclaim(x, "new-dev", "wc_sess_new")).status, 200);
-  const newClaim = await claim(x, "new-dev", "wc_sess_new", "delivery.new.claim.after.takeover");
-  assert.equal(newClaim.status, 200, JSON.stringify(newClaim.data));
-  assert.equal(newClaim.data.after.status, "交付中");
-  assert.equal(newClaim.data.after.sessionId, "wc_sess_new");
+  const newDeveloperClaim = await claim(x, "new-dev", "wc_sess_new", "delivery.new.dev.denied");
+  assert.equal(newDeveloperClaim.status, 409);
+  assert.equal(newDeveloperClaim.data.error.code, "DELIVERY_CONTROLLER_REQUIRED");
+  assert.equal((await preclaim(x, "controller", "wc_sess_controller", "controller_ai")).status, 200);
+  const controllerClaim = await claim(x, "controller", "wc_sess_controller", "delivery.controller.claim.after.takeover", "controller_ai");
+  assert.equal(controllerClaim.status, 200, JSON.stringify(controllerClaim.data));
+  assert.equal(controllerClaim.data.after.status, "交付中");
+  assert.equal(controllerClaim.data.after.sessionId, "wc_sess_controller");
 });
 
 test("pending delivery without independent evidence returns to independent testing", async (t) => {
@@ -236,7 +240,11 @@ test("authorized replacement completes already-merged candidate; old Session can
   assert.equal(takeover.status, 200, JSON.stringify(takeover.data));
   assert.equal(takeover.data.after.status, "待交付");
   assert.equal((await preclaim(x, "new-dev", "wc_sess_new")).status, 200);
-  const claimed = await claim(x, "new-dev", "wc_sess_new", "delivery.complete.new.claim");
+  const denied = await claim(x, "new-dev", "wc_sess_new", "delivery.complete.dev.denied");
+  assert.equal(denied.status, 409);
+  assert.equal(denied.data.error.code, "DELIVERY_CONTROLLER_REQUIRED");
+  assert.equal((await preclaim(x, "controller", "wc_sess_controller", "controller_ai")).status, 200);
+  const claimed = await claim(x, "controller", "wc_sess_controller", "delivery.complete.controller.claim", "controller_ai");
   assert.equal(claimed.status, 200, JSON.stringify(claimed.data));
   assert.equal(claimed.data.after.status, "交付中");
   const reportPath = "reports/D-PENDING/post-merge.md";
@@ -247,7 +255,7 @@ test("authorized replacement completes already-merged candidate; old Session can
     const response = await fetch(x.base + x.root, {
       method: "PATCH", headers: x.bearer, body: JSON.stringify({
         operationId, eventType: "delivery_complete", expectedRevision: now.registryRevision,
-        actorType: "developer_ai", actorId, sessionId, patch: { status: "已完成" },
+        actorType: actorId === "controller" ? "controller_ai" : "developer_ai", actorId, sessionId, patch: { status: "已完成" },
         metadata: { postMergeReportPath: reportPath, postMergeRegressionResult: "PASS" }
       })
     });
@@ -255,7 +263,9 @@ test("authorized replacement completes already-merged candidate; old Session can
   };
   const old = await attempts("old-dev", "wc_sess_old", "delivery.complete.old.denied");
   assert.equal(old.status, 409);
-  const fresh = await attempts("new-dev", "wc_sess_new", "delivery.complete.new.valid");
+  const unauthorizedDeveloper = await attempts("new-dev", "wc_sess_new", "delivery.complete.dev.denied");
+  assert.equal(unauthorizedDeveloper.status, 409);
+  const fresh = await attempts("controller", "wc_sess_controller", "delivery.complete.controller.valid");
   assert.equal(fresh.status, 200, JSON.stringify(fresh.data));
   assert.equal(fresh.data.after.status, "已完成");
   assert.equal(fresh.data.after.assignee, "");

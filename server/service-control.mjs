@@ -14,7 +14,10 @@ const WINDOWS = process.platform === "win32";
 function norm(p) {
   if (!p) return "";
   const x = path.resolve(String(p));
-  return WINDOWS ? x.toLowerCase() : x;
+  let physical = x;
+  try { physical = fsSync.realpathSync.native(x); }
+  catch (error) { if (!["ENOENT", "ENOTDIR"].includes(error?.code)) throw error; }
+  return WINDOWS ? physical.toLowerCase() : physical;
 }
 function argValue(argv, key) {
   const exact = `--${key}`;
@@ -64,9 +67,12 @@ export class ServiceController {
       }
     }
     const script = path.join(this.rootDir, "scripts", "query-process.ps1");
+    const safePid = Number(pid);
+    if (!Number.isSafeInteger(safePid) || safePid <= 0) throw new Error("invalid PID");
+    const command = `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & '${script.replace(/'/g, "''")}' -PidValue ${safePid}`;
     const { stdout } = await execFileAsync(this.powershell, [
       "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-      "-File", script, "-PidValue", String(pid),
+      "-EncodedCommand", Buffer.from(command, "utf16le").toString("base64"),
     ], { windowsHide: true, maxBuffer: 1024 * 1024 });
     return JSON.parse(stdout.trim());
   }
