@@ -12,6 +12,7 @@ import { ProjectRegistry } from "./project-registry.mjs";
 import { EventStore } from "./event-store.mjs";
 import { TransactionStore } from "./transaction-store.mjs";
 import { ScanStore } from "./scan-store.mjs";
+import { hardDependencyBlockers, provisionalClaimAuthorization } from "./candidate-evaluator.mjs";
 
 function assertOperationId(id) {
   if (typeof id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(id)) {
@@ -132,7 +133,7 @@ function writePaths(root, value) {
       return process.platform === "win32" ? resolved.toLowerCase() : resolved;
     });
 }
-async function assertDeveloperClaimExclusive(store, projectId, context, parsed, task, actorId, sessionId) {
+async function assertDeveloperClaimExclusive(store, projectId, context, parsed, task, actorId, sessionId, allowIsolatedOverlap = false) {
   const requested = writePaths(context.rootRealPath, task.writeTargets);
   if (!requested.length) throw new TaskboardError("开发认领必须声明计划写文件", {
     code: "CLAIM_WRITE_TARGETS_REQUIRED", status: 409
@@ -166,7 +167,7 @@ async function assertDeveloperClaimExclusive(store, projectId, context, parsed, 
           code: "CLAIM_DEVELOPER_BUSY", status: 409, details: { taskId: other.id, projectId: otherProject }
         });
       }
-      if (overlapping && (RESERVED_WRITES.has(other.status) ||
+      if (!allowIsolatedOverlap && overlapping && (RESERVED_WRITES.has(other.status) ||
         (other.status === "HOLD" && history?.some((event) =>
           event.event_type === "claim" && event.actor_type === "developer_ai")))) {
         throw new TaskboardError("计划写文件与未交付任务冲突", {
@@ -718,10 +719,34 @@ export class TaskStore {
           });
         }
       }
+      let provisional = null;
+      const dependencyBlockers = hardDependencyBlockers(currentTask,
+        new Map(parsed.tasks.map((item) => [item.id, item])));
       if (eventType === "claim" && actorType === "developer_ai") {
-        await assertDeveloperClaimExclusive(this, projectId, context, parsed, currentTask, actorId, sessionId);
+        if (dependencyBlockers.length) {
+          provisional = await provisionalClaimAuthorization(this, projectId, currentTask,
+            new Map(parsed.tasks.map((item) => [item.id, item])), { actorId, sessionId });
+          if (!provisional) throw new TaskboardError("未完成硬前置且缺少有效的独立工作区预开发授权", {
+            code: "CLAIM_DEPENDENCY_NOT_COMPLETED", status: 409,
+            details: { blockers: dependencyBlockers }
+          });
+        }
+        await assertDeveloperClaimExclusive(this, projectId, context, parsed, currentTask,
+          actorId, sessionId, Boolean(provisional));
       }
-      let effectiveMetadata = metadata;
+      if (dependencyBlockers.length && (["handoff", "test_result", "delivery_complete"].includes(eventType)
+        || (eventType === "claim" && actorType === "test_ai"))) {
+        throw new TaskboardError("上游任务尚未完成，预开发权限不能用于独测或正式交付", {
+          code: "PROVISIONAL_UPSTREAM_NOT_COMPLETE", status: 409,
+          details: { blockers: dependencyBlockers }
+        });
+      }
+      let effectiveMetadata = provisional ? {
+        ...(metadata || {}), provisionalClaim: true,
+        provisionalAuthorizationEventId: provisional.eventId,
+        provisionalBaseSha: provisional.baseSha,
+        provisionalWorktreeName: provisional.worktreeName
+      } : metadata;
       let effectivePatchInput = patch;
       if (["user_accept", "user_reject"].includes(eventType)) {
         const history = await this.events.listTaskEvents(projectId, taskId, { all: true });

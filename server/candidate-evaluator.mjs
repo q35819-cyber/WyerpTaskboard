@@ -1,9 +1,12 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { resolveProjectPath } from "./core/path-safety.mjs";
 import isPathInside from "./core/vendor/is-path-inside.mjs";
 
+const gitExec = promisify(execFile);
 function hash(value) { return crypto.createHash("sha256").update(value).digest("hex"); }
 function splitRefs(value) {
   return String(value || "").split(/[；;]/).map((x) => x.replace(/`/g, "").trim()).filter(Boolean);
@@ -16,7 +19,7 @@ function hardTaskDependencyId(value) {
   const match = token.match(/^([A-Za-z0-9][A-Za-z0-9._-]{0,127})\s*完成$/);
   return match ? match[1] : "";
 }
-function hardDependencyBlockers(task, tasksById) {
+export function hardDependencyBlockers(task, tasksById) {
   const blockers = [];
   const seen = new Set();
   for (const ref of splitRefs(task.readDependencies)) {
@@ -36,6 +39,63 @@ function hardDependencyBlockers(task, tasksById) {
   }
   return blockers;
 }
+
+export async function provisionalClaimAuthorization(store, projectId, task, tasksById, actor = {}) {
+  const unfinished = splitRefs(task.readDependencies).map(hardTaskDependencyId).filter(Boolean)
+    .filter((id) => tasksById.get(id)?.status !== "已完成");
+  if (!unfinished.length || unfinished.some((id) => id === task.id || !tasksById.has(id))) return null;
+  const history = await store.taskHistory(projectId, task.id, { all: true });
+  const issuedIndex = history.findLastIndex((event) =>
+    event.event_type === "controller_provisional_dev_authorization");
+  if (issuedIndex < 0) return null;
+  const issued = history[issuedIndex], meta = issued.metadata || {};
+  if (issued.actor_type !== "controller_ai" || !issued.actor_id ||
+    !["待准备", "待开发"].includes(task.status) ||
+    meta.taskId !== task.id || !/^[a-f0-9]{40}$/i.test(String(meta.baseSha || "")) ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{1,127}$/.test(String(meta.worktreeName || "")) ||
+    !String(meta.developerActorId || "").trim() || !String(meta.developerSessionId || "").trim() ||
+    (actor.actorId && meta.developerActorId !== actor.actorId) ||
+    (actor.sessionId && meta.developerSessionId !== actor.sessionId) ||
+    !Number.isFinite(Date.parse(meta.expiresAt)) || Date.parse(meta.expiresAt) <= Date.now() ||
+    !Array.isArray(meta.upstreamTaskIds) ||
+    meta.upstreamTaskIds.length !== new Set(unfinished).size ||
+    !unfinished.every((id) => meta.upstreamTaskIds.includes(id)) ||
+    history.slice(issuedIndex + 1).some((event) =>
+      ["controller_provisional_dev_revoked", "user_provisional_dev_revoked"].includes(event.event_type))) return null;
+  const approved = history.find((event) =>
+    event.event_id === meta.userAuthorizationEventId && event.actor_type === "user"
+    && event.event_type === "user_review" && event.metadata?.approveProvisionalDevelopment === true);
+  if (!approved || history.indexOf(approved) >= issuedIndex ||
+    history.slice(history.indexOf(approved) + 1).some((event) =>
+      event.event_type === "user_provisional_dev_revoked")) return null;
+  try {
+    const context = await store.projects.context(projectId);
+    const root = await fs.realpath(context.rootRealPath);
+    const git = async (cwd, ...args) => (await gitExec("git", ["-C", cwd, ...args],
+      { encoding: "utf8", windowsHide: true, timeout: 12000 })).stdout.trim();
+    if (await git(root, "symbolic-ref", "--short", "HEAD") !== "main" ||
+      await git(root, "rev-parse", "HEAD") !== meta.baseSha) return null;
+    const worktrees = (await git(root, "worktree", "list", "--porcelain")).split(/\r?\n/)
+      .filter((line) => line.startsWith("worktree ")).map((line) => line.slice(9));
+    for (const linked of worktrees) {
+      if (path.basename(linked) !== meta.worktreeName) continue;
+      const real = await fs.realpath(linked);
+      if ((process.platform === "win32" ? real.toLowerCase() : real) ===
+        (process.platform === "win32" ? root.toLowerCase() : root)) continue;
+      const actualRoot = path.resolve(await git(real, "rev-parse", "--show-toplevel"));
+      if ((process.platform === "win32" ? actualRoot.toLowerCase() : actualRoot) !==
+        (process.platform === "win32" ? real.toLowerCase() : real)) continue;
+      await git(real, "merge-base", "--is-ancestor", meta.baseSha, "HEAD");
+      return {
+        eventId: issued.event_id, actorId: meta.developerActorId,
+        sessionId: meta.developerSessionId, baseSha: meta.baseSha,
+        worktreeName: meta.worktreeName, unfinished
+      };
+    }
+  } catch { return null; }
+  return null;
+}
+
 export function deliveryEvidence(history, workflow) {
   const latestResult = [...history].reverse().find((event) => event.event_type === "test_result");
   const metadata = latestResult?.metadata || {};
@@ -145,7 +205,10 @@ export class CandidateEvaluator {
       if (task.status === "待交付" && !delivery?.valid) {
         blockers.push("缺少有效的最新独立测试PASS、candidate_merge动作或固定候选SHA；任务保留在看板但禁止认领");
       }
-      blockers.push(...hardDependencyBlockers(task, tasksById));
+      const dependencyBlockers = hardDependencyBlockers(task, tasksById);
+      const provisional = eligibleRole === "developer_ai" && dependencyBlockers.length
+        ? await provisionalClaimAuthorization(this.taskStore, projectId, task, tasksById) : null;
+      if (!provisional) blockers.push(...dependencyBlockers);
       if (task.assignee || task.sessionId) blockers.push("已有负责人或活动会话");
       if (requirements.pendingCount > 0) blockers.push("存在待AI拆解的新需求");
       const stop = await this.taskStore.stopState(projectId, task.id).catch(() => ({ stopRequested: false }));
@@ -168,12 +231,12 @@ export class CandidateEvaluator {
           }
           const conflict = activeWrites.find((item) => candidateWrites.some((candidate) =>
             candidate === item || isPathInside(candidate, item) || isPathInside(item, candidate)));
-          if (conflict) blockers.push("计划写文件与开发中任务" + active.id + "冲突：" + conflict);
+          if (conflict && !provisional) blockers.push("计划写文件与开发中任务" + active.id + "冲突：" + conflict);
         }
       }
 
       const dedupeKey = hash([projectId, task.id, task.status, task.updatedAt || "", task.plannedRole || "", eligibleRole].join("|"));
-      const sourceFingerprint = hash([parsed.fileSha256, resourceLedgerSha, task.updatedAt || "", task.assignee || "", task.sessionId || "", delivery?.eventId || "", delivery?.developerActorId || "", delivery?.developerSessionId || ""].join("|"));
+      const sourceFingerprint = hash([parsed.fileSha256, resourceLedgerSha, task.updatedAt || "", task.assignee || "", task.sessionId || "", delivery?.eventId || "", delivery?.developerActorId || "", delivery?.developerSessionId || "", provisional?.eventId || ""].join("|"));
       candidates.push({
         project_id: projectId,
         task_id: task.id,
@@ -191,9 +254,11 @@ export class CandidateEvaluator {
         write_targets: writeTargets,
         checkpoint_report_refs: splitRefs(task.targets),
         delivery_evidence_event_id: delivery?.eventId || null,
+        provisional_authorization_event_id: provisional?.eventId || null,
+        provisional: Boolean(provisional),
         eligible_role: eligibleRole,
-        eligible_actor_id: delivery?.developerActorId || null,
-        eligible_session_id: delivery?.developerSessionId || null,
+        eligible_actor_id: provisional?.actorId || delivery?.developerActorId || null,
+        eligible_session_id: provisional?.sessionId || delivery?.developerSessionId || null,
         eligible: Boolean(blockers.length === 0),
         blockers,
         reason: reasonFor(task, eligibleRole, blockers),
@@ -230,7 +295,10 @@ export class CandidateEvaluator {
     if (!task) return { ok: false, stale: true, reason: "task_missing" };
     const currentRole = roleFor(task);
     const mismatches = [];
-    const dependencyBlockers = hardDependencyBlockers(task, new Map(parsed.tasks.map((item) => [item.id, item])));
+    const tasksById = new Map(parsed.tasks.map((item) => [item.id, item]));
+    const dependencyBlockers = hardDependencyBlockers(task, tasksById);
+    const provisional = dependencyBlockers.length && currentRole === "developer_ai"
+      ? await provisionalClaimAuthorization(this.taskStore, candidate.project_id, task, tasksById) : null;
     if (task.status === "待交付") {
       const history = await this.taskStore.taskHistory(candidate.project_id, task.id, { limit: 1000 });
       const delivery = deliveryEvidence(history, context.workflow);
@@ -244,7 +312,10 @@ export class CandidateEvaluator {
         mismatches.push("delivery_session_changed");
       }
     }
-    if (dependencyBlockers.length) mismatches.push("hard_dependency_blocked");
+    if (dependencyBlockers.length && !provisional) mismatches.push("hard_dependency_blocked");
+    if ((candidate.provisional_authorization_event_id || null) !== (provisional?.eventId || null) ||
+      (provisional && (candidate.eligible_actor_id !== provisional.actorId ||
+        candidate.eligible_session_id !== provisional.sessionId))) mismatches.push("provisional_authorization_changed");
     if (parsed.registryRevision !== candidate.registry_revision) mismatches.push("registry_revision_changed");
     if (parsed.fileSha256 !== candidate.registry_sha) mismatches.push("registry_sha_changed");
     if (task.status !== candidate.status) mismatches.push("status_changed");
@@ -254,7 +325,7 @@ export class CandidateEvaluator {
       ok: mismatches.length === 0,
       stale: mismatches.length > 0,
       mismatches,
-      blockers: dependencyBlockers,
+      blockers: provisional ? [] : dependencyBlockers,
       current: {
         status: task.status,
         planned_role: task.plannedRole,
