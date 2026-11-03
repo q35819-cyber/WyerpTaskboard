@@ -539,6 +539,49 @@ test("claim rejects tasks already occupied by another execution and still allows
   assert.equal((await freeClaim.json()).after.status, "开发中");
 });
 
+test("unowned blocked task does not hold a permanent write lock", async (t) => {
+  const row = (id, status, assignee = "—", sessionId = "—") =>
+    [id, "F-" + id, "bugfix", "P0", status, "开发AI", assignee, "—", sessionId,
+      "—", "fixture", "plan.md", "trace/" + id, "read/" + id + ".md",
+      "src/shared.js", "cp/" + id + ".md"];
+  for (const [name, status, assignee, sessionId, expected] of [
+    ["unowned blocked", "阻断", "—", "—", 200],
+    ["blocked with owner", "阻断", "former-owner", "—", 409],
+    ["blocked with session", "阻断", "—", "former-session", 409],
+    ["pending QA", "待独测", "—", "—", 409],
+    ["active development", "开发中", "running-owner", "running-session", 409]
+  ]) {
+    await t.test(name, async (subtest) => {
+      const { base, secret, fixture, app } = await startFixture(subtest);
+      const headers = { Authorization: "Bearer " + secret, "Content-Type": "application/json" };
+      await fs.writeFile(fixture.registryPath,
+        registryText([row("A-10", "待开发"), row("B-10", status, assignee, sessionId)]), "utf8");
+      const before = (await app.taskStore.getTask("fixture", "B-10")).task;
+      const beforeEvents = await app.taskStore.taskHistory("fixture", "B-10", { all: true });
+      await recordPreclaim(base, secret, "A-10", { actorId: "new-developer", sessionId: "new-session" });
+      const task = await (await fetch(base + "/api/projects/fixture/tasks/A-10", { headers })).json();
+      const response = await fetch(base + "/api/projects/fixture/tasks/A-10/claim", {
+        method: "POST", headers, body: JSON.stringify({
+          operationId: "claim.unowned.blocked." + name.replace(/ /g, "-"),
+          expectedRevision: task.registryRevision,
+          actorType: "developer_ai", actorId: "new-developer",
+          assignee: "new-developer", sessionId: "new-session",
+          sessionWindowName: "new-window"
+        })
+      });
+      assert.equal(response.status, expected);
+      const result = await response.json();
+      if (expected === 200) assert.equal(result.after.status, "开发中");
+      else assert.equal(result.error.code, "CLAIM_WRITE_CONFLICT");
+      const after = (await app.taskStore.getTask("fixture", "B-10")).task;
+      assert.equal(after.status, before.status);
+      assert.equal(after.assignee, before.assignee);
+      assert.equal(after.sessionId, before.sessionId);
+      assert.deepEqual(await app.taskStore.taskHistory("fixture", "B-10", { all: true }), beforeEvents);
+    });
+  }
+});
+
 test("developer claim enforces actual file overlap and actor/session exclusion", async (t) => {
   const row = (id, writes) => [id, "F-" + id, "bugfix", "P0", "待开发", "开发AI",
     "—", "—", "—", "—", "fixture", "plan.md", "trace/" + id,

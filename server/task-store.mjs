@@ -144,6 +144,8 @@ async function assertDeveloperClaimExclusive(store, projectId, context, parsed, 
       (await otherContext.adapter.readMarkdownTaskRegistry(otherContext.registryPath, otherContext.project)).tasks;
     for (const other of otherTasks) {
       if (otherProject === projectId && other.id === task.id) continue;
+      // A blocked task without an owner or Session cannot hold a live write lock.
+      if (other.status === "阻断" && !other.assignee && !other.sessionId) continue;
       const active = EXECUTING_DEVELOPER.has(other.status) && Boolean(other.assignee || other.sessionId);
       const otherPaths = writePaths(otherContext.rootRealPath, other.writeTargets);
       const overlapping = otherPaths.some((item) => requested.some((candidate) =>
