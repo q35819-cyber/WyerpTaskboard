@@ -29,6 +29,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path config -Force | Out-Null
           '{"version":1,"projects":[]}' | Set-Content -Path config/projects.json -Encoding utf8NoBOM
+          $wakeConfig = @{ version = 1; enabled = $false; token = (([guid]::NewGuid().ToString('N')) + ([guid]::NewGuid().ToString('N'))); expected_extension_version = 'ci-disabled' }
+          $wakeConfig | ConvertTo-Json -Compress | Set-Content -Path config/chat-browser-wake.json -Encoding utf8NoBOM
       - name: Validate Windows service startup early
         run: node --test tests/service-control.test.mjs
       - name: Show sanitized Windows service startup error
