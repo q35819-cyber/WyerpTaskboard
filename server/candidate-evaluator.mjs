@@ -123,6 +123,7 @@ export class CandidateEvaluator {
   }
 
   async evaluateProject(projectId) {
+    await this.taskStore.autoRestoreTemporaryBlocks(projectId);
     const detectedAt = new Date(this.clock()).toISOString();
     const context = await this.taskStore.projects.context(projectId);
     const parsed = await context.adapter.readMarkdownTaskRegistry(context.registryPath, context.project);
