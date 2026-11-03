@@ -10,7 +10,7 @@ async function fixture(t) {
   const f = await makeFixture();
   t.after(() => fs.rm(f.boardRoot, { recursive: true, force: true }));
   const taskStore = await new TaskStore(f.boardRoot).init();
-  const cp = await new TaskStepCheckpoint(f.boardRoot, { taskStore }).init();
+  const cp = await new TaskStepCheckpoint(f.boardRoot, { taskStore, flowVersion: "role-steps-v1" }).init();
   return { f, taskStore, cp };
 }
 let sequence = 1;
@@ -855,4 +855,201 @@ test("portable flow paths stay relative and published template matches canonical
   const readme=await fs.readFile(path.resolve("templates/webcodex-v1/README.md"),"utf8");
   assert.doesNotMatch(readme,/(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|\\\\[^\\\s]+\\|\/(?:home|Users|mnt|opt|tmp)\/)/);
   assert.match(await fs.readFile(path.join(root,"00_统一入口.md"),"utf8"),/相对路径强制规则/);
+});
+
+test("v2 cursor enters C00, permits optional environment check and bypasses delivery-only C04 after ordinary dispatch", async (t) => {
+  const { f, taskStore } = await fixture(t);
+  const cp = await new TaskStepCheckpoint(f.boardRoot, { taskStore }).init();
+  const start = await cp.show("fixture", "A-10");
+  assert.equal(start.state.flowVersion, "role-steps-v2");
+  assert.equal(start.state.cursors.controller_ai, "C00_A_REQUIREMENTS");
+  assert.equal(start.state.cursors.developer_ai, "D01_CLAIM");
+  await assert.rejects(step(cp, "controller_ai", "C01_SCAN"),
+    (error) => error.code === "CHECKPOINT_STEP_ORDER");
+  for (const id of ["C00_A_REQUIREMENTS", "C00_B_MAIN_VERSION", "C00_C_SAFE_CLEANUP"]) {
+    await step(cp, "controller_ai", id);
+  }
+  assert.equal((await cp.show("fixture", "A-10")).state.cursors.controller_ai, "C01_SCAN");
+  const env = await step(cp, "controller_ai", "C00_D_ENVIRONMENT");
+  assert.equal(env.state.cursors.controller_ai, "C01_SCAN");
+  await assert.rejects(step(cp, "controller_ai", "C00_D_ENVIRONMENT"),
+    (error) => error.code === "CHECKPOINT_STEP_ORDER");
+  await step(cp, "controller_ai", "C01_SCAN");
+  await step(cp, "controller_ai", "C02_TRIAGE");
+  const dispatch = await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.modern.dispatch.001", eventType: "controller_dispatch",
+    actorType: "controller_ai", actorId: "controller", sessionId: "controller_ai.session"
+  });
+  const result = await step(cp, "controller_ai", "C03_DISPATCH", {
+    eventId: dispatch.event.event_id
+  });
+  assert.equal(result.state.cursors.controller_ai, "C08_NEXT");
+  await assert.rejects(step(cp, "controller_ai", "C04_MERGE_MAIN"),
+    (error) => error.code === "CHECKPOINT_STEP_ORDER");
+  await step(cp, "controller_ai", "C08_NEXT");
+  assert.equal((await cp.show("fixture", "A-10")).state.cursors.controller_ai, null);
+  assert.equal((await cp.show("fixture", "A-10")).state.records
+    .filter((entry) => ["C04_MERGE_MAIN", "C05_POSTMERGE", "C06_CLEANUP", "C07_COMPLETE"]
+      .includes(entry.stepId)).length, 0, "no fabricated delivery steps");
+});
+
+test("v2 developer moves D08 handoff to D09_NEXT without assuming QA PASS or developer merge ownership", async (t) => {
+  const { f, taskStore } = await fixture(t);
+  const cp = await new TaskStepCheckpoint(f.boardRoot, { taskStore }).init();
+  for (const id of ["C00_A_REQUIREMENTS", "C00_B_MAIN_VERSION", "C00_C_SAFE_CLEANUP",
+    "C01_SCAN", "C02_TRIAGE"]) await step(cp, "controller_ai", id);
+  const dispatch = await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.modern.dispatch.002", eventType: "controller_dispatch",
+    actorType: "controller_ai", actorId: "controller", sessionId: "controller_ai.session"
+  });
+  await step(cp, "controller_ai", "C03_DISPATCH", { eventId: dispatch.event.event_id });
+  await step(cp, "controller_ai", "C08_NEXT");
+  const claimed = await claimDev(taskStore);
+  await step(cp, "developer_ai", "D01_CLAIM", { eventId: claimed.eventId });
+  for (const id of ["D02_WORKTREE", "D03_WRITE_SCOPE", "D04_IMPLEMENT", "D05_TEST_1",
+    "D06_TEST_2", "D07_TEST_3"]) await step(cp, "developer_ai", id);
+  const handoff = await taskStore.updateTask("fixture", "A-10", { status: "待独测" }, {
+    expectedRevision: (await taskStore.snapshot("fixture")).registryRevision,
+    operationId: "fixture.modern.handoff.002", eventType: "handoff",
+    actorType: "developer_ai", actorId: "developer", sessionId: "developer_ai.session",
+    metadata: { atomicLifecycle: true, completedFromStatus: "开发中", handoffTarget: "待独测" }
+  });
+  const handed = await step(cp, "developer_ai", "D08_HANDOFF", { eventId: handoff.eventId });
+  assert.equal(handed.state.cursors.developer_ai, "D09_NEXT");
+  await assert.rejects(step(cp, "developer_ai", "D09_MERGE_MAIN"),
+    (error) => error.code === "CHECKPOINT_ROLE_STEP_INVALID");
+  await assert.rejects(step(cp, "developer_ai", "D10_POSTMERGE"),
+    (error) => error.code === "CHECKPOINT_ROLE_STEP_INVALID");
+  const done = await step(cp, "developer_ai", "D09_NEXT");
+  assert.equal(done.state.cursors.developer_ai, null);
+  assert.equal((await taskStore.getTask("fixture", "A-10")).task.status, "待独测");
+});
+
+test("v1 checkpoints remain on their original cursor sequence when reopened by v2 runtime", async (t) => {
+  const { f, cp: legacy, taskStore } = await fixture(t);
+  await step(legacy, "controller_ai", "C01_SCAN");
+  await step(legacy, "controller_ai", "C02_TRIAGE");
+  const dispatch = await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.old.dispatch.003", eventType: "controller_dispatch",
+    actorType: "controller_ai", actorId: "controller", sessionId: "controller_ai.session"
+  });
+  const third = await step(legacy, "controller_ai", "C03_DISPATCH", {
+    eventId: dispatch.event.event_id
+  });
+  const v2 = await new TaskStepCheckpoint(f.boardRoot, { taskStore }).init();
+  assert.equal((await v2.show("fixture", "A-10")).state.flowVersion, "role-steps-v1");
+  const resumed = await step(v2, "controller_ai", "C04_VERIFY_NEXT");
+  assert.equal(resumed.state.cursors.controller_ai, null);
+  assert.equal(resumed.state.records.length, third.state.records.length + 1);
+  assert.equal(resumed.state.flowVersion, "role-steps-v1");
+  await assert.rejects(step(v2, "controller_ai", "C08_NEXT"),
+    (error) => error.code === "CHECKPOINT_ROLE_STEP_INVALID");
+  const newTask = await v2.show("fixture", "T-01");
+  assert.equal(newTask.state.flowVersion, "role-steps-v2");
+  assert.equal(newTask.state.cursors.controller_ai, "C00_A_REQUIREMENTS");
+});
+
+test("new checkpoint rejects unknown step versions and forged old cursor before writing anything", async (t) => {
+  const { f, taskStore } = await fixture(t);
+  const cp = await new TaskStepCheckpoint(f.boardRoot, { taskStore }).init();
+  assert.throws(() => new TaskStepCheckpoint(f.boardRoot, { taskStore, flowVersion: "untrusted-version" }),
+    (error) => error.code === "CHECKPOINT_FLOW_VERSION_INVALID");
+  await step(cp, "controller_ai", "C00_A_REQUIREMENTS");
+  const shown = await cp.show("fixture", "A-10");
+  const filename = path.join(f.projectRoot, shown.file);
+  const raw = await fs.readFile(filename, "utf8");
+  const malformed = raw.replace('"controller_ai": "C00_B_MAIN_VERSION"',
+    '"controller_ai": "D09_MERGE_MAIN"');
+  assert.notEqual(malformed, raw);
+  await fs.writeFile(filename, malformed, "utf8");
+  await assert.rejects(cp.show("fixture", "A-10"),
+    (error) => error.code === "CHECKPOINT_FLOW_VERSION_INVALID");
+  await assert.rejects(step(cp, "controller_ai", "C00_B_MAIN_VERSION"),
+    (error) => error.code === "CHECKPOINT_FLOW_VERSION_INVALID");
+});
+
+test("v2 real QA PASS plus new controller delivery claim reopens C00 then gates C04/C07", async (t) => {
+  const { f, taskStore } = await fixture(t);
+  const cp = await new TaskStepCheckpoint(f.boardRoot, { taskStore }).init();
+  for (const id of ["C00_A_REQUIREMENTS", "C00_B_MAIN_VERSION", "C00_C_SAFE_CLEANUP",
+    "C01_SCAN", "C02_TRIAGE"]) await step(cp, "controller_ai", id);
+  const dispatch = await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.modern.dispatch.004", eventType: "controller_dispatch",
+    actorType: "controller_ai", actorId: "controller", sessionId: "controller_ai.session"
+  });
+  await step(cp, "controller_ai", "C03_DISPATCH", { eventId: dispatch.event.event_id });
+  await step(cp, "controller_ai", "C08_NEXT");
+  const claimed = await claimDev(taskStore);
+  await step(cp, "developer_ai", "D01_CLAIM", { eventId: claimed.eventId });
+  for (const id of ["D02_WORKTREE", "D03_WRITE_SCOPE", "D04_IMPLEMENT", "D05_TEST_1",
+    "D06_TEST_2", "D07_TEST_3"]) await step(cp, "developer_ai", id);
+  const handoff = await taskStore.updateTask("fixture", "A-10", { status: "待独测" }, {
+    expectedRevision: (await taskStore.snapshot("fixture")).registryRevision,
+    operationId: "fixture.modern.handoff.004", eventType: "handoff",
+    actorType: "developer_ai", actorId: "developer", sessionId: "developer_ai.session",
+    metadata: { atomicLifecycle: true, completedFromStatus: "开发中", handoffTarget: "待独测" }
+  });
+  await step(cp, "developer_ai", "D08_HANDOFF", { eventId: handoff.eventId });
+  await step(cp, "developer_ai", "D09_NEXT");
+  await taskStore.updateTask("fixture", "A-10", {
+    status: "独测中", assignee: "qa", sessionWindowName: "qa", sessionId: "qa-session"
+  }, {
+    expectedRevision: (await taskStore.snapshot("fixture")).registryRevision,
+    operationId: "fixture.modern.qa-claim.004", eventType: "claim",
+    actorType: "test_ai", actorId: "qa", sessionId: "qa-session"
+  });
+  const qa = await taskStore.updateTask("fixture", "A-10", { status: "待交付" }, {
+    expectedRevision: (await taskStore.snapshot("fixture")).registryRevision,
+    operationId: "fixture.modern.qa-result.004", eventType: "test_result",
+    actorType: "test_ai", actorId: "qa", sessionId: "qa-session",
+    metadata: {
+      atomicLifecycle: true, testResult: "pass", reportPath: "reports/qa.md",
+      deliveryDisposition: "required", deliveryActions: ["candidate_merge"],
+      commitSha: "a".repeat(40), headBranch: "candidate/qa"
+    }
+  });
+  assert.equal(qa.after.status, "待交付");
+  const newController = await taskStore.updateTask("fixture", "A-10", {
+    status: "交付中", assignee: "controller-2",
+    sessionWindowName: "controller-2", sessionId: "controller-2-session"
+  }, {
+    expectedRevision: (await taskStore.snapshot("fixture")).registryRevision,
+    operationId: "fixture.modern.controller-claim.004", eventType: "claim",
+    actorType: "controller_ai", actorId: "controller-2", sessionId: "controller-2-session"
+  });
+  assert.equal(newController.after.status, "交付中");
+  const before = await cp.show("fixture", "A-10");
+  assert.equal(before.state.cursors.controller_ai, null);
+  await assert.rejects(step(cp, "controller_ai", "C00_A_REQUIREMENTS", {
+    actorId: "forged-controller", sessionId: "forged-session"
+  }), (error) => error.code === "CHECKPOINT_STEP_ORDER");
+  assert.equal((await cp.show("fixture", "A-10")).sha256, before.sha256);
+  const reopened = await step(cp, "controller_ai", "C00_A_REQUIREMENTS", {
+    actorId: "controller-2", sessionId: "controller-2-session"
+  });
+  assert.equal(reopened.state.attempts, 2);
+  assert.equal(reopened.state.records.filter((e) => e.stepId === "C08_NEXT" && e.attempt === 1).length, 1);
+  for (const id of ["C00_B_MAIN_VERSION", "C00_C_SAFE_CLEANUP",
+    "C01_SCAN", "C02_TRIAGE"]) {
+    await step(cp, "controller_ai", id, { actorId: "controller-2", sessionId: "controller-2-session" });
+  }
+  const deliveryDispatch = await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.modern.dispatch.005", eventType: "controller_dispatch",
+    actorType: "controller_ai", actorId: "controller-2", sessionId: "controller-2-session"
+  });
+  const c03 = await step(cp, "controller_ai", "C03_DISPATCH", {
+    actorId: "controller-2", sessionId: "controller-2-session", eventId: deliveryDispatch.event.event_id
+  });
+  assert.equal(c03.state.cursors.controller_ai, "C04_MERGE_MAIN");
+  await step(cp, "controller_ai", "C04_MERGE_MAIN",
+    { actorId: "controller-2", sessionId: "controller-2-session" });
+  await step(cp, "controller_ai", "C05_POSTMERGE",
+    { actorId: "controller-2", sessionId: "controller-2-session" });
+  await step(cp, "controller_ai", "C06_CLEANUP",
+    { actorId: "controller-2", sessionId: "controller-2-session" });
+  const beforeClose = await cp.show("fixture", "A-10");
+  await assert.rejects(step(cp, "controller_ai", "C07_COMPLETE", {
+    actorId: "controller-2", sessionId: "controller-2-session"
+  }), (error) => error.code === "CHECKPOINT_FORMAL_EVENT_REQUIRED");
+  assert.equal((await cp.show("fixture", "A-10")).sha256, beforeClose.sha256);
 });
