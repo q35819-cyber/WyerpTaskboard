@@ -1482,6 +1482,48 @@ test("task-scan status endpoint reports scheduler and candidate summary", async 
   assert.equal(body.developerCandidates[0].eligible, true);
 });
 
+test("task-scan HTTP includes ready developers, retains blockers and excludes controller delivery", async (t) => {
+  const { base, app } = await startFixture(t);
+  const now = Date.now();
+  const entry = (id, status, role, allowed, blockers = []) => ({
+    detection_id: "ready_http_" + id,
+    project_id: "fixture", task_id: id, track: "product", priority: "P0",
+    status, planned_role: "开发AI", eligible_role: role, eligible: allowed,
+    blockers, reason: blockers.join("；") || "候选状态已确认",
+    current_assignee: "", current_session_id: "",
+    first_detected_at: new Date(now).toISOString(),
+    last_confirmed_at: new Date(now).toISOString(),
+    expires_at: new Date(now + 10 * 60_000).toISOString(),
+    consumed_at: null, stale_at: null
+  });
+  const rows = [
+    entry("READY-OK", "待执行", "developer_ai", true),
+    entry("READY-STOP", "待执行", "developer_ai", false, ["存在stop_request"]),
+    entry("READY-DEP", "待执行", "developer_ai", false, ["前置未完成"]),
+    entry("LEGACY-DEV", "待开发", "developer_ai", true),
+    entry("CONTROLLER-DELIVERY", "待交付", "controller_ai", true),
+    entry("ROLE-MISMATCH", "待执行", "test_ai", true)
+  ];
+  await app.scanStore.writeState({
+    version: 1, updated_at: new Date(now).toISOString(),
+    candidates: Object.fromEntries(rows.map((row) => [row.detection_id, row]))
+  });
+  await app.scanStore.writeStatus({ state: "completed", last_scan_at: new Date(now).toISOString() });
+
+  const response = await fetch(base + "/api/task-scan/status");
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  const byId = new Map(body.developerCandidates.map((item) => [item.taskId, item]));
+  assert.deepEqual([...byId.keys()].sort(), ["LEGACY-DEV", "READY-DEP", "READY-OK", "READY-STOP"]);
+  assert.equal(byId.get("READY-OK").eligible, true);
+  assert.equal(byId.get("READY-OK").status, "待执行");
+  assert.equal(byId.get("READY-STOP").eligible, false);
+  assert.deepEqual(byId.get("READY-STOP").blockers, ["存在stop_request"]);
+  assert.deepEqual(byId.get("READY-DEP").blockers, ["前置未完成"]);
+  assert.equal(byId.has("CONTROLLER-DELIVERY"), false);
+  assert.equal(byId.has("ROLE-MISMATCH"), false);
+});
+
 
 test("browser admin can auto-adapt an incompatible project without overwriting legacy text", async (t) => {
   const { base, secret, fixture } = await startFixture(t);
