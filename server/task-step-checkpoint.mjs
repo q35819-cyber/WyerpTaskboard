@@ -27,6 +27,15 @@ const CLOSED = new Set(["已完成", "已取消"]);
 function invalid(code, message, status = 409) {
   return new TaskboardError(message, { code, status });
 }
+async function hardDependenciesCompleted(taskStore, projectId, task) {
+  const ids = String(task.readDependencies || "").split(/[；;]/)
+    .map((item) => item.replaceAll("`", "").trim().match(/^([A-Za-z0-9][A-Za-z0-9._-]{0,127})\s*完成$/)?.[1])
+    .filter(Boolean);
+  if (!ids.length) return true;
+  const snapshot = await taskStore.snapshot(projectId);
+  return ids.every((id) => snapshot.tasks.some((entry) =>
+    entry.id === id && entry.status === "已完成"));
+}
 function emptyState(projectId, taskId) {
   return {
     version: 1, projectId, taskId, flowVersion: "role-steps-v1",
@@ -137,10 +146,43 @@ export class TaskStepCheckpoint {
       if (previous.sha256 !== expectedSha256) {
         throw invalid("CHECKPOINT_REVISION_CONFLICT", "断点被其它角色更新，必须重新读取", 409);
       }
+      const history = await this.taskStore.taskHistory(projectId, taskId, { all: true });
+      const { task } = await this.taskStore.getTask(projectId, taskId);
+      const currentClaim = [...history].reverse().find((entry) =>
+        entry.actor_type === "developer_ai" && ["claim", "takeover"].includes(entry.event_type));
+      const currentClaimIndex = history.indexOf(currentClaim);
+      if (stepId === "D01_CLAIM" && state.cursors.developer_ai !== "D01_CLAIM") {
+        const lastFailIndex = history.findLastIndex((entry) =>
+          entry.event_type === "test_result" && entry.actor_type === "test_ai"
+          && entry.metadata?.atomicLifecycle === true && entry.metadata?.testResult === "fail"
+          && ["独测中", "复测中"].includes(entry.old_status)
+          && entry.new_status === "测试失败待修复");
+        const failed = history[lastFailIndex];
+        const latestQAClaim = lastFailIndex >= 0 && [...history.slice(0, lastFailIndex)].reverse().find((entry) =>
+          entry.actor_type === "test_ai" && ["claim", "takeover"].includes(entry.event_type));
+        const validFailure = failed && ["独测中", "复测中"].includes(failed.old_status)
+          && failed.new_status === "测试失败待修复" && failed.metadata?.reportPath
+          && latestQAClaim?.actor_id === failed.actor_id
+          && latestQAClaim?.session_id === failed.session_id;
+        const previouslyStarted = state.records.some((record) =>
+          record.stepId === "D01_CLAIM" && record.result === "PASS");
+        const alreadyRestarted = state.records.some((record) =>
+          record.stepId === "D01_CLAIM" && record.eventId === currentClaim?.event_id);
+        if (validFailure && previouslyStarted && !alreadyRestarted
+          && currentClaimIndex > lastFailIndex && currentClaim?.event_id === eventId
+          && currentClaim?.actor_id === actorId && currentClaim?.session_id === sessionId
+          && task.status === "修复中" && task.sessionId === sessionId
+          && !(await this.taskStore.stopState(projectId, taskId)).stopRequested) {
+          if (await hardDependenciesCompleted(this.taskStore, projectId, task)) {
+            if (state.records.some((entry) => entry.attempt === state.attempts)) state.attempts += 1;
+            state.cursors.developer_ai = "D01_CLAIM";
+            state.cursors.test_ai = "Q01_ADMISSION";
+          }
+        }
+      }
       if (state.cursors[actorType] !== stepId) {
         throw invalid("CHECKPOINT_STEP_ORDER", "上一步尚未通过，不得越级执行；请先读取唯一下一步");
       }
-      const history = await this.taskStore.taskHistory(projectId, taskId, { all: true });
       const authority = [...history].reverse().find((entry) =>
         entry.actor_type === actorType && ["claim", "takeover"].includes(entry.event_type));
       const lastTakeover = [...history].reverse().find((entry) =>
@@ -160,7 +202,20 @@ export class TaskStepCheckpoint {
       }
       const [index] = [steps.indexOf(stepId)];
       if (actorType === "developer_ai" && stepId === "D01_CLAIM"
-        && state.cursors.controller_ai !== null) throw invalid("CHECKPOINT_PREDECESSOR_REQUIRED", "总控未完成派工");
+        && state.cursors.controller_ai !== null) {
+        const claimIndex = history.findIndex((entry) =>
+          entry.event_id === eventId && entry.event_type === "claim"
+          && entry.actor_type === "developer_ai" && entry.actor_id === actorId
+          && entry.session_id === sessionId);
+        const dispatch = history.slice(0, Math.max(0, claimIndex)).some((entry) =>
+          entry.actor_type === "controller_ai" && /^controller_dispatch(?:_[a-z0-9_]+)?$/i.test(entry.event_type));
+        if (!dispatch || task.sessionId !== sessionId
+          || !["开发中", "修复中"].includes(task.status)
+          || (await this.taskStore.stopState(projectId, taskId)).stopRequested
+          || !(await hardDependenciesCompleted(this.taskStore, projectId, task))) {
+          throw invalid("CHECKPOINT_PREDECESSOR_REQUIRED", "总控未完成可信正式派工");
+        }
+      }
       if (actorType === "developer_ai" && stepId === "D09_MERGE_MAIN"
         && (!state.records.some((r) => r.stepId === "Q03_RESULT" && r.result === "PASS"
           && r.verdict === "pass" && r.attempt === state.attempts)
@@ -196,6 +251,27 @@ export class TaskStepCheckpoint {
         && (!["独测中", "复测中"].includes(event?.new_status)
           || (authority && event?.event_id !== authority.event_id))) {
         throw invalid("CHECKPOINT_FORMAL_EVENT_REQUIRED", "独测准入必须关联最新有效认领事件");
+      }
+      if (result === "PASS" && stepId === "Q01_ADMISSION" && task.status === "复测中") {
+        const claimIndex = history.indexOf(event);
+        const failIndex = history.findLastIndex((entry, index) => index < claimIndex
+          && entry.event_type === "test_result" && entry.actor_type === "test_ai"
+          && entry.metadata?.atomicLifecycle === true && entry.metadata?.testResult === "fail"
+          && entry.new_status === "测试失败待修复");
+        if (failIndex >= 0) {
+          const repaired = [...history.slice(failIndex + 1, claimIndex)].reverse().find((entry) =>
+            entry.event_type === "handoff" && entry.actor_type === "developer_ai"
+            && entry.metadata?.atomicLifecycle === true && entry.new_status === "待复测");
+          if (!repaired) throw invalid("CHECKPOINT_PREDECESSOR_REQUIRED", "旧独测FAIL后缺少真实修复交接");
+          const priorHandoff = [...history.slice(0, failIndex)].reverse().find((entry) =>
+            entry.event_type === "handoff" && entry.actor_type === "developer_ai");
+          const oldSha = String(history[failIndex].metadata?.commitSha || priorHandoff?.metadata?.commitSha || "");
+          const newSha = String(repaired.metadata?.commitSha || "");
+          if (/^[a-f0-9]{40}$/i.test(oldSha) && /^[a-f0-9]{40}$/i.test(newSha)
+            && oldSha.toLowerCase() === newSha.toLowerCase()) {
+            throw invalid("CHECKPOINT_CANDIDATE_UNCHANGED", "独测FAIL后未更换候选Git SHA");
+          }
+        }
       }
       if (result === "PASS" && stepId === "D08_HANDOFF" && !["待独测", "待复测"].includes(event?.new_status)) {
         throw invalid("CHECKPOINT_FORMAL_EVENT_REQUIRED", "未真实进入独测队列");
