@@ -34,6 +34,71 @@ export class TaskScanner {
     return this;
   }
 
+
+  // Called only by an already-awake role after releasing its previous task.
+  // Returns a candidate; the caller still must pass guard/preclaim/claim.
+  async nextForRole({ projectId, actorType, actorId, sessionId,
+    completedTaskId = "", excludeTaskIds = [] } = {}) {
+    if (!projectId || !["developer_ai", "test_ai", "controller_ai"].includes(actorType)
+      || !actorId || !sessionId || !Array.isArray(excludeTaskIds)
+      || excludeTaskIds.some((id) => typeof id !== "string" || !id.trim())) {
+      throw new TypeError("projectId, actorType, actorId, sessionId and valid excludeTaskIds are required");
+    }
+    if (!this.evaluator) await this.init();
+    const result = await this.evaluator.evaluateProject(projectId);
+    const excluded = new Set([completedTaskId, ...excludeTaskIds].filter(Boolean));
+    const rank = (candidate) => actorType === "test_ai"
+      ? (candidate.status === "待复测" ? 0 : 1)
+      : actorType === "controller_ai" ? 0
+        : candidate.status === "测试失败待修复" ? 0
+          : candidate.status === "待开发" ? 1 : 2;
+    const candidates = result.candidates.filter((candidate) =>
+      actorType === "controller_ai" ? candidate.status === "待交付"
+        : candidate.eligible_role === actorType && candidate.status !== "待交付")
+      .sort((a, b) => Number(b.eligible) - Number(a.eligible)
+        || rank(a) - rank(b)
+        || ({ P0: 0, P1: 1, P2: 2 }[a.priority] ?? 9)
+          - ({ P0: 0, P1: 1, P2: 2 }[b.priority] ?? 9)
+        || a.task_id.localeCompare(b.task_id));
+    const skipped = candidates.filter((candidate) => !candidate.eligible).map((candidate) => ({
+      task_id: candidate.task_id,
+      reason: candidate.blockers.join("；") || "not_eligible"
+    }));
+    for (const candidate of candidates) {
+      if (excluded.has(candidate.task_id)) {
+        skipped.push({ task_id: candidate.task_id, reason: "previous_task_or_claim_409" });
+        continue;
+      }
+      if (!candidate.eligible) continue;
+      const stop = await this.taskStore.stopState(projectId, candidate.task_id);
+      if (stop.stopRequested) {
+        skipped.push({ task_id: candidate.task_id, reason: "stop_requested" });
+        continue;
+      }
+      let checked;
+      try { checked = await this.evaluator.recheck(candidate); }
+      catch (error) {
+        skipped.push({ task_id: candidate.task_id, reason: error.code || "recheck_failed" });
+        continue;
+      }
+      if (!checked.ok) {
+        skipped.push({ task_id: candidate.task_id, reason: "candidate_stale_409",
+          mismatches: checked.mismatches || [] });
+        continue;
+      }
+      return {
+        state: "next_available", project_id: projectId, role: actorType,
+        task_id: candidate.task_id, candidate, skipped,
+        next_action: "guard_preclaim_claim", auto_wake: false
+      };
+    }
+    return {
+      state: "none", project_id: projectId, role: actorType,
+      reason: candidates.length ? "all_candidates_blocked" : "no_role_candidates",
+      skipped, auto_wake: false
+    };
+  }
+
   async scanOnce({ trigger = "manual" } = {}) {
     if (!this.evaluator) await this.init();
     this.aiExecutionSettings ||= await new AiExecutionSettingsStore(this.rootDir).init();

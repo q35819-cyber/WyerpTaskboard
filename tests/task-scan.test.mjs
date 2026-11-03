@@ -634,3 +634,129 @@ test("unrelated registry changes keep detection_id stable and refresh recheck tr
   const recheck = await new CandidateEvaluator(fixture.boardRoot, { taskStore, requirementStore }).recheck(second);
   assert.equal(recheck.stale, false);
 });
+
+test("R1 same awake role gets its next real candidate without notifying or claiming another AI", async (t) => {
+  const fixture = await fixtureWithLedger(t);
+  const taskStore = await new TaskStore(fixture.boardRoot).init();
+  const requirementStore = await new RequirementStore(fixture.boardRoot).init();
+  const scanStore = await new ScanStore(fixture.boardRoot).init();
+  let wakeCalls = 0;
+  const scanner = await new TaskScanner(fixture.boardRoot, {
+    taskStore, requirementStore, scanStore,
+    wakeBridge: { notifyCandidate: async () => { wakeCalls++; throw Error("unexpected AI wake"); } }
+  }).init();
+  const developer = await scanner.nextForRole({
+    projectId: "fixture", actorType: "developer_ai", actorId: "dev-1",
+    sessionId: "dev-session", completedTaskId: "B-10"
+  });
+  assert.equal(developer.state, "next_available");
+  assert.equal(developer.task_id, "A-10");
+  assert.equal(developer.next_action, "guard_preclaim_claim");
+  assert.equal(developer.auto_wake, false);
+  const tester = await scanner.nextForRole({
+    projectId: "fixture", actorType: "test_ai", actorId: "qa-1",
+    sessionId: "qa-session", completedTaskId: "A-10"
+  });
+  assert.equal(tester.task_id, "T-01");
+  assert.equal(wakeCalls, 0);
+  assert.equal((await taskStore.getTask("fixture", "A-10")).task.status, "待开发");
+  assert.equal((await taskStore.getTask("fixture", "T-01")).task.status, "待独测");
+});
+
+test("R2 known claim 409, changed candidates and STOP are skipped without taking ownership", async (t) => {
+  const fixture = await fixtureWithLedger(t);
+  const rows = [
+    ["A-10", "F-A", "product", "P0", "待开发", "开发AI", "—", "—", "—",
+      "2026-09-29T00:00:00Z", "第一项", "测试计划.md", "cp/A-10.md"],
+    ["C-10", "F-C", "product", "P1", "待开发", "开发AI", "—", "—", "—",
+      "2026-09-29T00:00:00Z", "第二项", "测试计划.md", "cp/C-10.md"]
+  ];
+  await fs.writeFile(fixture.registryPath, registryText(rows), "utf8");
+  const taskStore = await new TaskStore(fixture.boardRoot).init();
+  const scanner = await new TaskScanner(fixture.boardRoot, {
+    taskStore, requirementStore: await new RequirementStore(fixture.boardRoot).init(),
+    scanStore: await new ScanStore(fixture.boardRoot).init()
+  }).init();
+  const args = { projectId: "fixture", actorType: "developer_ai",
+    actorId: "dev-next", sessionId: "dev-next-session" };
+  const conflict = await scanner.nextForRole({ ...args, excludeTaskIds: ["A-10"] });
+  assert.equal(conflict.task_id, "C-10");
+  assert.deepEqual(conflict.skipped.map((x) => x.reason), ["previous_task_or_claim_409"]);
+  const originalRecheck = scanner.evaluator.recheck.bind(scanner.evaluator);
+  scanner.evaluator.recheck = async (candidate) => candidate.task_id === "A-10"
+    ? { ok: false, stale: true, mismatches: ["registry_revision_changed"] }
+    : originalRecheck(candidate);
+  const stale = await scanner.nextForRole(args);
+  assert.equal(stale.task_id, "C-10");
+  assert.equal(stale.skipped[0].reason, "candidate_stale_409");
+  scanner.evaluator.recheck = originalRecheck;
+  await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.next.stop.request.001", eventType: "stop_request",
+    actorType: "user", actorId: "user", note: "停止第一个候选"
+  });
+  const stopped = await scanner.nextForRole(args);
+  assert.equal(stopped.task_id, "C-10");
+  assert.ok(stopped.skipped.some((x) => x.task_id === "A-10" && /stop/i.test(x.reason)));
+  assert.equal((await taskStore.getTask("fixture", "A-10")).task.status, "待开发");
+});
+
+test("R2 all hard-blocked or invalid role inputs return transparent reasons", async (t) => {
+  const fixture = await fixtureWithLedger(t);
+  await fs.writeFile(fixture.registryPath, registryText([
+    ["A-10","F-A","infrastructure","P0","待准备","开发AI","—","—","—",
+      "2026-09-29T00:00:00Z","必须等前置任务","测试计划.md","trace/A.md",
+      "UPSTREAM-MISSING完成","src/a.js","cp/A-10.md"]
+  ]), "utf8");
+  const scanner = await new TaskScanner(fixture.boardRoot).init();
+  const args = { projectId: "fixture", actorType: "developer_ai", actorId: "dev",
+    sessionId: "session" };
+  const none = await scanner.nextForRole(args);
+  assert.equal(none.state, "none");
+  assert.equal(none.reason, "all_candidates_blocked");
+  assert.ok(none.skipped.some((x) => /前置任务.*未登记/.test(x.reason)));
+  assert.equal(none.auto_wake, false);
+  assert.equal((await scanner.nextForRole({ ...args, actorType: "test_ai" })).reason, "no_role_candidates");
+  await assert.rejects(scanner.nextForRole({ ...args, actorType: "unexpected" }), TypeError);
+  await assert.rejects(scanner.nextForRole({ ...args, excludeTaskIds: [null] }), TypeError);
+});
+
+test("R3 controller receives real independent PASS delivery, not developer or unverified delivery", async (t) => {
+  const fixture = await fixtureWithLedger(t);
+  await fs.writeFile(fixture.registryPath, registryText([
+    ["DELIVERY-10","F-D","infrastructure","P0","待交付","总控AI","—","—","—",
+      "2026-09-29T00:00:00Z","等待正式总控交付","测试计划.md",
+      "trace/D.md","read/D.md","src/delivery.js","cp/DELIVERY-10.md"]
+  ]), "utf8");
+  const store = await new TaskStore(fixture.boardRoot).init();
+  const scanner = await new TaskScanner(fixture.boardRoot, {
+    taskStore: store, requirementStore: await new RequirementStore(fixture.boardRoot).init(),
+    scanStore: await new ScanStore(fixture.boardRoot).init()
+  }).init();
+  const controller = { projectId: "fixture", actorType: "controller_ai",
+    actorId: "controller", sessionId: "controller-session" };
+  const blocked = await scanner.nextForRole(controller);
+  assert.equal(blocked.state, "none");
+  assert.equal(blocked.reason, "all_candidates_blocked");
+  await store.appendTaskEvent("fixture", "DELIVERY-10", {
+    operationId: "next.delivery.handoff", eventType: "handoff", actorType: "developer_ai",
+    actorId: "dev", sessionId: "dev-session",
+    metadata: { atomicLifecycle: true, completedFromStatus: "开发中", handoffTarget: "待独测" }
+  });
+  await store.appendTaskEvent("fixture", "DELIVERY-10", {
+    operationId: "next.delivery.qa.claim", eventType: "claim", actorType: "test_ai",
+    actorId: "qa", sessionId: "qa-session", metadata: { claimedFromStatus: "待独测" }
+  });
+  await store.appendTaskEvent("fixture", "DELIVERY-10", {
+    operationId: "next.delivery.qa.pass", eventType: "test_result",
+    actorType: "test_ai", actorId: "qa", sessionId: "qa-session",
+    metadata: { atomicLifecycle: true, testResult: "pass", deliveryDisposition: "required",
+      deliveryActions: ["candidate_merge"], commitSha: "a".repeat(40),
+      headBranch: "feature/delivery", handoffTarget: "待交付" }
+  });
+  const next = await scanner.nextForRole(controller);
+  assert.equal(next.task_id, "DELIVERY-10");
+  assert.equal(next.role, "controller_ai");
+  assert.equal(next.auto_wake, false);
+  assert.equal((await scanner.nextForRole({ ...controller, actorType: "developer_ai" })).reason,
+    "no_role_candidates");
+});
