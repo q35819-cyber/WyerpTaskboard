@@ -24,5 +24,10 @@ jobs:
           node-version: '24'
       - name: Check syntax
         run: npm run check
+      - name: Prepare disposable service configuration
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path config -Force | Out-Null
+          '{"version":1,"projects":[]}' | Set-Content -Path config/projects.json -Encoding utf8NoBOM
       - name: Run project tests
         run: npm test
