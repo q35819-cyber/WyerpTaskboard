@@ -7,7 +7,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { ServiceController } from "../server/service-control.mjs";
 
-const root = "D:\\WyerpTaskboard";
+const root = path.resolve(import.meta.dirname, "..");
 const testRuntime = await fs.mkdtemp(path.join(os.tmpdir(), "wyerp-taskboard-service-control-"));
 const instancePath = path.join(testRuntime, "instance.json");
 

@@ -1,0 +1,54 @@
+name: Quality Gates
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality-gates:
+    name: quality-gates
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+      - name: Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Check syntax
+        run: npm run check
+      - name: Prepare disposable service configuration
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path config -Force | Out-Null
+          '{"version":1,"projects":[]}' | Set-Content -Path config/projects.json -Encoding utf8NoBOM
+          $wakeConfig = @{ version = 1; enabled = $false; token = (([guid]::NewGuid().ToString('N')) + ([guid]::NewGuid().ToString('N'))); expected_extension_version = 'ci-disabled' }
+          $wakeConfig | ConvertTo-Json -Compress | Set-Content -Path config/chat-browser-wake.json -Encoding utf8NoBOM
+      - name: Validate Windows service startup early
+        run: node --test tests/service-control.test.mjs
+      - name: Show sanitized Windows service startup error
+        if: failure()
+        shell: pwsh
+        run: |
+          $log = 'data/logs/service.stderr.log'
+          if (Test-Path $log) {
+            Get-Content $log -Tail 45 | ForEach-Object {
+              if ($_ -match '(?i)token|secret|password|authorization|cookie|api.?key') { '[redacted]' }
+              else { $_ }
+            }
+          }
+          else { 'No service stderr log was generated' }
+      - name: Diagnose server initialization on test failure
+        if: failure()
+        shell: pwsh
+        run: |
+          node --input-type=module -e "import { createTaskboardServer } from './server/http-server.mjs'; await createTaskboardServer({ rootDir: process.cwd() }); console.log('Server init passed')"
+      - name: Run project tests
+        run: npm test
