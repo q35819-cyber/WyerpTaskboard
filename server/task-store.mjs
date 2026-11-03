@@ -176,6 +176,77 @@ async function assertDeveloperClaimExclusive(store, projectId, context, parsed, 
     }
   }
 }
+
+const TEMPORARY_RESTORE = new Map([
+  ["待准备", "待准备"], ["待开发", "待开发"], ["开发中", "待开发"],
+  ["待独测", "待独测"], ["独测中", "待独测"],
+  ["待复测", "待复测"], ["复测中", "待复测"]
+]);
+async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) {
+  if (task.status !== "阻断" || task.assignee || task.sessionId) return null;
+  const history = await store.events.listTaskEvents(projectId, task.id, { all: true });
+  const blocked = [...history].reverse().find((event) =>
+    event.old_status !== "阻断" && event.new_status === "阻断");
+  if (blocked?.event_type !== "temporary_block" || blocked.actor_type !== "system") return null;
+  const target = TEMPORARY_RESTORE.get(blocked.old_status);
+  const conditions = blocked.metadata?.conditions;
+  if (!target || !Array.isArray(conditions) || !conditions.length || conditions.length > 8) return null;
+  if ((await store.stopState(projectId, task.id)).stopRequested) return null;
+  const lastFailure = history.findLastIndex((event) =>
+    event.event_type === "test_result" && event.metadata?.testResult === "fail");
+  const lastHandoff = history.findLastIndex((event) =>
+    event.event_type === "handoff" && event.actor_type === "developer_ai");
+  if (lastFailure > lastHandoff) return null;
+  if (["待独测", "待复测"].includes(target)) {
+    const handoff = history[lastHandoff];
+    if (!handoff || handoff.new_status !== target || handoff.metadata?.atomicLifecycle !== true ||
+      history.slice(lastHandoff + 1).some((event) =>
+        event.event_type === "code_change" || event.metadata?.invalidatesTestEvidence === true)) return null;
+  }
+  const byId = new Map(tasks.map((item) => [item.id, item]));
+  const dependencies = String(task.readDependencies || "").split(/[；;]/)
+    .map((item) => item.trim().replaceAll("`", ""));
+  for (const condition of conditions) {
+    if (!condition || typeof condition !== "object") return null;
+    if (condition.kind === "dependency_completed") {
+      if (!dependencies.includes(condition.taskId + "完成") ||
+        byId.get(condition.taskId)?.status !== "已完成") return null;
+    } else if (condition.kind === "owner_released") {
+      const other = byId.get(condition.taskId);
+      if (!other || other.id === task.id || !condition.sessionId || other.assignee || other.sessionId) return null;
+      const events = await store.events.listTaskEvents(projectId, other.id, { all: true });
+      const claim = events.findLastIndex((event) =>
+        event.event_type === "claim" && event.session_id === condition.sessionId);
+      if (claim < 0 || !events.slice(claim + 1).some((event) =>
+        ["handoff", "release", "test_result"].includes(event.event_type) &&
+        event.session_id === condition.sessionId)) return null;
+    } else if (condition.kind === "required_file_exists") {
+      if (typeof condition.path !== "string" || !dependencies.includes(condition.path)) return null;
+      try {
+        const found = await resolveProjectPath(context.rootRealPath, condition.path, {
+          mustExist: true, rejectReparse: true
+        });
+        if (!(await fs.stat(found)).isFile()) return null;
+      } catch { return null; }
+    } else return null;
+  }
+  if (["待准备", "待开发"].includes(target)) {
+    try {
+      await assertDeveloperClaimExclusive(store, projectId, context, { tasks }, task,
+        "task-scan", "auto-unblock");
+    } catch (error) {
+      if (["CLAIM_WRITE_CONFLICT", "CLAIM_DEVELOPER_BUSY"].includes(error.code)) return null;
+      throw error;
+    }
+  }
+  return { target, blockedEventId: blocked.event_id };
+}
+
+function autoUnblockOperationId(projectId, taskId, blockedEventId) {
+  return "auto_unblock." + crypto.createHash("sha256")
+    .update(projectId + "|" + taskId + "|" + blockedEventId).digest("hex");
+}
+
 async function runGit(root, args) {
   try {
     const result = await execFileAsync("git", ["-C", root, ...args], {
@@ -544,6 +615,51 @@ export class TaskStore {
     };
   }
 
+  async autoRestoreTemporaryBlocks(projectId) {
+    const context = await this.projects.context(projectId);
+    const before = await context.adapter.readMarkdownTaskRegistry(context.registryPath, context.project);
+    const history = await this.events.listProjectTaskEvents(projectId, before.tasks.map((task) => task.id), { all: true });
+    for (const task of before.tasks) {
+      const blocked = [...(history.get(task.id) || [])].reverse().find((event) =>
+        event.old_status !== "阻断" && event.new_status === "阻断");
+      if (blocked?.event_type !== "temporary_block") continue;
+      const operationId = autoUnblockOperationId(projectId, task.id, blocked.event_id);
+      const transaction = await this.transactions.read(operationId);
+      if (!transaction || ["committed", "aborted_no_effect"].includes(transaction.state)) continue;
+      await withProjectLock(this.rootDir, projectId, operationId, async () => {
+        const pending = await this.transactions.read(operationId);
+        if (pending && !["committed", "aborted_no_effect"].includes(pending.state)) {
+          const recovered = await this.recoverTransaction(pending);
+          if (recovered.action === "inconsistent") throw new TaskboardError("自动解阻事务不一致", {
+            code: "AUTO_UNBLOCK_RECOVERY_INCONSISTENT", status: 409
+          });
+        }
+      });
+    }
+    const parsed = await context.adapter.readMarkdownTaskRegistry(context.registryPath, context.project);
+    const restored = [];
+    for (const task of parsed.tasks) {
+      const eligible = await eligibleTemporaryUnblock(this, projectId, task, parsed.tasks, context);
+      if (!eligible) continue;
+      const { snapshot } = await this.getTask(projectId, task.id);
+      const operationId = autoUnblockOperationId(projectId, task.id, eligible.blockedEventId);
+      try {
+        const result = await this.updateTask(projectId, task.id, {
+          status: eligible.target, assignee: "", sessionId: "", sessionWindowName: ""
+        }, {
+          operationId, expectedRevision: snapshot.registryRevision,
+          eventType: "auto_unblock", actorType: "system", actorId: "task-scan",
+          note: "可信临时阻断条件已重新验证并自动恢复原合法阶段",
+          metadata: { blockedEventId: eligible.blockedEventId, restoreStatus: eligible.target }
+        });
+        if (!result.idempotentReplay) restored.push(task.id);
+      } catch (error) {
+        if (!["REVISION_CONFLICT", "AUTO_UNBLOCK_NOT_READY", "PROJECT_LOCKED"].includes(error.code)) throw error;
+      }
+    }
+    return restored;
+  }
+
   async updateTask(projectId, taskId, patch, {
     expectedRevision,
     operationId,
@@ -593,6 +709,15 @@ export class TaskStore {
 
       const currentTask = parsed.tasks.find((item) => item.id === taskId);
       if (!currentTask) throw new TaskboardError("未知任务ID: " + taskId, { code: "TASK_NOT_FOUND", status: 404 });
+      if (eventType === "auto_unblock") {
+        const allowed = await eligibleTemporaryUnblock(this, projectId, currentTask, parsed.tasks, context);
+        if (actorType !== "system" || !allowed || patch.status !== allowed.target ||
+          metadata?.blockedEventId !== allowed.blockedEventId) {
+          throw new TaskboardError("临时阻断未满足机器核验条件", {
+            code: "AUTO_UNBLOCK_NOT_READY", status: 409
+          });
+        }
+      }
       if (eventType === "claim" && actorType === "developer_ai") {
         await assertDeveloperClaimExclusive(this, projectId, context, parsed, currentTask, actorId, sessionId);
       }
