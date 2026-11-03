@@ -6,12 +6,20 @@ import { createTaskboardServer } from "../server/http-server.mjs";
 import { makeFixture } from "./helpers.mjs";
 const URL_PATH="/api/erp-release/pass/verify";
 const PASS_TOKEN="t".repeat(48);
-async function service(t,options={}){
+async function service(t,options={},probe=fetch){
  const fixture=await makeFixture();
  const app=await createTaskboardServer({rootDir:fixture.boardRoot,host:"127.0.0.1",port:0,erpPassGateOptions:options});
- await new Promise(resolve=>app.server.listen(0,"127.0.0.1",resolve));
- t.after(async()=>{await new Promise(resolve=>app.server.close(resolve));await fs.rm(fixture.boardRoot,{recursive:true,force:true});});
- const base="http://127.0.0.1:"+app.server.address().port;
+ t.after(async()=>{if(app.server.listening)await new Promise(resolve=>app.server.close(resolve));await fs.rm(fixture.boardRoot,{recursive:true,force:true});});
+ let base;
+ for(let attempt=0;attempt<10;attempt++){
+  await new Promise(resolve=>app.server.listen(0,"127.0.0.1",resolve));
+  base="http://127.0.0.1:"+app.server.address().port;
+  try{await probe(base+"/api/auth/session");break;}
+  catch(error){
+   await new Promise(resolve=>app.server.close(resolve));
+   if(error?.cause?.message!=="bad port"||attempt===9)throw error;
+  }
+ }
  const secret=JSON.parse(await fs.readFile(path.join(fixture.boardRoot,"config","admin-secret.json"),"utf8")).adminSecret;
  return {base,secret,app};
 }
@@ -39,4 +47,26 @@ test("local browser retry requires same-origin user access but no CSRF token",as
   assert.equal(r.status,400);
  r=await fetch(x.base+"/api/erp-release/pass/retry",{method:"POST",headers:{Origin:x.base,"Content-Type":"application/json"},body:JSON.stringify({evidence_id:"evt_"+"a".repeat(24)})});
  assert.equal(r.status,409);
+});
+test("fixture retries only fetch-forbidden ports and preserves other network failures",async t=>{
+ const restricted=()=>new TypeError("fetch failed",{cause:new Error("bad port")});
+ let attempts=0;
+ const allowed=await service(t,{},async url=>{
+  if(++attempts===1)throw restricted();
+  return fetch(url);
+ });
+ assert.ok(attempts>=2&&attempts<=10);
+ assert.equal((await fetch(allowed.base+"/api/auth/session")).status,200);
+ let otherErrors=0;
+ await assert.rejects(service(t,{},async()=>{
+  otherErrors++;
+  throw new TypeError("fetch failed",{cause:new Error("ECONNREFUSED")});
+ }),error=>error.cause?.message==="ECONNREFUSED");
+ assert.equal(otherErrors,1);
+ let exhausted=0;
+ await assert.rejects(service(t,{},async()=>{
+  exhausted++;
+  throw restricted();
+ }),error=>error.cause?.message==="bad port");
+ assert.equal(exhausted,10);
 });
