@@ -47,6 +47,61 @@ test("ready queue UI fails closed on STOP, stale/missing candidates and keeps bl
   assert.equal(ready({...task,plannedRole:"总控AI"}),false);
 });
 
+test("ready column derives fresh developer eligibility and separates QA, delivery across changes", async () => {
+  const [{ wyerpAiFlowV1: flow }, source] = await Promise.all([
+    import("../server/workflows/wyerp-ai-flow-v1.mjs"),
+    fs.readFile(path.resolve(import.meta.dirname, "..", "web", "app.js"), "utf8")
+  ]);
+  const readySource=source.match(/function isReadyTask\(task\)\{[\s\S]*?\n\}/)?.[0];
+  const boardSource=source.match(/function boardTasksForColumn\(column\)\{[\s\S]*?\n\}/)?.[0];
+  assert.ok(readySource && boardSource);
+  const task=(id,status,role="开发AI")=>({id,status,plannedRole:role,assignee:"",sessionId:""});
+  const A=task("A","待开发"),B=task("B","待开发"),C=task("C","待准备");
+  const QA=task("QA","待独测","独立测试AI"),RE=task("RE","待复测","独立测试AI");
+  const DEL=task("DEL","待交付","总控AI");
+  const state={projectId:"fixture",filtered:[A,B,C,QA,RE,DEL],scanStatus:{
+    scan:{last_scan_at:new Date().toISOString()},
+    developerCandidates:[
+      {projectId:"fixture",taskId:"A",status:"待开发",eligible:true,blockers:[]},
+      {projectId:"fixture",taskId:"B",status:"待开发",eligible:false,blockers:["A前置未完成"]},
+      {projectId:"fixture",taskId:"C",status:"待准备",eligible:true,blockers:[]}
+    ]
+  }};
+  const candidate=(t)=>state.scanStatus.developerCandidates.find(x=>x.projectId===state.projectId&&x.taskId===t.id)||null;
+  const ready=new Function("state","developerCandidateFor",readySource+"\nreturn isReadyTask;")(state,candidate);
+  const board=new Function("state","developerCandidateFor","isReadyTask","tasksForColumn",boardSource+"\nreturn boardTasksForColumn;")(
+    state,candidate,ready,(tasks,statuses)=>tasks.filter(t=>statuses.includes(t.status)));
+  const get=(id)=>board(flow.boardColumns.find(c=>c.id===id)).map(t=>t.id);
+  assert.deepEqual(get("awaiting_work"),["A","C"]);
+  assert.deepEqual(get("qa_pending"),["QA","RE"]);
+  assert.deepEqual(get("awaiting_delivery_user"),["DEL"]);
+  assert.deepEqual(get("todo"),["B"]);
+  assert.equal(state.filtered.filter(ready).length,2);
+  // A was completed; B's dependency is now fulfilled, C is already claimed.
+  A.status="已完成";
+  B.status="待开发";
+  C.status="开发中";
+  C.assignee="another-developer";
+  state.scanStatus.developerCandidates=[
+    {projectId:"fixture",taskId:"B",status:"待开发",eligible:true,blockers:[]}
+  ];
+  assert.deepEqual(get("awaiting_work"),["B"]);
+  assert.deepEqual(get("qa_pending"),["QA","RE"]);
+  assert.equal(state.filtered.filter(ready).length,1);
+  state.scanStatus.scan.last_scan_at=new Date(Date.now()-31*60*1000).toISOString();
+  assert.deepEqual(get("awaiting_work"),[]);
+  assert.deepEqual(get("todo"),["B"]);
+  assert.deepEqual(get("qa_pending"),["QA","RE"]);
+  assert.equal(state.filtered.filter(ready).length,0);
+  // Each task belongs to exactly one visible column; projection never mutates persisted status.
+  const all=flow.boardColumns.flatMap(c=>get(c.id));
+  assert.equal(all.length,state.filtered.length);
+  assert.equal(new Set(all).size,all.length);
+  assert.equal(B.status,"待开发");
+  assert.equal(QA.status,"待独测");
+  assert.equal(RE.status,"待复测");
+});
+
 test("scheduled dispatcher scans busy or idle mode only when due", async (t) => {
   const dir = await root(t);
   let now = Date.parse("2026-09-29T00:00:00Z");

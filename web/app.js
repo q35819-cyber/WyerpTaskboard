@@ -176,7 +176,7 @@ function isReadyTask(task){
 function boardTasksForColumn(column){
   if(column.id==="awaiting_work"){
     const order=new Map((state.scanStatus?.developerCandidates||[]).filter(item=>item.projectId===state.projectId).map((item,index)=>[item.taskId,index]));
-    return state.filtered.filter(task=>isReadyTask(task)||["待独测","待复测"].includes(task.status)).sort((a,b)=>
+    return state.filtered.filter(isReadyTask).sort((a,b)=>
       (order.get(a.id)??99999)-(order.get(b.id)??99999)||String(a.id).localeCompare(String(b.id)));
   }
   const tasks=tasksForColumn(state.filtered,column.statuses);

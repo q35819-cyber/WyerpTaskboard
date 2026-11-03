@@ -17,6 +17,7 @@ test("ready-to-run state is claimable while legacy pending states remain support
   },{eventType:"claim",actorType:"developer_ai",sessionId:"dev-session"});
   assert.equal(next.plannedRole,"开发AI");
   assert.equal(workflow.boardColumns.find(x=>x.id==="awaiting_work").title,"待执行");
+  assert.deepEqual(workflow.boardColumns.find(x=>x.id==="qa_pending").statuses,["待独测","待复测"]);
 });
 
 test("wyerp-ai-flow-v1 accepts product, bugfix and infrastructure tracks", () => {

@@ -60,10 +60,10 @@
 
 
 /* 2026-09-28 恢复直接进度列排版；计划只作为筛选/标签，不再拆分主看板 */
-.board{display:grid;grid-template-columns:repeat(6,minmax(245px,1fr));gap:12px;overflow-x:auto;padding:0 28px 30px;align-items:start}
+.board{display:grid;grid-template-columns:repeat(7,minmax(245px,1fr));gap:12px;overflow-x:auto;padding:0 28px 30px;align-items:start}
 .board-column{min-height:200px}
 .column-empty{padding:18px 8px;text-align:center;color:#98a2b3;font-size:12px}
-@media(max-width:900px){.board{grid-template-columns:repeat(6,80vw)}}
+@media(max-width:900px){.board{grid-template-columns:repeat(7,80vw)}}
 .ai-reply{margin-top:9px;padding:9px 10px;border-radius:7px;background:#eff8ff;border:1px solid #b2ddff;color:#175cd3;font-weight:600}
 .ai-reply-head{margin-bottom:4px;font-size:11px;color:#026aa2;font-weight:800}
 .history-item.user-accept-event{border-left-color:#12b76a;background:#ecfdf3;color:#027a48}
