@@ -43,5 +43,10 @@ jobs:
             }
           }
           else { 'No service stderr log was generated' }
+      - name: Diagnose server initialization on test failure
+        if: failure()
+        shell: pwsh
+        run: |
+          node --input-type=module -e "import { createTaskboardServer } from './server/http-server.mjs'; await createTaskboardServer({ rootDir: process.cwd() }); console.log('Server init passed')"
       - name: Run project tests
         run: npm test
