@@ -14,7 +14,7 @@ test("projects config ACL removes inheritance and Authenticated Users modify acc
   const file = path.join(dir, "projects.json");
   await fs.writeFile(file, '{"version":1,"projects":[]}', "utf8");
 
-  const script = "D:\\WyerpTaskboard\\scripts\\harden-config-acl.ps1";
+  const script = path.resolve(import.meta.dirname, "..", "scripts", "harden-config-acl.ps1");
   const hardened = await execFileAsync("powershell.exe", [
     "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
     "-File", script, "-PathValue", file
