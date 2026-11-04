@@ -284,9 +284,9 @@ export class TaskStepCheckpoint {
           (e) => e.actor_type === "test_ai" && ["claim", "takeover"].includes(e.event_type));
         const between = history.slice(verdictIndex + 1, qaIndex);
         const restored = between.some((e) => e.actor_type === "controller_ai"
-          && e.event_type.startsWith("controller_")
+          && typeof e.event_type === "string" && e.event_type.startsWith("controller_")
           && e.old_status === "阻断" && e.new_status === "待复测");
-        const failedDelivery = between.some((e) => e.event_type.startsWith("controller_")
+        const failedDelivery = between.some((e) => typeof e.event_type === "string" && e.event_type.startsWith("controller_")
           && ["待交付", "交付中"].includes(e.old_status) && e.new_status === "阻断");
         const repair = [...between].reverse().find((e) => e.actor_type === "developer_ai"
           && e.event_type === "handoff" && e.old_status === "修复中"
