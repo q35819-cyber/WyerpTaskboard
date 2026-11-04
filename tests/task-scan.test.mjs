@@ -46,6 +46,58 @@ test("scanner returns current awake role candidate and never claims or wakes", a
   t.after(() => fs.rm(fixture.boardRoot, { recursive: true, force: true }));
 });
 
+test("D09 prefers original developer failure and never selects controller delivery", () => {
+  const data = [
+    { task_id: "P0-READY", status: "待开发", priority: "P0", eligible_role: "developer_ai", eligible: true },
+    { task_id: "P1-FAIL", status: "测试失败待修复", priority: "P1", eligible_role: "developer_ai", eligible: true },
+    { task_id: "DELIVERY", status: "待交付", priority: "P0", eligible_role: "developer_ai", eligible: true }
+  ];
+  const result = nextRoleCandidate(data, { role: "developer_ai", actorId: "dev", sessionId: "session" });
+  assert.equal(result.candidate.task_id, "P1-FAIL");
+  assert.equal(nextRoleCandidate(data, { role: "developer_ai", actorId: "dev", sessionId: "session",
+    attemptedTaskIds: ["P0-READY", "P1-FAIL"] }).state, "exhausted");
+});
+
+test("D09 skips a raced 409 and demands a fresh chat report before the next claim", async t => {
+  const fixture = await fixtureWithLedger(t);
+  const rows = [
+    ["DEV-A", "F-A", "product", "P0", "待开发", "开发AI", "—", "—", "—", "—",
+      "first", "测试计划.md", "cp/DEV-A.md"],
+    ["DEV-B", "F-B", "product", "P1", "待开发", "开发AI", "—", "—", "—", "—",
+      "second", "测试计划.md", "cp/DEV-B.md"]
+  ];
+  await fs.writeFile(fixture.registryPath, registryText(rows), "utf8");
+  const scanner = await new TaskScanner(fixture.boardRoot).init();
+  const me = { projectId: "fixture", actorId: "developer", sessionId: "session-developer" };
+  let calls = 0;
+  const claimCandidate = async candidate => {
+    calls++;
+    if (candidate.task_id === "DEV-A")
+      throw Object.assign(Error("race"), { status: 409, code: "TASK_ALREADY_OCCUPIED" });
+    const snapshot = await scanner.taskStore.snapshot("fixture");
+    return scanner.taskStore.updateTask("fixture", "DEV-B", {
+      status: "开发中", assignee: "developer", sessionWindowName: "dev",
+      sessionId: me.sessionId
+    }, { expectedRevision: snapshot.registryRevision,
+      operationId: "role.next.fixture.claim.001", eventType: "claim",
+      actorType: "developer_ai", actorId: me.actorId, sessionId: me.sessionId });
+  };
+  const blocked = await scanner.claimNextForAwakeDeveloper({
+    ...me, reportedTaskId: "DEV-A", claimCandidate
+  });
+  assert.equal(blocked.state, "report_required");
+  assert.equal(blocked.taskId, "DEV-B");
+  assert.equal(calls, 1);
+  const claimed = await scanner.claimNextForAwakeDeveloper({
+    ...me, reportedTaskId: "DEV-B", attemptedTaskIds: ["DEV-A"], claimCandidate
+  });
+  assert.equal(claimed.state, "claimed");
+  assert.equal(claimed.taskId, "DEV-B");
+  assert.equal((await scanner.claimNextForAwakeDeveloper({
+    ...me, reportedTaskId: "DEV-A", claimCandidate
+  })).state, "busy");
+});
+
 test("scanner creates role-aware candidates, dedupes repeated scans and expires after 30 minutes", async (t) => {
   const fixture = await fixtureWithLedger(t);
   let now = Date.parse("2026-09-29T00:00:00Z");

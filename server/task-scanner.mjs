@@ -38,10 +38,80 @@ export class TaskScanner {
     if (!projectId) return { state: "blocked", candidate: null, reason: "project_required" };
     if (!this.evaluator) await this.init();
     const current = await this.evaluator.evaluateProject(projectId);
-    const next = nextRoleCandidate(current.candidates, { role, actorId, sessionId, attemptedTaskIds });
-    if (next.state !== "ready") return next;
-    const recheck = await this.evaluator.recheck(next.candidate);
-    return recheck.ok ? next : { state: "blocked", candidate: null, reason: "candidate_stale_retry_scan" };
+    const ignored = new Set(attemptedTaskIds);
+    for (let i = 0; i < current.candidates.length; i++) {
+      const next = nextRoleCandidate(current.candidates, { role, actorId, sessionId, attemptedTaskIds: [...ignored] });
+      if (next.state !== "ready") return next;
+      if (role === "developer_ai" && next.candidate.status === "测试失败待修复") {
+        const history = await this.taskStore.taskHistory(projectId, next.candidate.task_id, { all: true });
+        const original = [...history].reverse().find((entry) =>
+          entry.actor_type === "developer_ai" && ["claim", "takeover"].includes(entry.event_type));
+        if (!original || original.actor_id !== actorId) {
+          ignored.add(next.candidate.task_id);
+          continue;
+        }
+      }
+      const recheck = await this.evaluator.recheck(next.candidate);
+      return recheck.ok ? next : { state: "stale", candidate: next.candidate, reason: "candidate_stale_retry_scan" };
+    }
+    return { state: "exhausted", reason: "no_matching_original_developer_task", candidate: null };
+  }
+
+  async claimNextForAwakeDeveloper({ projectId, actorId, sessionId,
+    reportedTaskId, attemptedTaskIds = [], claimCandidate } = {}) {
+    if (!projectId || !actorId || !sessionId || typeof claimCandidate !== "function")
+      return { state: "blocked", reason: "project_actor_session_claim_required" };
+    if (!this.evaluator) await this.init();
+    for (const project of this.taskStore.projects.list()) {
+      const snapshot = await this.taskStore.snapshot(project.id);
+      for (const task of snapshot.tasks.filter((item) => ["开发中", "修复中"].includes(item.status))) {
+        if (task.sessionId === sessionId) return { state: "busy", taskId: task.id };
+        const history = await this.taskStore.taskHistory(project.id, task.id, { all: true });
+        const prior = [...history].reverse().find((event) =>
+          event.actor_type === "developer_ai" && ["claim", "takeover"].includes(event.event_type));
+        if (prior?.actor_id === actorId) return { state: "busy", taskId: task.id };
+      }
+    }
+    const tried = new Set(attemptedTaskIds), rejected = [];
+    const count = (await this.taskStore.snapshot(projectId)).tasks.length;
+    const retryCodes = new Set(["TASK_ALREADY_OCCUPIED", "CLAIM_WRITE_CONFLICT",
+      "REVISION_CONFLICT", "PROJECT_LOCKED", "TASK_STOP_REQUESTED", "GUARD_BLOCKED"]);
+    for (let i = 0; i < count; i++) {
+      const next = await this.nextForAwakeRole({
+        projectId, role: "developer_ai", actorId, sessionId, attemptedTaskIds: [...tried]
+      });
+      if (next.state === "stale" && next.candidate?.task_id) {
+        tried.add(next.candidate.task_id);
+        rejected.push({ taskId: next.candidate.task_id, reason: next.reason });
+        continue;
+      }
+      if (next.state !== "ready") return { state: next.state, reason: next.reason, blocked: next.blocked || [], rejected };
+      const candidate = next.candidate;
+      if (candidate.status === "测试失败待修复") {
+        const history = await this.taskStore.taskHistory(projectId, candidate.task_id, { all: true });
+        const original = [...history].reverse().find((event) =>
+          event.actor_type === "developer_ai" && ["claim", "takeover"].includes(event.event_type));
+        if (!original || original.actor_id !== actorId) {
+          tried.add(candidate.task_id);
+          rejected.push({ taskId: candidate.task_id, reason: "original_developer_only" });
+          continue;
+        }
+      }
+      if (candidate.task_id !== reportedTaskId)
+        return { state: "report_required", taskId: candidate.task_id, rejected };
+      try {
+        const claimed = await claimCandidate(candidate);
+        if (claimed?.after?.sessionId !== sessionId ||
+          !["开发中", "修复中"].includes(claimed?.after?.status)) throw Error("formal_claim_result_invalid");
+        return { state: "claimed", taskId: candidate.task_id,
+          claimEventId: claimed.eventId || null, nextAction: "read_plan_and_execute", rejected };
+      } catch (error) {
+        if (error?.status !== 409 || !retryCodes.has(error.code)) throw error;
+        tried.add(candidate.task_id);
+        rejected.push({ taskId: candidate.task_id, reason: error.code });
+      }
+    }
+    return { state: "exhausted", reason: "all_candidates_attempted", rejected };
   }
 
   async scanOnce({ trigger = "manual" } = {}) {

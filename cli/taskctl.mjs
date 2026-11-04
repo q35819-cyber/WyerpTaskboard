@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { logCliError } from "./cli-event-log.mjs";
+import { TaskScanner } from "../server/task-scanner.mjs";
 
 const rootDir = process.env.WYERP_TASKBOARD_ROOT || "D:\\WyerpTaskboard";
 const baseUrl = process.env.WYERP_TASKBOARD_URL || "http://127.0.0.1:47831";
@@ -214,6 +215,8 @@ try {
         "taskctl list [--project wyerp-taskboard]",
         "taskctl create --project PROJECT --task TASK-ID --parent TEXT --track product[/subtrack]|bugfix|infrastructure --priority P0 --status 待开发 --planned-role 开发AI --boundary TEXT --plan PATH --traceability TEXT --read-dependencies TEXT --write-targets TEXT --targets TEXT [--acceptance-scope system|user_ui_business]",
         "taskctl get --project PROJECT --task WTB-TEST-001",
+        "taskctl next --project PROJECT --actor-id ID --session-id SESSION (只读选择，不要用户填任务编号)",
+        "taskctl next-claim --project PROJECT --actor-id ID --session-id SESSION --reported-task TASK-ID --note 已向用户实际汇报 --assignee DISPLAY --session-name WINDOW (按真实guard/预汇报/claim领取)",
         "taskctl context --task TASK-ID [--project PROJECT]",
         "taskctl guard --project PROJECT --task WTB-TEST-001 [--actor-id ID --session-id ID]",
         "taskctl preclaim-report --project PROJECT --task WTB-TEST-001 --actor-id ID --session-id ID --note TEXT [--actor-type controller_ai|developer_ai|test_ai]",
@@ -281,6 +284,50 @@ try {
         metadata: metadata(args, acceptanceScope ? { acceptanceScope } : {})
       }
     }));
+  } else if (command === "next" || command === "next-claim") {
+    const project = explicitProject(args);
+    if (args["actor-type"] && args["actor-type"] !== "developer_ai")
+      throw Object.assign(Error("next仅支持已唤醒的开发AI"), { code: "NEXT_ROLE_INVALID" });
+    const actorId = required(args, "actor-id"), sessionId = required(args, "session-id");
+    const scanner = await new TaskScanner(rootDir).init();
+    if (command === "next") {
+      const selected = await scanner.nextForAwakeRole({
+        projectId: project, role: "developer_ai", actorId, sessionId
+      });
+      output({ state: selected.state, next_task_id: selected.candidate?.task_id || null,
+        status: selected.candidate?.status || null, reason: selected.reason,
+        blockers: selected.blocked || selected.candidate?.blockers || [] });
+    } else {
+      const reportedTaskId = required(args, "reported-task");
+      const reportNote = required(args, "note"), assignee = required(args, "assignee");
+      const sessionWindowName = required(args, "session-name");
+      const selected = await scanner.claimNextForAwakeDeveloper({
+        projectId: project, actorId, sessionId, reportedTaskId,
+        claimCandidate: async (candidate) => {
+          const task = candidate.task_id;
+          const guard = await guardState(project, task, args);
+          if (guard.stopRequested || guard.userMessages?.requiresAcknowledgement ||
+            guard.requirements?.pendingCount > 0) {
+            throw Object.assign(Error("guard blocked"), { status: 409, code: "GUARD_BLOCKED" });
+          }
+          await request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task) + "/preclaim-report", {
+            method: "POST",
+            body: { operationId: operationId(args, "preclaim_report"), actorType: "developer_ai",
+              actorId, sessionId, sessionWindowName,
+              note: "本轮已在聊天汇报：" + task + "，当前" + candidate.status + "；" + reportNote }
+          });
+          const currentTask = await current(project, task);
+          return request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task) + "/claim", {
+            method: "POST",
+            body: { operationId: operationId(args, "claim"), expectedRevision: currentTask.registryRevision,
+              actorType: "developer_ai", actorId, sessionId, assignee, sessionWindowName }
+          });
+        }
+      });
+      output({ state: selected.state, next_task_id: selected.taskId || null,
+        claim_event_id: selected.claimEventId || null, next_action: selected.nextAction || null,
+        reason: selected.reason || null, blocked: selected.blocked || [], rejected: selected.rejected || [] });
+    }
   } else if (command === "get") {
     const { project, task } = projectTask(args); output(await current(project, task));
   } else if (command === "context") {

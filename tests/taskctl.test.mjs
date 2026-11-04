@@ -62,6 +62,35 @@ async function preclaim(rootDir, base, task, {
   ])).stdout);
 }
 
+test("taskctl next and next-claim select and formally claim without the user supplying a task ID", async t => {
+  const { fixture, base } = await startFixture(t);
+  const id = ["--project", "fixture", "--actor-id", "dev-next-cli", "--session-id", "session-next-cli"];
+  const first = JSON.parse((await taskctl(fixture.boardRoot, base, ["next", ...id])).stdout);
+  assert.equal(first.state, "ready");
+  assert.equal(first.next_task_id, "A-10");
+  const unreported = JSON.parse((await taskctl(fixture.boardRoot, base, ["next-claim", ...id,
+    "--reported-task", "WRONG-TASK", "--note", "已真实向用户汇报",
+    "--assignee", "developer", "--session-name", "开发窗口"])).stdout);
+  assert.equal(unreported.state, "report_required");
+  assert.equal(unreported.next_task_id, "A-10");
+  const before = JSON.parse((await taskctl(fixture.boardRoot, base,
+    ["get", "--project", "fixture", "--task", "A-10"])).stdout);
+  assert.equal(before.status, "待开发");
+  const result = JSON.parse((await taskctl(fixture.boardRoot, base, ["next-claim", ...id,
+    "--reported-task", "A-10", "--note", "已向用户报告目标、当前阶段和边界",
+    "--assignee", "developer", "--session-name", "开发窗口"])).stdout);
+  assert.equal(result.state, "claimed");
+  assert.equal(result.next_task_id, "A-10");
+  const after = JSON.parse((await taskctl(fixture.boardRoot, base,
+    ["get", "--project", "fixture", "--task", "A-10"])).stdout);
+  assert.equal(after.status, "开发中");
+  assert.equal(after.sessionId, "session-next-cli");
+  const duplicate = JSON.parse((await taskctl(fixture.boardRoot, base, ["next-claim", ...id,
+    "--reported-task", "A-10", "--note", "已汇报",
+    "--assignee", "developer", "--session-name", "开发窗口"])).stdout);
+  assert.equal(duplicate.state, "busy");
+});
+
 test("taskctl context uses only task ID and returns readable plan, safe links and existing guard", async t => {
   const { fixture, base } = await startFixture(t);
   const planPath = path.join(fixture.projectRoot, "任务看板与AI协作控制开发计划.md");
