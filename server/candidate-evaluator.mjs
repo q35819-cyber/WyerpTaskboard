@@ -134,7 +134,8 @@ async function currentAutoUnblockedBug(store, projectId, task, history) {
     event.new_status !== "待开发" || event.metadata?.restoreStatus !== "待开发") return false;
   const blocked = history.find((item) => item.event_id === event.metadata?.blockedEventId);
   if (!blocked || blocked.new_status !== "阻断" ||
-    !["temporary_block", "developer_paused_for_independent_full_suite_gate"].includes(blocked.event_type)) return false;
+    !["temporary_block", "developer_paused_for_independent_full_suite_gate",
+      "developer_d01_missing_controller_dispatch_block"].includes(blocked.event_type)) return false;
   const operationId = "auto_unblock." + hash(projectId + "|" + task.id + "|" + blocked.event_id);
   if (event.operation_id !== operationId) return false;
   const transaction = await store.transactions.read(operationId);
