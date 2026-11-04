@@ -594,10 +594,10 @@ test("unowned blocked task does not hold a permanent write lock", async (t) => {
       "src/shared.js", "cp/" + id + ".md"];
   for (const [name, status, assignee, sessionId, expected] of [
     ["unowned blocked", "阻断", "—", "—", 200],
-    ["blocked with owner", "阻断", "former-owner", "—", 409],
-    ["blocked with session", "阻断", "—", "former-session", 409],
-    ["pending QA", "待独测", "—", "—", 409],
-    ["active development", "开发中", "running-owner", "running-session", 409]
+    ["blocked with owner", "阻断", "former-owner", "—", 200],
+    ["blocked with session", "阻断", "—", "former-session", 200],
+    ["pending QA", "待独测", "—", "—", 200],
+    ["active development", "开发中", "running-owner", "running-session", 200]
   ]) {
     await t.test(name, async (subtest) => {
       const { base, secret, fixture, app } = await startFixture(subtest);
@@ -630,7 +630,7 @@ test("unowned blocked task does not hold a permanent write lock", async (t) => {
   }
 });
 
-test("developer claim enforces actual file overlap and actor/session exclusion", async (t) => {
+test("developer claim allows isolated same-project writes but blocks duplicate actor or session", async (t) => {
   const row = (id, writes) => [id, "F-" + id, "bugfix", "P0", "待开发", "开发AI",
     "—", "—", "—", "—", "fixture", "plan.md", "trace/" + id,
     "read/" + id + ".md", writes, "cp/" + id + ".md"];
@@ -656,9 +656,11 @@ test("developer claim enforces actual file overlap and actor/session exclusion",
     assert.equal(second.status, expectedCode ? 409 : 200);
     if (expectedCode) assert.equal(second.result.error.code, expectedCode);
   }
-  await verifyPair("src/same.js", "src/same.js", "dev-B", "session-B", "CLAIM_WRITE_CONFLICT");
-  await verifyPair("src/components", "src/components/child.js", "dev-B", "session-B", "CLAIM_WRITE_CONFLICT");
+  await verifyPair("src/same.js", "src/same.js", "dev-B", "session-B", null);
+  await verifyPair("src/components", "src/components/child.js", "dev-B", "session-B", null);
+  await verifyPair("src/same.js", "src/same.js", "dev-A", "session-B", "CLAIM_DEVELOPER_BUSY");
   await verifyPair("src/one.js", "src/two.js", "dev-A", "session-B", "CLAIM_DEVELOPER_BUSY");
+  await verifyPair("src/same.js", "src/same.js", "dev-B", "session-A", "CLAIM_DEVELOPER_BUSY");
   await verifyPair("src/one.js", "src/two.js", "dev-B", "session-A", "CLAIM_DEVELOPER_BUSY");
   await verifyPair("src/one.js", "src/two.js", "dev-B", "session-B", null);
 });
@@ -735,7 +737,7 @@ test("overlapping registered project roots cannot claim the same physical file",
   assert.equal(conflicting.body.error.code, "CLAIM_WRITE_CONFLICT");
 });
 
-test("handoff releases execution identity but reserves file scope until delivery", async (t) => {
+test("handoff releases execution identity and permits independent developer before delivery", async (t) => {
   const { base, secret, fixture } = await startFixture(t);
   const headers = { Authorization: "Bearer " + secret, "Content-Type": "application/json" };
   const row = (id, writes) => [id, "F-" + id, "bugfix", "P0", "待开发", "开发AI",
@@ -761,8 +763,8 @@ test("handoff releases execution identity but reserves file scope until delivery
   assert.equal(handedOff.body.after.status, "待独测");
   assert.equal(handedOff.body.after.sessionId, "");
   const conflict = await request("C-10", "dev-B", "session-B", "claim", "claim.scope.block.002");
-  assert.equal(conflict.status, 409);
-  assert.equal(conflict.body.error.code, "CLAIM_WRITE_CONFLICT");
+  assert.equal(conflict.status, 200);
+  assert.equal(conflict.body.after.status, "开发中");
   assert.equal((await request("D-10", "dev-A", "session-A", "claim", "claim.scope.free.003")).status, 200);
 });
 

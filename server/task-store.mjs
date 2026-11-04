@@ -133,7 +133,7 @@ function writePaths(root, value) {
       return process.platform === "win32" ? resolved.toLowerCase() : resolved;
     });
 }
-async function assertDeveloperClaimExclusive(store, projectId, context, parsed, task, actorId, sessionId, allowIsolatedOverlap = false) {
+async function assertDeveloperClaimExclusive(store, projectId, context, parsed, task, actorId, sessionId, allowIsolatedOverlap = false, preserveAutoUnblockScope = false) {
   const requested = writePaths(context.rootRealPath, task.writeTargets);
   if (!requested.length) throw new TaskboardError("开发认领必须声明计划写文件", {
     code: "CLAIM_WRITE_TARGETS_REQUIRED", status: 409
@@ -167,7 +167,7 @@ async function assertDeveloperClaimExclusive(store, projectId, context, parsed, 
           code: "CLAIM_DEVELOPER_BUSY", status: 409, details: { taskId: other.id, projectId: otherProject }
         });
       }
-      if (!allowIsolatedOverlap && overlapping && (RESERVED_WRITES.has(other.status) ||
+      if ((otherProject !== projectId || preserveAutoUnblockScope) && !allowIsolatedOverlap && overlapping && (RESERVED_WRITES.has(other.status) ||
         (other.status === "HOLD" && history?.some((event) =>
           event.event_type === "claim" && event.actor_type === "developer_ai")))) {
         throw new TaskboardError("计划写文件与未交付任务冲突", {
@@ -248,7 +248,7 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
       hardDependencyBlockers(task, byId).length) return null;
     try {
       await assertDeveloperClaimExclusive(store, projectId, context, { tasks }, task,
-        "task-scan", "auto-unblock");
+        "task-scan", "auto-unblock", false, true);
     } catch (error) {
       if (["CLAIM_WRITE_CONFLICT", "CLAIM_DEVELOPER_BUSY"].includes(error.code)) return null;
       throw error;
