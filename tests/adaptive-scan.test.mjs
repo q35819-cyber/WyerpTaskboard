@@ -12,7 +12,7 @@ async function root(t) {
   return value;
 }
 
-test("ready column derives fresh scan eligibility and preserves exclusive QA and delivery columns", async () => {
+test("one shared ready column derives developer eligibility and keeps QA and delivery roles separate", async () => {
   const { wyerpAiFlowV1: flow } = await import("../server/workflows/wyerp-ai-flow-v1.mjs");
   const source = await fs.readFile(path.resolve(import.meta.dirname, "..", "web", "app.js"), "utf8");
   const readySource = source.match(/function isReadyTask\(task\)\{[\s\S]*?\n\}/)?.[0];
@@ -35,25 +35,66 @@ test("ready column derives fresh scan eligibility and preserves exclusive QA and
   const board=new Function("state","developerCandidateFor","isReadyTask","tasksForColumn",boardSource+"\nreturn boardTasksForColumn;")(
     state,candidate,ready,(items,statuses)=>items.filter(t=>statuses.includes(t.status)));
   const get=id=>board(flow.boardColumns.find(c=>c.id===id)).map(t=>t.id);
-  assert.deepEqual(get("awaiting_work"),["A","C"]);
-  assert.deepEqual(get("qa_pending"),["QA","RE"]);
+  assert.equal(flow.boardColumns.length,6);
+  assert.ok(!flow.boardColumns.some(c=>c.id==="awaiting_work"));
+  assert.deepEqual(get("qa_pending"),["A","C","QA","RE"]);
+  assert.equal(get("qa_pending").filter(id=>["A","C"].includes(id)).length,2,"developer count");
+  assert.equal(get("qa_pending").filter(id=>["QA","RE"].includes(id)).length,2,"QA count");
   assert.deepEqual(get("awaiting_delivery_user"),["DEL"]);
   assert.deepEqual(get("todo"),["B","LEG"]);
   assert.equal(state.filtered.filter(ready).length,2);
   A.status="已完成";
   C.status="开发中";C.assignee="dev-other";
   state.scanStatus.developerCandidates=[{projectId:"fixture",taskId:"B",status:"待开发",eligible:true,blockers:[]}];
-  assert.deepEqual(get("awaiting_work"),["B"]);
-  assert.deepEqual(get("qa_pending"),["QA","RE"]);
+  assert.deepEqual(get("qa_pending"),["B","QA","RE"]);
   assert.equal(state.filtered.filter(ready).length,1);
   assert.equal(state.filtered.flatMap(()=>[]).length,0);
   state.scanStatus.scan.last_scan_at=new Date(Date.now()-31*60*1000).toISOString();
-  assert.deepEqual(get("awaiting_work"),[]);
+  assert.deepEqual(get("qa_pending"),["QA","RE"],"stale scan removes developer, not QA");
   assert.deepEqual(get("todo"),["B","LEG"]);
   const ids=flow.boardColumns.flatMap(col=>get(col.id));
   assert.equal(ids.length,state.filtered.length);
   assert.equal(new Set(ids).size,ids.length);
   assert.equal(B.status,"待开发");
+  // Exercise the real renderBoard function with minimal DOM nodes, not just column metadata.
+  const renderSource=source.match(/function renderBoard\(\)\{[\s\S]*?\n\}/)?.[0];
+  assert.ok(renderSource);
+  const node=tag=>({
+    tag,children:[],classList:{add(){}},textContent:"",className:"",
+    append(...parts){this.children.push(...parts)},
+    replaceChildren(...parts){this.children=[...parts]}
+  });
+  const els={boardView:node("main")};
+  state.workflow=flow;state.columnPages={};
+  const renderBoard=new Function("state","els","boardTasksForColumn","isReadyTask","paginateColumn","PAGE_SIZE",
+    "document","taskCard","renderPagination",renderSource+"\nreturn renderBoard;")(
+      state,els,board,ready,(items,page,size)=>{
+        const pages=Math.max(1,Math.ceil(items.length/size));
+        const current=Math.min(Math.max(1,page||1),pages);
+        return {page:current,totalPages:pages,visible:items.slice((current-1)*size,current*size)};
+      },3,{createElement:node},task=>Object.assign(node("article"),{taskId:task.id}),()=>node("nav"));
+  const renderedCount=()=>{
+    renderBoard();
+    assert.equal(els.boardView.children.length,6,"six actual DOM columns");
+    const shared=els.boardView.children.find(col=>
+      col.children[0]?.children[0]?.textContent===flow.boardColumns.find(c=>c.id==="qa_pending").title);
+    assert.ok(shared);
+    assert.equal(shared.children.filter(child=>child.tag==="article").length,
+      Math.min(3,get("qa_pending").length),"pagination never changes full role counts");
+    return shared.children[0].children[1].textContent;
+  };
+  A.status="待开发";C.status="待准备";C.assignee="";
+  state.scanStatus.scan.last_scan_at=new Date().toISOString();
+  state.scanStatus.developerCandidates=[
+    {projectId:"fixture",taskId:"A",status:"待开发",eligible:true,blockers:[]},
+    {projectId:"fixture",taskId:"B",status:"待开发",eligible:false,blockers:["前置未完成"]},
+    {projectId:"fixture",taskId:"C",status:"待准备",eligible:true,blockers:[]}
+  ];
+  assert.equal(renderedCount(),"开发 2 项 · 测试 2 项");
+  state.filtered=state.filtered.filter(t=>["A","QA"].includes(t.id));
+  assert.equal(renderedCount(),"开发 1 项 · 测试 1 项","count tracks current filter");
+  state.scanStatus.scan.last_scan_at=new Date(Date.now()-31*60*1000).toISOString();
+  assert.equal(renderedCount(),"开发 0 项 · 测试 1 项","stale scan returns developer to todo");
 });
 
 test("scheduled dispatcher scans busy or idle mode only when due", async (t) => {
