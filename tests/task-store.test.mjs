@@ -2,7 +2,65 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import { TaskStore } from "../server/task-store.mjs";
+import { TaskStepCheckpoint } from "../server/task-step-checkpoint.mjs";
 import { makeFixture, registryText } from "./helpers.mjs";
+
+test("v2 step evidence gates formal claim and handoff before mutation", async (t) => {
+  const f = await makeFixture();
+  t.after(() => fs.rm(f.boardRoot, { recursive: true, force: true }));
+  const store = await new TaskStore(f.boardRoot).init();
+  const cp = await new TaskStepCheckpoint(f.boardRoot, { taskStore: store }).init();
+  let n = 0;
+  const record = async (role, stepId, eventId = null) => {
+    const current = await cp.show("fixture", "A-10");
+    return cp.record("fixture", "A-10", {
+      operationId: "gate.step." + String(++n).padStart(4, "0"),
+      expectedSha256: current.sha256, stepId, actorType: role,
+      actorId: role === "controller_ai" ? "controller" : "developer",
+      sessionId: role === "controller_ai" ? "controller-session" : "developer-session",
+      evidence: "真实步骤验证证据 " + stepId, eventId
+    });
+  };
+  await record("controller_ai", "C00_A_REQUIREMENTS");
+  const initial = await store.snapshot("fixture");
+  const claimPatch = { status: "开发中", assignee: "developer",
+    sessionWindowName: "dev", sessionId: "developer-session" };
+  const claimOptions = { expectedRevision: initial.registryRevision, operationId: "gate.claim.0001",
+    eventType: "claim", actorType: "developer_ai", actorId: "developer",
+    sessionId: "developer-session" };
+  await assert.rejects(store.updateTask("fixture", "A-10", claimPatch, claimOptions),
+    (error) => error.code === "CHECKPOINT_STEP_EVIDENCE_REQUIRED");
+  assert.equal((await store.snapshot("fixture")).registryRevision, initial.registryRevision);
+  assert.equal(await store.transactions.read(claimOptions.operationId), null);
+  for (const id of ["C00_B_MAIN_VERSION", "C00_C_SAFE_CLEANUP", "C01_SCAN", "C02_TRIAGE"]) {
+    await record("controller_ai", id);
+  }
+  const dispatch = await store.appendTaskEvent("fixture", "A-10", {
+    operationId: "gate.dispatch.0001", eventType: "controller_dispatch",
+    actorType: "controller_ai", actorId: "controller",
+    sessionId: "controller-session", note: "正式开发派工"
+  });
+  await record("controller_ai", "C03_DISPATCH", dispatch.event.event_id);
+  const claim = await store.updateTask("fixture", "A-10", claimPatch, claimOptions);
+  assert.equal(claim.after.status, "开发中");
+  await record("developer_ai", "D01_CLAIM", claim.eventId);
+  for (const id of ["D02_WORKTREE", "D03_WRITE_SCOPE", "D04_IMPLEMENT", "D05_TEST_1", "D06_TEST_2"]) {
+    await record("developer_ai", id);
+  }
+  const beforeHandoff = await store.snapshot("fixture");
+  const handoffPatch = { status: "待独测", assignee: "", sessionWindowName: "", sessionId: "" };
+  const handoffOptions = { expectedRevision: beforeHandoff.registryRevision,
+    operationId: "gate.handoff.0001", eventType: "handoff",
+    actorType: "developer_ai", actorId: "developer", sessionId: "developer-session",
+    metadata: { atomicLifecycle: true, completedFromStatus: "开发中", handoffTarget: "待独测" } };
+  await assert.rejects(store.updateTask("fixture", "A-10", handoffPatch, handoffOptions),
+    (error) => error.code === "CHECKPOINT_STEP_EVIDENCE_REQUIRED");
+  assert.equal((await store.snapshot("fixture")).registryRevision, beforeHandoff.registryRevision);
+  assert.equal(await store.transactions.read(handoffOptions.operationId), null);
+  await record("developer_ai", "D07_TEST_3");
+  const handoff = await store.updateTask("fixture", "A-10", handoffPatch, handoffOptions);
+  assert.equal(handoff.after.status, "待独测");
+});
 
 test("snapshot sorts product/P0 before infrastructure/P0", async (t) => {
   const f = await makeFixture(); t.after(() => fs.rm(f.boardRoot, { recursive: true, force: true }));

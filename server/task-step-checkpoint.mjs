@@ -439,4 +439,28 @@ export class TaskStepCheckpoint {
       return { ...reread, duplicate: false };
     });
   }
+
+  async assertFormalTransition(projectId, taskId, { eventType, actorType, actorId, sessionId } = {}) {
+    const required = eventType === "claim" && actorType === "developer_ai"
+      ? { step: "C03_DISPATCH", role: "controller_ai" }
+      : eventType === "handoff" && actorType === "developer_ai"
+        ? { step: "D07_TEST_3", role: "developer_ai" }
+        : eventType === "test_result" && actorType === "test_ai"
+          ? { step: "Q02_TEST", role: "test_ai" }
+          : eventType === "delivery_complete" && actorType === "controller_ai"
+            ? { step: "C06_CLEANUP", role: "controller_ai" }
+            : null;
+    if (!required) return;
+    const { exists, legacy, state } = await this.show(projectId, taskId);
+    // Plain-text legacy checkpoints retain existing formal-event gates until migrated.
+    if (!exists || legacy || state.flowVersion !== "role-steps-v2") return;
+    const proof = state.records.findLast((item) => item.attempt === state.attempts
+      && item.stepId === required.step && item.actorType === required.role
+      && (required.step === "Q02_TEST" ? ["PASS", "FAIL", "BLOCK"].includes(item.result)
+        : item.result === "PASS")
+      && (required.role !== actorType || (item.actorId === actorId && item.sessionId === sessionId))
+      && (required.step !== "C03_DISPATCH" || item.eventId));
+    if (!proof) throw invalid("CHECKPOINT_STEP_EVIDENCE_REQUIRED",
+      "正式任务状态推进缺少当前轮次可信步骤证据", 409);
+  }
 }

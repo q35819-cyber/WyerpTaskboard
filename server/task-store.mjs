@@ -709,6 +709,11 @@ export class TaskStore {
 
       const currentTask = parsed.tasks.find((item) => item.id === taskId);
       if (!currentTask) throw new TaskboardError("未知任务ID: " + taskId, { code: "TASK_NOT_FOUND", status: 404 });
+      if (["claim", "handoff", "test_result", "delivery_complete"].includes(eventType)) {
+        const { TaskStepCheckpoint } = await import("./task-step-checkpoint.mjs");
+        await new TaskStepCheckpoint(this.rootDir, { taskStore: this }).assertFormalTransition(
+          projectId, taskId, { eventType, actorType, actorId, sessionId });
+      }
       if (eventType === "auto_unblock") {
         const allowed = await eligibleTemporaryUnblock(this, projectId, currentTask, parsed.tasks, context);
         if (actorType !== "system" || !allowed || patch.status !== allowed.target ||

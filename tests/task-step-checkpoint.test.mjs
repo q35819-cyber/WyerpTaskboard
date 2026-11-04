@@ -991,13 +991,15 @@ test("v2 real QA PASS plus new controller delivery claim reopens C00 then gates 
   });
   await step(cp, "developer_ai", "D08_HANDOFF", { eventId: handoff.eventId });
   await step(cp, "developer_ai", "D09_NEXT");
-  await taskStore.updateTask("fixture", "A-10", {
+  const qaClaim = await taskStore.updateTask("fixture", "A-10", {
     status: "独测中", assignee: "qa", sessionWindowName: "qa", sessionId: "qa-session"
   }, {
     expectedRevision: (await taskStore.snapshot("fixture")).registryRevision,
     operationId: "fixture.modern.qa-claim.004", eventType: "claim",
     actorType: "test_ai", actorId: "qa", sessionId: "qa-session"
   });
+  await step(cp, "test_ai", "Q01_ADMISSION", { actorId: "qa", sessionId: "qa-session", eventId: qaClaim.eventId });
+  await step(cp, "test_ai", "Q02_TEST", { actorId: "qa", sessionId: "qa-session" });
   const qa = await taskStore.updateTask("fixture", "A-10", { status: "待交付" }, {
     expectedRevision: (await taskStore.snapshot("fixture")).registryRevision,
     operationId: "fixture.modern.qa-result.004", eventType: "test_result",
