@@ -16,11 +16,28 @@ async function fixture(t) {
 let sequence = 1;
 async function step(cp, role, id, extra = {}, taskId = "A-10") {
   const before = await cp.show("fixture", taskId);
+  const actorId = extra.actorId || (role === "controller_ai" ? "controller" : role === "developer_ai" ? "developer" : "qa");
+  const sessionId = extra.sessionId || role + ".session";
+  const c00 = {
+    C00_A_REQUIREMENTS: ["controller_requirements_reviewed",
+      { requirementsReviewed: true, requirementEvidence: "reports/requirements-checked.md" }],
+    C00_B_MAIN_VERSION: ["controller_main_version_verified",
+      { gitExitCode: 0, localMainSha: "a".repeat(40), remoteMainSha: "a".repeat(40), packageVersion: "0.6.63" }],
+    C00_C_SAFE_CLEANUP: ["controller_safe_cleanup_verified",
+      { resourcesChecked: true, cleanupOutcome: "preserved", cleanupEvidence: "data/logs/changes/fixture.jsonl", nextAction: "继续保全并在下一轮C00复核" }]
+  };
+  if (role === "controller_ai" && cp.flowVersion === "role-steps-v2"
+    && (extra.result || "PASS") === "PASS" && c00[id] && !extra.eventId) {
+    const event = await cp.taskStore.appendTaskEvent("fixture", taskId, {
+      operationId: "fixture.c00." + String(sequence++).padStart(8, "0"),
+      eventType: c00[id][0], actorType: role, actorId, sessionId, metadata: c00[id][1]
+    });
+    extra = { ...extra, eventId: event.event.event_id };
+  }
   const result = await cp.record("fixture", taskId, {
     operationId: "fixture.step." + String(sequence++).padStart(8, "0"),
-    expectedSha256: before.sha256, stepId: id, actorType: role,
-    actorId: role === "controller_ai" ? "controller" : role === "developer_ai" ? "developer" : "qa",
-    sessionId: role + ".session", evidence: "实际执行证据: fixture-" + id, ...extra
+    expectedSha256: before.sha256, stepId: id, actorType: role, actorId,
+    sessionId, evidence: "实际执行证据: fixture-" + id, ...extra
   });
   assert.ok(result.sha256 && result.file.endsWith(taskId + ".md"));
   assert.equal(result.state.lastAction.stepId, id);
@@ -127,12 +144,12 @@ test("finished Q04 permits a fresh Q01 only after a different formally handed-of
 });
 
 test("finished Q04 refuses unchanged, unsupported, mismatched or stopped candidate attempts", async (t) => {
-  for (const options of [
+  await Promise.all([
     { candidate: "1".repeat(40) },
     { selfTest: false },
     { testSha: "3".repeat(40) },
     { stop: true }
-  ]) {
+  ].map(async (options) => {
     const { cp, latestQa, finished } = await newCandidateAfterQ04(t, options);
     const before = await cp.show("fixture", "A-10");
     await assert.rejects(step(cp, "test_ai", "Q01_ADMISSION", {
@@ -142,7 +159,7 @@ test("finished Q04 refuses unchanged, unsupported, mismatched or stopped candida
     assert.equal(after.sha256, before.sha256);
     assert.equal(after.state.attempts, finished.state.attempts);
     assert.equal(after.state.cursors.test_ai, null);
-  }
+  }));
 });
 
 test("one checkpoint per task preserves existing legacy text and enforces controller step order", async (t) => {
@@ -364,7 +381,7 @@ test("existing Q01 FAIL history may be retained during zero-developer-checkpoint
   assert.equal(recovered.state.records[2].result,"PASS");
 });
 test("new QA Q01 reopens only with a real controller-requeued Q02 BLOCK or finished Q04", async(t) => {
-  for (const finished of [false, true]) {
+  await Promise.all([false, true].map(async (finished) => {
     const {cp,taskStore}=await fixture(t);
     const label=finished?"finished":"q02block";
     await claimDev(taskStore);
@@ -455,11 +472,11 @@ test("new QA Q01 reopens only with a real controller-requeued Q02 BLOCK or finis
     assert.equal(newStart.state.records.some(r=>r.attempt===newStart.state.attempts
       && r.stepId==="D08_HANDOFF"&&r.result==="PASS"),false);
     assert.ok(handoff.eventId);
-  }
+  }));
 });
 
 test("Q02 recovery rejects fake controller restoration and true QA FAIL without repair", async(t) => {
-  for (const mode of ["fake-controller", "unrepaired-fail"]) {
+  await Promise.all(["fake-controller", "unrepaired-fail"].map(async (mode) => {
     const {cp,taskStore}=await fixture(t);
     await claimDev(taskStore);
     await taskStore.updateTask("fixture","A-10",
@@ -507,11 +524,11 @@ test("Q02 recovery rejects fake controller restoration and true QA FAIL without 
     }),e=>e.code==="CHECKPOINT_STEP_ORDER");
     assert.equal((await cp.show("fixture","A-10")).sha256,previous.sha256);
     assert.equal((await cp.show("fixture","A-10")).state.attempts,previous.state.attempts);
-  }
+  }));
 });
 
 test("a genuine QA FAIL reopens Q01 after repaired handoff but rejects reused candidate SHA",async(t)=>{
-  for (const unchanged of [false,true]) {
+  await Promise.all([false,true].map(async (unchanged) => {
     const {cp,taskStore}=await fixture(t);
     const label=unchanged?"same":"new";
     await claimDev(taskStore);
@@ -568,7 +585,7 @@ test("a genuine QA FAIL reopens Q01 after repaired handoff but rejects reused ca
       assert.equal(done.state.records.some(r=>r.attempt===before.state.attempts
         && r.stepId==="Q02_TEST" && r.result==="FAIL"),true);
     }
-  }
+  }));
 });
 
 test("independent BLOCK followed by real controller requeue permits new QA to recover unchanged handoff",async(t)=>{
@@ -1415,6 +1432,44 @@ test("portable flow paths stay relative and published template matches canonical
   const readme=await fs.readFile(path.resolve("templates/webcodex-v1/README.md"),"utf8");
   assert.doesNotMatch(readme,/(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|\\\\[^\\\s]+\\|\/(?:home|Users|mnt|opt|tmp)\/)/);
   assert.match(await fs.readFile(path.join(root,"00_统一入口.md"),"utf8"),/相对路径强制规则/);
+});
+
+test("v2 C00 PASS requires fresh, scoped evidence events before any scan", async (t) => {
+  const { f, taskStore } = await fixture(t);
+  const cp = await new TaskStepCheckpoint(f.boardRoot, { taskStore }).init();
+  const append = async (eventType, metadata, actorId = "controller", sessionId = "controller_ai.session") =>
+    (await taskStore.appendTaskEvent("fixture", "A-10", {
+      operationId: "fixture.c00.negative." + String(sequence++).padStart(8, "0"),
+      eventType, actorType: "controller_ai", actorId, sessionId, metadata
+    })).event.event_id;
+  const rejectWithoutAdvance = async (stepId, eventId) => {
+    const before = await cp.show("fixture", "A-10");
+    await assert.rejects(step(cp, "controller_ai", stepId, { eventId }),
+      (error) => error.code === "CHECKPOINT_C00_EVIDENCE_REQUIRED");
+    assert.equal((await cp.show("fixture", "A-10")).sha256, before.sha256);
+  };
+
+  await rejectWithoutAdvance("C00_A_REQUIREMENTS", "evt_nonexistent");
+  await rejectWithoutAdvance("C00_A_REQUIREMENTS", await append("controller_requirements_reviewed",
+    { requirementsReviewed: false, requirementEvidence: "reports/review.md" }));
+  await rejectWithoutAdvance("C00_A_REQUIREMENTS", await append("controller_requirements_reviewed",
+    { requirementsReviewed: true, requirementEvidence: "reports/review.md" }, "other-controller"));
+  await step(cp, "controller_ai", "C00_A_REQUIREMENTS");
+  await assert.rejects(step(cp, "controller_ai", "C01_SCAN"),
+    (error) => error.code === "CHECKPOINT_STEP_ORDER");
+
+  await rejectWithoutAdvance("C00_B_MAIN_VERSION", await append("controller_main_version_verified",
+    { gitExitCode: 0, localMainSha: "a".repeat(40), remoteMainSha: "b".repeat(40), packageVersion: "0.6.63" }));
+  await rejectWithoutAdvance("C00_B_MAIN_VERSION", await append("controller_main_version_verified",
+    { gitExitCode: 1, localMainSha: "a".repeat(40), remoteMainSha: "a".repeat(40), packageVersion: "0.6.63" }));
+  await step(cp, "controller_ai", "C00_B_MAIN_VERSION");
+
+  await rejectWithoutAdvance("C00_C_SAFE_CLEANUP", await append("controller_safe_cleanup_verified",
+    { resourcesChecked: true, cleanupOutcome: "preserved", cleanupEvidence: "reports/cleanup.md" }));
+  await rejectWithoutAdvance("C00_C_SAFE_CLEANUP", await append("controller_safe_cleanup_verified",
+    { resourcesChecked: false, cleanupOutcome: "clean", cleanupEvidence: "reports/cleanup.md" }));
+  await step(cp, "controller_ai", "C00_C_SAFE_CLEANUP");
+  assert.equal((await cp.show("fixture", "A-10")).state.cursors.controller_ai, "C01_SCAN");
 });
 
 test("v2 cursor enters C00, permits optional environment check and bypasses delivery-only C04 after ordinary dispatch", async (t) => {

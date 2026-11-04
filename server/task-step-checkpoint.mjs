@@ -34,6 +34,26 @@ const EVENT_REQUIRED = {
   D12_COMPLETE: ["delivery_complete"], C07_COMPLETE: ["delivery_complete"],
   Q01_ADMISSION: ["claim", "takeover"], Q03_RESULT: ["test_result"]
 };
+const C00_EVENTS = Object.freeze({
+  C00_A_REQUIREMENTS: "controller_requirements_reviewed",
+  C00_B_MAIN_VERSION: "controller_main_version_verified",
+  C00_C_SAFE_CLEANUP: "controller_safe_cleanup_verified"
+});
+function validC00Evidence(stepId, metadata = {}) {
+  if (stepId === "C00_A_REQUIREMENTS") {
+    return metadata.requirementsReviewed === true
+      && typeof metadata.requirementEvidence === "string" && metadata.requirementEvidence.trim().length >= 8;
+  }
+  if (stepId === "C00_B_MAIN_VERSION") {
+    return metadata.gitExitCode === 0 && /^[a-f0-9]{40}$/i.test(metadata.localMainSha || "")
+      && metadata.localMainSha === metadata.remoteMainSha
+      && /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(metadata.packageVersion || "");
+  }
+  return metadata.resourcesChecked === true
+    && ["clean", "archived", "preserved"].includes(metadata.cleanupOutcome)
+    && typeof metadata.cleanupEvidence === "string" && metadata.cleanupEvidence.trim().length >= 8
+    && (metadata.cleanupOutcome !== "preserved" || Boolean(metadata.nextAction));
+}
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const CLOSED = new Set(["已完成", "已取消"]);
 function invalid(code, message, status = 409) {
@@ -441,6 +461,18 @@ export class TaskStepCheckpoint {
       }
       const required = EVENT_REQUIRED[stepId] || [];
       const event = eventId ? history.find((x) => x.event_id === eventId) : null;
+      if (modern && actorType === "controller_ai" && result === "PASS" && C00_EVENTS[stepId]) {
+        const preceding = state.records.findLast((entry) =>
+          entry.actorType === "controller_ai" && entry.result === "PASS"
+            && entry.attempt === state.attempts && C00_EVENTS[entry.stepId]);
+        if (!event || event.event_type !== C00_EVENTS[stepId] || event.actor_type !== actorType
+          || event.actor_id !== actorId || event.session_id !== sessionId
+          || state.records.some((entry) => entry.eventId === eventId)
+          || (preceding && Date.parse(event.timestamp) < Date.parse(preceding.at))
+          || !validC00Evidence(stepId, event.metadata)) {
+          throw invalid("CHECKPOINT_C00_EVIDENCE_REQUIRED", "C00缺少本轮同一总控Session的可信核验事件和结构化结果");
+        }
+      }
       if (result === "PASS" && required.length && (!event || !required.includes(event.event_type)
         || event.actor_type !== actorType || event.actor_id !== actorId
         || (event.session_id && event.session_id !== sessionId))) {
