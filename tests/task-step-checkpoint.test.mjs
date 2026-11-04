@@ -868,6 +868,129 @@ test("controller-authorized QA BLOCK return reopens D01 without erasing old Q02 
     actorId:"developer",sessionId:"developer_ai.session"
   }),e=>e.code==="CHECKPOINT_SESSION_MISMATCH");
 });
+test("user-command authorized QA BLOCK return reopens D01 without erasing old Q02 or letting old Session write",async(t)=>{
+  const {cp,taskStore}=await fixture(t);
+  await controllerReady(taskStore,cp);
+  const original=await claimDev(taskStore);
+  await step(cp,"developer_ai","D01_CLAIM",{eventId:original.eventId});
+  for(const id of ROLE_STAGE_STEPS.developer_ai.slice(1,7))await step(cp,"developer_ai",id);
+  const priorHandoff=await taskStore.updateTask("fixture","A-10",
+    {status:"待独测",assignee:"",sessionWindowName:"",sessionId:""},
+    {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      operationId:"fixture.return-block.handoff",eventType:"handoff",
+      actorType:"developer_ai",actorId:"developer",sessionId:"developer_ai.session",
+      metadata:{atomicLifecycle:true,completedFromStatus:"开发中",handoffTarget:"待独测",
+        commitSha:"1".repeat(40)}});
+  await step(cp,"developer_ai","D08_HANDOFF",{eventId:priorHandoff.eventId});
+  const qa=await taskStore.updateTask("fixture","A-10",
+    {status:"独测中",assignee:"qa",sessionWindowName:"qa",sessionId:"test_ai.session"},
+    {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      operationId:"fixture.return-block.qa-claim",eventType:"claim",
+      actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session"});
+  await step(cp,"test_ai","Q01_ADMISSION",{eventId:qa.eventId});
+  await step(cp,"test_ai","Q02_TEST",{result:"BLOCK"});
+  await taskStore.updateTask("fixture","A-10",
+    {status:"阻断",assignee:"",sessionId:"",sessionWindowName:""},
+    {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      operationId:"fixture.return-block.result",eventType:"test_result",
+      actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session",
+      metadata:{atomicLifecycle:true,testResult:"blocked",reportPath:"reports/qa-block.md",
+        commitSha:"1".repeat(40)}});
+  await taskStore.updateTask("fixture","A-10",{status:"HOLD"},
+    {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      operationId:"fixture.return-block.hold",eventType:"developer_user_directed_bugfix_hold",
+      actorType:"developer_ai",actorId:"repair",sessionId:"repair-session"});
+  await taskStore.updateTask("fixture","A-10",{status:"测试失败待修复"},
+    {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      operationId:"fixture.return-block.return-dev",eventType:"developer_user_directed_bugfix_requeue",
+      actorType:"developer_ai",actorId:"repair",sessionId:"repair-session"});
+  const repair=await taskStore.updateTask("fixture","A-10",
+    {status:"修复中",assignee:"repair",sessionWindowName:"repair",sessionId:"repair-session"},
+    {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      operationId:"fixture.return-block.devclaim",eventType:"claim",
+      actorType:"developer_ai",actorId:"repair",sessionId:"repair-session"});
+  const before=await cp.show("fixture","A-10");
+  assert.equal(before.state.cursors.developer_ai,"D09_MERGE_MAIN");
+  assert.equal(before.state.cursors.test_ai,"Q02_TEST");
+  await taskStore.appendTaskEvent("fixture","A-10",{
+    operationId:"fixture.return-block.stop",eventType:"stop_request",actorType:"user",note:"用户停止"
+  });
+  await assert.rejects(step(cp,"developer_ai","D01_CLAIM",{
+    actorId:"repair",sessionId:"repair-session",eventId:repair.eventId
+  }),e=>e.code==="CHECKPOINT_STEP_ORDER");
+  assert.equal((await cp.show("fixture","A-10")).sha256,before.sha256);
+  await taskStore.appendTaskEvent("fixture","A-10",{
+    operationId:"fixture.return-block.resume",eventType:"resume",actorType:"user",note:"用户恢复"
+  });
+  await assert.rejects(step(cp,"developer_ai","D01_CLAIM",{
+    actorId:"developer",sessionId:"developer_ai.session",eventId:repair.eventId
+  }),e=>e.code==="CHECKPOINT_SESSION_MISMATCH");
+  const resumed=await step(cp,"developer_ai","D01_CLAIM",{
+    actorId:"repair",sessionId:"repair-session",eventId:repair.eventId
+  });
+  assert.equal(resumed.state.attempts,before.state.attempts+1);
+  assert.equal(resumed.state.cursors.developer_ai,"D02_WORKTREE");
+  assert.equal(resumed.state.cursors.test_ai,"Q01_ADMISSION");
+  assert.ok(resumed.state.records.some(x=>x.attempt===before.state.attempts
+    && x.stepId==="Q02_TEST" && x.result==="BLOCK"));
+  assert.ok(resumed.state.records.some(x=>x.attempt===resumed.state.attempts
+    && x.stepId==="D01_CLAIM" && x.eventId===repair.eventId));
+  assert.equal(resumed.state.records.some(x=>x.attempt===resumed.state.attempts
+    && x.stepId==="Q01_ADMISSION"),false);
+  await assert.rejects(step(cp,"developer_ai","D02_WORKTREE",{
+    actorId:"developer",sessionId:"developer_ai.session"
+  }),e=>e.code==="CHECKPOINT_SESSION_MISMATCH");
+});
+test("spoofed user-command bugfix transitions cannot reopen D01",async(t)=>{
+  const {cp,taskStore}=await fixture(t);
+  await controllerReady(taskStore,cp);
+  const original=await claimDev(taskStore);
+  await step(cp,"developer_ai","D01_CLAIM",{eventId:original.eventId});
+  for(const id of ROLE_STAGE_STEPS.developer_ai.slice(1,7))await step(cp,"developer_ai",id);
+  const priorHandoff=await taskStore.updateTask("fixture","A-10",
+    {status:"待独测",assignee:"",sessionWindowName:"",sessionId:""},
+    {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      operationId:"fixture.return-block.handoff",eventType:"handoff",
+      actorType:"developer_ai",actorId:"developer",sessionId:"developer_ai.session",
+      metadata:{atomicLifecycle:true,completedFromStatus:"开发中",handoffTarget:"待独测",
+        commitSha:"1".repeat(40)}});
+  await step(cp,"developer_ai","D08_HANDOFF",{eventId:priorHandoff.eventId});
+  const qa=await taskStore.updateTask("fixture","A-10",
+    {status:"独测中",assignee:"qa",sessionWindowName:"qa",sessionId:"test_ai.session"},
+    {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      operationId:"fixture.return-block.qa-claim",eventType:"claim",
+      actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session"});
+  await step(cp,"test_ai","Q01_ADMISSION",{eventId:qa.eventId});
+  await step(cp,"test_ai","Q02_TEST",{result:"BLOCK"});
+  await taskStore.updateTask("fixture","A-10",
+    {status:"阻断",assignee:"",sessionId:"",sessionWindowName:""},
+    {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      operationId:"fixture.return-block.result",eventType:"test_result",
+      actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session",
+      metadata:{atomicLifecycle:true,testResult:"blocked",reportPath:"reports/qa-block.md",
+        commitSha:"1".repeat(40)}});
+  await taskStore.updateTask("fixture","A-10",{status:"HOLD"},
+    {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      operationId:"fixture.return-block.hold",eventType:"developer_user_directed_bugfix_hold",
+      actorType:"developer_ai",actorId:"intruder",sessionId:"fake-session"});
+  await taskStore.updateTask("fixture","A-10",{status:"测试失败待修复"},
+    {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      operationId:"fixture.return-block.return-dev",eventType:"developer_user_directed_bugfix_requeue",
+      actorType:"developer_ai",actorId:"intruder",sessionId:"fake-session"});
+  const repair=await taskStore.updateTask("fixture","A-10",
+    {status:"修复中",assignee:"repair",sessionWindowName:"repair",sessionId:"repair-session"},
+    {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      operationId:"fixture.return-block.devclaim",eventType:"claim",
+      actorType:"developer_ai",actorId:"repair",sessionId:"repair-session"});
+  const before=await cp.show("fixture","A-10");
+  assert.equal(before.state.cursors.developer_ai,"D09_MERGE_MAIN");
+  assert.equal(before.state.cursors.test_ai,"Q02_TEST");
+  await assert.rejects(step(cp,"developer_ai","D01_CLAIM",{
+    actorId:"repair",sessionId:"repair-session",eventId:repair.eventId
+  }),e=>e.code==="CHECKPOINT_STEP_ORDER");
+  assert.equal((await cp.show("fixture","A-10")).sha256,before.sha256);
+});
+
 test("QA BLOCK return cannot restart developer D01 with forged or late controller dispatch",async(t)=>{
   const {cp,taskStore}=await fixture(t);
   await controllerReady(taskStore,cp);
