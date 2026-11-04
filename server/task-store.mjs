@@ -188,9 +188,19 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
   const history = await store.events.listTaskEvents(projectId, task.id, { all: true });
   const blocked = [...history].reverse().find((event) =>
     event.old_status !== "阻断" && event.new_status === "阻断");
-  if (blocked?.event_type !== "temporary_block" || blocked.actor_type !== "system") return null;
+  const developerPause = blocked?.event_type === "developer_paused_for_independent_full_suite_gate";
+  if (developerPause) {
+    if (blocked.actor_type !== "developer_ai" || blocked.old_status !== "开发中") return null;
+    const claim = history.slice(0, history.indexOf(blocked)).findLast((event) =>
+      ["claim", "takeover"].includes(event.event_type) && event.actor_type === "developer_ai" &&
+      event.actor_id === blocked.actor_id && event.session_id === blocked.session_id &&
+      event.new_status === "开发中");
+    if (!claim || !blocked.session_id) return null;
+  } else if (blocked?.event_type !== "temporary_block" || blocked.actor_type !== "system") return null;
   const target = TEMPORARY_RESTORE.get(blocked.old_status);
-  const conditions = blocked.metadata?.conditions;
+  const conditions = developerPause
+    ? [{ kind: "dependency_completed", taskId: blocked.metadata?.requiredTask }]
+    : blocked.metadata?.conditions;
   if (!target || !Array.isArray(conditions) || !conditions.length || conditions.length > 8) return null;
   if ((await store.stopState(projectId, task.id)).stopRequested) return null;
   const lastFailure = history.findLastIndex((event) =>
@@ -210,7 +220,8 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
   for (const condition of conditions) {
     if (!condition || typeof condition !== "object") return null;
     if (condition.kind === "dependency_completed") {
-      if (!dependencies.includes(condition.taskId + "完成") ||
+      if (typeof condition.taskId !== "string" || condition.taskId === task.id ||
+        (!developerPause && !dependencies.includes(condition.taskId + "完成")) ||
         byId.get(condition.taskId)?.status !== "已完成") return null;
     } else if (condition.kind === "owner_released") {
       const other = byId.get(condition.taskId);
@@ -623,7 +634,7 @@ export class TaskStore {
     for (const task of before.tasks) {
       const blocked = [...(history.get(task.id) || [])].reverse().find((event) =>
         event.old_status !== "阻断" && event.new_status === "阻断");
-      if (blocked?.event_type !== "temporary_block") continue;
+      if (!["temporary_block", "developer_paused_for_independent_full_suite_gate"].includes(blocked?.event_type)) continue;
       const operationId = autoUnblockOperationId(projectId, task.id, blocked.event_id);
       const transaction = await this.transactions.read(operationId);
       if (!transaction || ["committed", "aborted_no_effect"].includes(transaction.state)) continue;
