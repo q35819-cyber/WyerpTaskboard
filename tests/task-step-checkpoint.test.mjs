@@ -961,11 +961,9 @@ test("a formally dispatched and claimed task can start D01 without fabricated ol
     operationId:"fixture.dependency.dispatch",eventType:"controller_dispatch_p0",
     actorType:"controller_ai",actorId:"controller",sessionId:"controller-session"
   });
-  const blockedClaim=await claimDev(blocked.taskStore);
   const before=await blocked.cp.show("fixture","A-10");
-  await assert.rejects(step(blocked.cp,"developer_ai","D01_CLAIM",{
-    eventId:blockedClaim.eventId
-  }),e=>e.code==="CHECKPOINT_PREDECESSOR_REQUIRED");
+  await assert.rejects(claimDev(blocked.taskStore),
+    e=>e.code==="CLAIM_DEPENDENCY_NOT_COMPLETED");
   assert.equal((await blocked.cp.show("fixture","A-10")).sha256,before.sha256);
 });
 
