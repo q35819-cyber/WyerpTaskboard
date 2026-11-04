@@ -178,6 +178,32 @@ async function assertDeveloperClaimExclusive(store, projectId, context, parsed, 
   }
 }
 
+async function firstClaimableP0Bug(store, projectId, tasks, actorId, sessionId) {
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+  for (const task of tasks) {
+    if (task.track !== "bugfix" || task.priority !== "P0" ||
+      !["待准备", "待开发", "待执行", "测试失败待修复"].includes(task.status) ||
+      task.assignee || task.sessionId || task.plannedRole !== "开发AI" ||
+      !String(task.writeTargets || "").trim() || hardDependencyBlockers(task, byId).length) continue;
+    if ((await store.stopState(projectId, task.id)).stopRequested) continue;
+    const takeover = await store.takeoverState(projectId, task.id);
+    if (takeover.suspectedDisconnect && !takeover.takeoverAllowed) continue;
+    const messages = await store.userMessageState(projectId, task.id, {
+      actorType: "developer_ai", actorId, sessionId
+    });
+    if (messages.requiresAcknowledgement ||
+      (messages.messages?.at(-1) && !messages.messages.at(-1).replies?.length)) continue;
+    if (task.status === "测试失败待修复") {
+      const history = await store.events.listTaskEvents(projectId, task.id, { all: true });
+      const original = [...history].reverse().find((event) =>
+        event.actor_type === "developer_ai" && ["claim", "takeover"].includes(event.event_type));
+      if (original?.actor_id !== actorId) continue;
+    }
+    return task.id;
+  }
+  return null;
+}
+
 const TEMPORARY_RESTORE = new Map([
   ["待准备", "待准备"], ["待开发", "待开发"], ["开发中", "待开发"],
   ["待独测", "待独测"], ["独测中", "待独测"],
@@ -747,6 +773,19 @@ export class TaskStore {
         }
         await assertDeveloperClaimExclusive(this, projectId, context, parsed, currentTask,
           actorId, sessionId, Boolean(provisional));
+        if (["待准备", "待开发", "待执行"].includes(currentTask.status) &&
+          currentTask.track !== "bugfix") {
+          const history = await this.events.listTaskEvents(projectId, currentTask.id, { all: true });
+          const urgency = [...history].reverse().find((event) =>
+            event.actor_type === "user" && event.event_type === "priority_change" &&
+            typeof event.metadata?.urgent === "boolean");
+          if (urgency?.metadata?.urgent !== true) {
+            const bugId = await firstClaimableP0Bug(this, projectId, parsed.tasks, actorId, sessionId);
+            if (bugId) throw new TaskboardError("请先领取当前可执行的P0 BUG修复任务", {
+              code: "BUGFIX_PRIORITY_REQUIRED", status: 409, details: { bugTaskId: bugId, projectId }
+            });
+          }
+        }
       }
       if (dependencyBlockers.length && (["handoff", "test_result", "delivery_complete"].includes(eventType)
         || (eventType === "claim" && actorType === "test_ai"))) {

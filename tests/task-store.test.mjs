@@ -268,3 +268,135 @@ test("test resource lifecycle projects preserved, observed, stale and cleaned st
   assert.equal(state.activeCount, 0);
   assert.equal(state.items[0].status, "已清理");
 });
+
+// P0 bugfix claim priority uses the real TaskStore transaction and registered task states.
+test("new ordinary developer claim is refused while a claimable P0 BUG exists", async (t) => {
+  const f = await makeFixture();
+  t.after(() => fs.rm(f.boardRoot, { recursive: true, force: true }));
+  const row = (id, track, status = "待开发", dependency = "") => [
+    id, "F-PRIORITY", track, "P0", status, "开发AI", "—", "—", "—", "—",
+    "P0 BUG priority", "plan.md", "trace/" + id, dependency,
+    "src/" + id + ".js", "cp/" + id + ".md"
+  ];
+  await fs.writeFile(f.registryPath, registryText([
+    row("NORMAL-10", "product"), row("BUG-10", "bugfix")
+  ]), "utf8");
+  const store = await new TaskStore(f.boardRoot).init();
+  let seq = 0;
+  const claim = async (id, actor) => {
+    const snap = await store.snapshot("fixture");
+    return store.updateTask("fixture", id, {
+      status: "开发中", assignee: actor, sessionWindowName: actor, sessionId: actor + "-session"
+    }, {
+      expectedRevision: snap.registryRevision, operationId: "priority.claim." + (++seq),
+      eventType: "claim", actorType: "developer_ai", actorId: actor,
+      sessionId: actor + "-session", sessionWindowName: actor
+    });
+  };
+  const before = (await store.snapshot("fixture")).registryRevision;
+  await assert.rejects(claim("NORMAL-10", "dev-normal"), (error) =>
+    error.code === "BUGFIX_PRIORITY_REQUIRED" && error.status === 409 &&
+    error.details.bugTaskId === "BUG-10");
+  assert.equal((await store.snapshot("fixture")).registryRevision, before, "blocked claim cannot mutate tasks");
+  assert.equal((await claim("BUG-10", "dev-bug")).after.status, "开发中");
+  assert.equal((await claim("NORMAL-10", "dev-normal")).after.status, "开发中",
+    "after a different developer owns the BUG, ordinary work must not deadlock");
+});
+
+test("P0 priority never traps normal claims behind STOP, dependencies or someone else's QA failure", async (t) => {
+  const cases = ["stop", "dependency", "other-owner", "hold", "missing-write"];
+  for (const kind of cases) {
+    const f = await makeFixture();
+    t.after(() => fs.rm(f.boardRoot, { recursive: true, force: true }));
+    const bugStatus = kind === "hold" ? "HOLD" : kind === "other-owner" ? "测试失败待修复" : "待开发";
+    const row = (id, track, status, dependency = "", writes = "src/" + id + ".js") =>
+      [id, "F-PRIORITY", track, "P0", status,
+        status === "HOLD" ? "" : "开发AI", "—", "—", "—", "—", "priority",
+        "plan.md", "trace/" + id, dependency, writes, "cp/" + id + ".md"];
+    await fs.writeFile(f.registryPath, registryText([
+      row("NORMAL-10", "product", "待开发"),
+      row("BUG-10", "bugfix", bugStatus,
+        kind === "dependency" ? "MISSING-10完成" : "",
+        kind === "missing-write" ? "" : "src/BUG-10.js")
+    ]), "utf8");
+    const store = await new TaskStore(f.boardRoot).init();
+    if (kind === "stop") await store.appendTaskEvent("fixture", "BUG-10", {
+      operationId: "priority.bug.stop", eventType: "stop_request",
+      actorType: "user", actorId: "user", sessionId: "user", note: "STOP"
+    });
+    if (kind === "other-owner") await store.appendTaskEvent("fixture", "BUG-10", {
+      operationId: "priority.bug.old.dev", eventType: "claim",
+      actorType: "developer_ai", actorId: "original-developer", sessionId: "old-session"
+    });
+    const snap = await store.snapshot("fixture");
+    const result = await store.updateTask("fixture", "NORMAL-10", {
+      status: "开发中", assignee: "new-developer", sessionWindowName: "normal",
+      sessionId: "normal-session"
+    }, {
+      expectedRevision: snap.registryRevision,
+      operationId: "priority.normal." + kind, eventType: "claim",
+      actorType: "developer_ai", actorId: "new-developer", sessionId: "normal-session"
+    });
+    assert.equal(result.after.status, "开发中", kind);
+  }
+});
+
+test("P0 BUG returned from QA to its original developer keeps repair priority", async (t) => {
+  const f = await makeFixture();
+  t.after(() => fs.rm(f.boardRoot, { recursive: true, force: true }));
+  const row = (id, track, status) => [id, "F-PRIORITY", track, "P0",
+    status, "开发AI", "—", "—", "—", "—", "priority", "plan.md",
+    "trace/" + id, "", "src/" + id + ".js", "cp/" + id + ".md"];
+  await fs.writeFile(f.registryPath, registryText([
+    row("NORMAL-10", "product", "待开发"),
+    row("BUG-10", "bugfix", "测试失败待修复")
+  ]), "utf8");
+  const store = await new TaskStore(f.boardRoot).init();
+  await store.appendTaskEvent("fixture", "BUG-10", {
+    operationId: "priority.original.claim", eventType: "claim",
+    actorType: "developer_ai", actorId: "original-developer", sessionId: "old-session"
+  });
+  const snap = await store.snapshot("fixture");
+  await assert.rejects(store.updateTask("fixture", "NORMAL-10", {
+    status: "开发中", assignee: "original-developer",
+    sessionId: "new-original-session", sessionWindowName: "repair"
+  }, {
+    expectedRevision: snap.registryRevision, operationId: "priority.original.normal",
+    eventType: "claim", actorType: "developer_ai", actorId: "original-developer",
+    sessionId: "new-original-session"
+  }), (error) => error.code === "BUGFIX_PRIORITY_REQUIRED" &&
+    error.details.bugTaskId === "BUG-10");
+});
+
+test("an explicit user urgent priority event can override BUG-first for that ordinary task only", async (t) => {
+  const f = await makeFixture();
+  t.after(() => fs.rm(f.boardRoot, { recursive: true, force: true }));
+  const row = (id, track) => [id, "F-URGENT", track, "P0", "待开发",
+    "开发AI", "—", "—", "—", "—", "priority", "plan.md",
+    "trace/" + id, "", "src/" + id + ".js", "cp/" + id + ".md"];
+  await fs.writeFile(f.registryPath, registryText([
+    row("URGENT-10", "product"), row("REGULAR-10", "product"), row("BUG-10", "bugfix")
+  ]), "utf8");
+  const store = await new TaskStore(f.boardRoot).init();
+  for (const [id, urgent] of [["URGENT-10", true], ["REGULAR-10", false]]) {
+    await store.appendTaskEvent("fixture", id, {
+      operationId: "priority.user.urgent." + id, eventType: "priority_change",
+      actorType: "user", actorId: "owner", sessionId: "user", metadata: { urgent }
+    });
+  }
+  const claim = async (id, actor) => {
+    const snapshot = await store.snapshot("fixture");
+    return store.updateTask("fixture", id, {
+      status: "开发中", assignee: actor, sessionId: actor + "-session",
+      sessionWindowName: actor
+    }, {
+      expectedRevision: snapshot.registryRevision,
+      operationId: "priority.urgent.claim." + id,
+      actorType: "developer_ai", actorId: actor, sessionId: actor + "-session",
+      eventType: "claim"
+    });
+  };
+  assert.equal((await claim("URGENT-10", "dev-urgent")).after.status, "开发中");
+  await assert.rejects(claim("REGULAR-10", "dev-regular"), (error) =>
+    error.code === "BUGFIX_PRIORITY_REQUIRED" && error.details.bugTaskId === "BUG-10");
+});

@@ -219,6 +219,7 @@ export class CandidateEvaluator {
       }
     }
 
+    const explicitUrgentOverrides = new Set();
     for (const task of parsed.tasks) {
       let delivery = null;
       if (task.status === "待交付") {
@@ -253,6 +254,8 @@ export class CandidateEvaluator {
       const userUrgent = typeof urgency?.metadata?.urgent === "boolean"
         ? urgency.metadata.urgent
         : urgency?.event_type === "priority_change" && urgency.new_priority === "P0";
+      if (urgency?.event_type === "priority_change" && urgency.metadata?.urgent === true)
+        explicitUrgentOverrides.add(task.id);
       const priorDeveloper = [...developerEvents].reverse().find((event) =>
         event.actor_type === "developer_ai" && ["claim", "takeover"].includes(event.event_type));
       const autoUnblockedBug = eligibleRole === "developer_ai" &&
@@ -297,6 +300,21 @@ export class CandidateEvaluator {
         detected_at: detectedAt,
         requires_runtime_recheck: ["actor_scope_user_messages", "active_webcodex_jobs", "resource_conflicts", "test_ai_independence"],
       });
+    }
+
+    const readyBug = candidates.find((candidate) =>
+      candidate.eligible && candidate.eligible_role === "developer_ai" &&
+      candidate.track === "bugfix" && candidate.priority === "P0" &&
+      ["待准备", "待开发", "待执行"].includes(candidate.status));
+    if (readyBug) {
+      for (const candidate of candidates) {
+        if (candidate.eligible_role !== "developer_ai" ||
+          !["待准备", "待开发", "待执行"].includes(candidate.status) ||
+          candidate.track === "bugfix" || explicitUrgentOverrides.has(candidate.task_id)) continue;
+        candidate.blockers.push("请先修复可领取的P0 BUG：" + readyBug.task_id);
+        candidate.eligible = false;
+        candidate.reason = candidate.blockers.join("；");
+      }
     }
 
     return {
