@@ -180,6 +180,58 @@ export class TaskStepCheckpoint {
           }
         }
       }
+      let resumedQaAttempt = false;
+      if (actorType === "test_ai" && stepId === "Q01_ADMISSION" && result === "PASS"
+        && state.cursors.test_ai !== "Q01_ADMISSION") {
+        const qaIndex = history.findLastIndex((e) => e.actor_type === "test_ai"
+          && ["claim", "takeover"].includes(e.event_type));
+        const qaClaim = history[qaIndex];
+        if (qaClaim && (qaClaim.actor_id !== actorId || qaClaim.session_id !== sessionId))
+          throw invalid("CHECKPOINT_SESSION_MISMATCH", "旧独测Session不得重开Q01", 403);
+        const verdictIndex = history.findLastIndex((e, i) => i < qaIndex
+          && e.actor_type === "test_ai" && e.event_type === "test_result"
+          && e.metadata?.atomicLifecycle === true
+          && ["blocked", "fail", "pass"].includes(e.metadata?.testResult));
+        const verdict = history[verdictIndex];
+        const formerQA = verdictIndex >= 0 && [...history.slice(0, verdictIndex)].reverse().find(
+          (e) => e.actor_type === "test_ai" && ["claim", "takeover"].includes(e.event_type));
+        const between = history.slice(verdictIndex + 1, qaIndex);
+        const restored = between.some((e) => e.actor_type === "controller_ai"
+          && e.event_type.startsWith("controller_")
+          && e.old_status === "阻断" && e.new_status === "待复测");
+        const failedDelivery = between.some((e) => e.event_type.startsWith("controller_")
+          && ["待交付", "交付中"].includes(e.old_status) && e.new_status === "阻断");
+        const repair = [...between].reverse().find((e) => e.actor_type === "developer_ai"
+          && e.event_type === "handoff" && e.old_status === "修复中"
+          && e.new_status === "待复测" && e.metadata?.atomicLifecycle === true);
+        const repairIndex = repair ? history.indexOf(repair) : -1;
+        const repairClaim = repairIndex >= 0 && [...history.slice(0, repairIndex)].reverse().find(
+          (e) => e.actor_type === "developer_ai" && ["claim", "takeover"].includes(e.event_type));
+        const oldSha = String(verdict?.metadata?.commitSha || "");
+        const repairedSha = String(repair?.metadata?.commitSha || "");
+        const changedSha = !(/^[a-f0-9]{40}$/i.test(oldSha) && /^[a-f0-9]{40}$/i.test(repairedSha)
+          && oldSha.toLowerCase() === repairedSha.toLowerCase());
+        const genuineRepair = repair && repairClaim && changedSha
+          && repair.actor_id === repairClaim.actor_id && repair.session_id === repairClaim.session_id;
+        const validRestart = (verdict?.metadata?.testResult === "blocked"
+            && verdict.new_status === "阻断" && restored)
+          || (verdict?.metadata?.testResult === "pass" && verdict.new_status === "待交付"
+            && failedDelivery && restored)
+          || (["blocked", "fail"].includes(verdict?.metadata?.testResult) && genuineRepair);
+        if (qaClaim?.event_id === eventId && qaClaim.actor_id === actorId
+          && qaClaim.session_id === sessionId && qaClaim.old_status === "待复测"
+          && qaClaim.new_status === "复测中" && task.status === "复测中"
+          && task.sessionId === sessionId && formerQA
+          && formerQA.actor_id === verdict?.actor_id && formerQA.session_id === verdict?.session_id
+          && state.records.some((r) => r.stepId === "Q01_ADMISSION"
+            && r.result === "PASS" && r.attempt === state.attempts)
+          && validRestart && !(await this.taskStore.stopState(projectId, taskId)).stopRequested
+          && await hardDependenciesCompleted(this.taskStore, projectId, task)) {
+          state.attempts += 1;
+          state.cursors.test_ai = "Q01_ADMISSION";
+          resumedQaAttempt = true;
+        }
+      }
       if (state.cursors[actorType] !== stepId) {
         throw invalid("CHECKPOINT_STEP_ORDER", "上一步尚未通过，不得越级执行；请先读取唯一下一步");
       }
@@ -283,6 +335,7 @@ export class TaskStepCheckpoint {
         throw invalid("CHECKPOINT_DELIVERY_NOT_CLOSED", "任务未在真实看板关闭");
       }
       if (result === "PASS" && stepId === "Q01_ADMISSION"
+        && !resumedQaAttempt
         && !state.records.some((r) => r.stepId === "D08_HANDOFF" && r.result === "PASS"
           && r.attempt === state.attempts)) {
         // The formal handoff may have released the developer before D08 could be saved.

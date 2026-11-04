@@ -266,6 +266,201 @@ test("existing Q01 FAIL history may be retained during zero-developer-checkpoint
   assert.equal(recovered.state.records[1].eventId,handoff.eventId);
   assert.equal(recovered.state.records[2].result,"PASS");
 });
+test("new QA Q01 reopens only with a real controller-requeued Q02 BLOCK or finished Q04", async(t) => {
+  for (const finished of [false, true]) {
+    const {cp,taskStore}=await fixture(t);
+    const label=finished?"finished":"q02block";
+    await claimDev(taskStore);
+    const handoff=await taskStore.updateTask("fixture","A-10",
+      {status:"待独测",assignee:"",sessionWindowName:"",sessionId:""},
+      {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+        operationId:"fixture.resume."+label+".handoff",eventType:"handoff",
+        actorType:"developer_ai",actorId:"developer",sessionId:"developer_ai.session",
+        metadata:{atomicLifecycle:true,completedFromStatus:"开发中",handoffTarget:"待独测"}});
+    const qa1=await taskStore.updateTask("fixture","A-10",
+      {status:"独测中",assignee:"qa",sessionWindowName:"qa",sessionId:"test_ai.session"},
+      {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+        operationId:"fixture.resume."+label+".qa1",eventType:"claim",
+        actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session"});
+    await step(cp,"test_ai","Q01_ADMISSION",{eventId:qa1.eventId});
+    await step(cp,"test_ai","Q02_TEST",finished?{}:{result:"BLOCK"});
+    const testResult=await taskStore.updateTask("fixture","A-10",
+      {status:finished?"待交付":"阻断",assignee:"",sessionId:"",sessionWindowName:""},
+      {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+        operationId:"fixture.resume."+label+".result",eventType:"test_result",
+        actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session",
+        metadata:{atomicLifecycle:true,testResult:finished?"pass":"blocked",
+          acceptanceScope:"system",deliveryActions:finished?["candidate_merge"]:[],
+          reportPath:"reports/qa-"+label+".md"}});
+    if(finished) {
+      await step(cp,"test_ai","Q03_RESULT",{eventId:testResult.eventId});
+      await step(cp,"test_ai","Q04_NEXT");
+      assert.equal((await cp.show("fixture","A-10")).state.cursors.test_ai,null);
+      await taskStore.updateTask("fixture","A-10",
+        {status:"交付中",assignee:"controller",sessionId:"controller-session",sessionWindowName:"controller"},
+        {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+          operationId:"fixture.resume.finished.controller-claim",eventType:"claim",
+          actorType:"controller_ai",actorId:"controller",sessionId:"controller-session"});
+      await taskStore.updateTask("fixture","A-10",
+        {status:"阻断",assignee:"",sessionId:"",sessionWindowName:""},
+        {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+          operationId:"fixture.resume.finished.delivery-block",eventType:"controller_postmerge_regression_blocked",
+          actorType:"controller_ai",actorId:"controller",sessionId:"controller-session"});
+    } else {
+      assert.equal((await cp.show("fixture","A-10")).state.cursors.test_ai,"Q02_TEST");
+    }
+    await taskStore.updateTask("fixture","A-10",{status:"待复测"},
+      {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+        operationId:"fixture.resume."+label+".controller-requeue",eventType:"controller_requeue",
+        actorType:"controller_ai",actorId:"controller",sessionId:"controller-session"});
+    const qa2=await taskStore.updateTask("fixture","A-10",
+      {status:"复测中",assignee:"qa-new",sessionWindowName:"qa-new",sessionId:"new-qa-session"},
+      {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+        operationId:"fixture.resume."+label+".qa2",eventType:"claim",
+        actorType:"test_ai",actorId:"qa-new",sessionId:"new-qa-session"});
+    const before=await cp.show("fixture","A-10");
+    if(!finished) {
+      await taskStore.appendTaskEvent("fixture","A-10",{
+        operationId:"fixture.resume.q02block.stop",eventType:"stop_request",
+        actorType:"user",note:"暂停此独测"});
+      await assert.rejects(step(cp,"test_ai","Q01_ADMISSION",{
+        actorId:"qa-new",sessionId:"new-qa-session",eventId:qa2.eventId
+      }),e=>e.code==="CHECKPOINT_STEP_ORDER");
+      assert.equal((await cp.show("fixture","A-10")).sha256,before.sha256);
+      await taskStore.appendTaskEvent("fixture","A-10",{
+        operationId:"fixture.resume.q02block.resume",eventType:"resume",
+        actorType:"user",note:"重新授权后继续"});
+    }
+    await assert.rejects(step(cp,"test_ai","Q01_ADMISSION",{
+      actorId:"qa",sessionId:"test_ai.session",eventId:qa2.eventId
+    }),e=>e.code==="CHECKPOINT_SESSION_MISMATCH");
+    assert.equal((await cp.show("fixture","A-10")).sha256,before.sha256);
+    const newStart=await step(cp,"test_ai","Q01_ADMISSION",{
+      actorId:"qa-new",sessionId:"new-qa-session",eventId:qa2.eventId
+    });
+    assert.equal(newStart.state.attempts,before.state.attempts+1);
+    assert.equal(newStart.state.cursors.test_ai,"Q02_TEST");
+    assert.equal(newStart.state.records.some(r=>r.attempt===before.state.attempts
+      && (finished?r.stepId==="Q04_NEXT"&&r.result==="PASS":r.stepId==="Q02_TEST"&&r.result==="BLOCK")),true);
+    assert.equal(newStart.state.records.some(r=>r.attempt===newStart.state.attempts
+      && r.stepId==="D08_HANDOFF"&&r.result==="PASS"),false);
+    assert.ok(handoff.eventId);
+  }
+});
+
+test("Q02 recovery rejects fake controller restoration and true QA FAIL without repair", async(t) => {
+  for (const mode of ["fake-controller", "unrepaired-fail"]) {
+    const {cp,taskStore}=await fixture(t);
+    await claimDev(taskStore);
+    await taskStore.updateTask("fixture","A-10",
+      {status:"待独测",assignee:"",sessionWindowName:"",sessionId:""},
+      {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+        operationId:"fixture.q02negative."+mode+".handoff",eventType:"handoff",
+        actorType:"developer_ai",actorId:"developer",sessionId:"developer_ai.session",
+        metadata:{atomicLifecycle:true,completedFromStatus:"开发中",handoffTarget:"待独测"}});
+    const qa1=await taskStore.updateTask("fixture","A-10",
+      {status:"独测中",assignee:"qa",sessionWindowName:"qa",sessionId:"test_ai.session"},
+      {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+        operationId:"fixture.q02negative."+mode+".qa1",eventType:"claim",
+        actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session"});
+    await step(cp,"test_ai","Q01_ADMISSION",{eventId:qa1.eventId});
+    await step(cp,"test_ai","Q02_TEST",{result:"BLOCK"});
+    const realBlock = mode === "fake-controller";
+    await taskStore.updateTask("fixture","A-10",
+      {status:realBlock?"阻断":"测试失败待修复",assignee:"",sessionWindowName:"",sessionId:""},
+      {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+        operationId:"fixture.q02negative."+mode+".result",eventType:"test_result",
+        actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session",
+        metadata:{atomicLifecycle:true,testResult:realBlock?"blocked":"fail",
+          reportPath:"reports/qa-"+mode+".md",commitSha:"1".repeat(40)}});
+    if (!realBlock) {
+      await taskStore.updateTask("fixture","A-10",{status:"阻断"},{
+        expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+        operationId:"fixture.q02negative.fail.controllerblock",eventType:"controller_block",
+        actorType:"controller_ai",actorId:"controller",sessionId:"controller-session"});
+    }
+    await taskStore.updateTask("fixture","A-10",{status:"待复测"},{
+      expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      operationId:"fixture.q02negative."+mode+".requeue",
+      eventType:realBlock?"fake_requeue":"controller_requeue",
+      actorType:realBlock?"developer_ai":"controller_ai",
+      actorId:realBlock?"developer":"controller",
+      sessionId:realBlock?"developer_ai.session":"controller-session"});
+    const qa2=await taskStore.updateTask("fixture","A-10",
+      {status:"复测中",assignee:"qa-new",sessionWindowName:"qa-new",sessionId:"qa-new-session"},
+      {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+        operationId:"fixture.q02negative."+mode+".qa2",eventType:"claim",
+        actorType:"test_ai",actorId:"qa-new",sessionId:"qa-new-session"});
+    const previous=await cp.show("fixture","A-10");
+    await assert.rejects(step(cp,"test_ai","Q01_ADMISSION",{
+      actorId:"qa-new",sessionId:"qa-new-session",eventId:qa2.eventId
+    }),e=>e.code==="CHECKPOINT_STEP_ORDER");
+    assert.equal((await cp.show("fixture","A-10")).sha256,previous.sha256);
+    assert.equal((await cp.show("fixture","A-10")).state.attempts,previous.state.attempts);
+  }
+});
+
+test("a genuine QA FAIL reopens Q01 after repaired handoff but rejects reused candidate SHA",async(t)=>{
+  for (const unchanged of [false,true]) {
+    const {cp,taskStore}=await fixture(t);
+    const label=unchanged?"same":"new";
+    await claimDev(taskStore);
+    await taskStore.updateTask("fixture","A-10",
+      {status:"待独测",assignee:"",sessionId:"",sessionWindowName:""},
+      {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+        operationId:"fixture.failqa."+label+".handoff",eventType:"handoff",
+        actorType:"developer_ai",actorId:"developer",sessionId:"developer_ai.session",
+        metadata:{atomicLifecycle:true,completedFromStatus:"开发中",handoffTarget:"待独测",
+          commitSha:"1".repeat(40)}});
+    const qa1=await taskStore.updateTask("fixture","A-10",
+      {status:"独测中",assignee:"qa",sessionWindowName:"qa",sessionId:"test_ai.session"},
+      {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+        operationId:"fixture.failqa."+label+".qa1",eventType:"claim",
+        actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session"});
+    await step(cp,"test_ai","Q01_ADMISSION",{eventId:qa1.eventId});
+    await step(cp,"test_ai","Q02_TEST",{result:"FAIL"});
+    await taskStore.updateTask("fixture","A-10",
+      {status:"测试失败待修复",assignee:"",sessionWindowName:"",sessionId:""},
+      {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+        operationId:"fixture.failqa."+label+".fail",eventType:"test_result",
+        actorType:"test_ai",actorId:"qa",sessionId:"test_ai.session",
+        metadata:{atomicLifecycle:true,testResult:"fail",reportPath:"reports/real-fail.md",
+          commitSha:"1".repeat(40)}});
+    await taskStore.updateTask("fixture","A-10",
+      {status:"修复中",assignee:"repair",sessionWindowName:"repair",sessionId:"repair-session"},
+      {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+        operationId:"fixture.failqa."+label+".devclaim",eventType:"claim",
+        actorType:"developer_ai",actorId:"repair",sessionId:"repair-session"});
+    await taskStore.updateTask("fixture","A-10",
+      {status:"待复测",assignee:"",sessionId:"",sessionWindowName:""},
+      {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+        operationId:"fixture.failqa."+label+".repaired",eventType:"handoff",
+        actorType:"developer_ai",actorId:"repair",sessionId:"repair-session",
+        metadata:{atomicLifecycle:true,completedFromStatus:"修复中",handoffTarget:"待复测",
+          commitSha:unchanged?"1".repeat(40):"2".repeat(40)}});
+    const qa2=await taskStore.updateTask("fixture","A-10",
+      {status:"复测中",assignee:"qa-new",sessionWindowName:"qa-new",sessionId:"qa-new-session"},
+      {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+        operationId:"fixture.failqa."+label+".qa2",eventType:"claim",
+        actorType:"test_ai",actorId:"qa-new",sessionId:"qa-new-session"});
+    const before=await cp.show("fixture","A-10");
+    if(unchanged) {
+      await assert.rejects(step(cp,"test_ai","Q01_ADMISSION",{
+        actorId:"qa-new",sessionId:"qa-new-session",eventId:qa2.eventId
+      }),e=>e.code==="CHECKPOINT_STEP_ORDER");
+      assert.equal((await cp.show("fixture","A-10")).sha256,before.sha256);
+    } else {
+      const done=await step(cp,"test_ai","Q01_ADMISSION",{
+        actorId:"qa-new",sessionId:"qa-new-session",eventId:qa2.eventId
+      });
+      assert.equal(done.state.attempts,before.state.attempts+1);
+      assert.equal(done.state.cursors.test_ai,"Q02_TEST");
+      assert.equal(done.state.records.some(r=>r.attempt===before.state.attempts
+        && r.stepId==="Q02_TEST" && r.result==="FAIL"),true);
+    }
+  }
+});
+
 test("independent BLOCK followed by real controller requeue permits new QA to recover unchanged handoff",async(t)=>{
   const {cp,taskStore}=await fixture(t);
   await claimDev(taskStore);
