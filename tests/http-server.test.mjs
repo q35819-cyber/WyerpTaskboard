@@ -5,22 +5,67 @@ import path from "node:path";
 import { createTaskboardServer } from "../server/http-server.mjs";
 import { makeFixture, registryText } from "./helpers.mjs";
 
-async function startFixture(t, serverOptions = {}) {
+async function startFixture(t, serverOptions = {}, probe = fetch) {
   const fixture = await makeFixture();
   const app = await createTaskboardServer({ rootDir: fixture.boardRoot, host: "127.0.0.1", port: 0, ...serverOptions });
-  await new Promise((resolve, reject) => {
-    app.server.once("error", reject);
-    app.server.listen(0, "127.0.0.1", resolve);
-  });
-  const port = app.server.address().port;
   t.after(async () => {
-    await new Promise((resolve) => app.server.close(resolve));
+    if (app.server.listening) await new Promise((resolve) => app.server.close(resolve));
     await fs.rm(fixture.boardRoot, { recursive: true, force: true });
   });
+  let port, base;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    await new Promise((resolve, reject) => {
+      app.server.once("error", reject);
+      app.server.listen(0, "127.0.0.1", () => {
+        app.server.off("error", reject);
+        resolve();
+      });
+    });
+    port = app.server.address().port;
+    base = `http://127.0.0.1:${port}`;
+    try {
+      await probe(base + "/api/auth/session");
+      break;
+    } catch (error) {
+      await new Promise((resolve) => app.server.close(resolve));
+      if (error?.cause?.message !== "bad port" || attempt === 9) throw error;
+    }
+  }
   const secret = JSON.parse(await fs.readFile(path.join(fixture.boardRoot, "config", "admin-secret.json"), "utf8")).adminSecret;
-  const base = `http://127.0.0.1:${port}`;
   return { fixture, app, port, base, secret };
 }
+
+test("HTTP fixture retries only fetch-forbidden ports and cleans failed attempts", async (t) => {
+  const badPort = () => new TypeError("fetch failed", { cause: new Error("bad port") });
+  let retries = 0;
+  const allowed = await startFixture(t, {}, async (url) => {
+    if (++retries === 1) throw badPort();
+    return fetch(url);
+  });
+  assert.ok(retries >= 2 && retries <= 10);
+  assert.equal((await fetch(allowed.base + "/api/auth/session")).status, 200);
+
+  async function rejectedFixture(error, expectedAttempts) {
+    const cleanups = [];
+    let attempts = 0;
+    try {
+      await assert.rejects(
+        startFixture({ after: (cleanup) => cleanups.push(cleanup) }, {}, async () => {
+          attempts++;
+          throw error();
+        }),
+        (actual) => actual.cause?.message === error().cause.message
+      );
+      assert.equal(attempts, expectedAttempts);
+    } finally {
+      assert.equal(cleanups.length, 1, "failed fixtures must register socket and temporary-directory cleanup");
+      await Promise.all(cleanups.map((cleanup) => cleanup()));
+    }
+  }
+
+  await rejectedFixture(() => new TypeError("fetch failed", { cause: new Error("ECONNREFUSED") }), 1);
+  await rejectedFixture(badPort, 10);
+});
 
 test("taskboard refuses non-loopback bind hosts", async (t) => {
   const fixture = await makeFixture();
