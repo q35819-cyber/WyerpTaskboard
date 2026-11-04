@@ -65,6 +65,66 @@ test("machine-confirmed prerequisite completion automatically restores the origi
   assert.equal(history.filter((event) => event.event_type === "auto_unblock").length, 1);
 });
 
+test("authentic developer full-suite pause resumes after its recorded requiredTask completes", async (t) => {
+  const { store, evaluator } = await setup(t, [
+    row("A-10", "开发中", { owner: "dev", session: "dev-session" }),
+    row("B-10", "独测中", { owner: "tester", session: "qa-session" })
+  ]);
+  await store.appendTaskEvent("fixture", "A-10", {
+    operationId: "claim.pause.fixture." + (++sequence), eventType: "claim", actorType: "developer_ai",
+    actorId: "fixture-actor", sessionId: "dev-session"
+  });
+  await change(store, "A-10", { status: "阻断", assignee: "", sessionId: "" },
+    "developer_paused_for_independent_full_suite_gate",
+    { requiredTask: "B-10", candidateSha: "a".repeat(40) }, "developer_ai", "dev-session");
+  await evaluator.evaluateProject("fixture");
+  assert.equal(await status(store, "A-10"), "阻断");
+  await change(store, "B-10", { status: "已完成", assignee: "", sessionId: "" },
+    "test_result", { atomicLifecycle: true, testResult: "pass", acceptanceScope: "system",
+      reportPath: "reports/B-10/QA-PASS.md", deliveryActions: [] }, "test_ai", "qa-session");
+  await Promise.all([evaluator.evaluateProject("fixture"), evaluator.evaluateProject("fixture")]);
+  assert.equal(await status(store, "A-10"), "待开发");
+  const latest = await evaluator.evaluateProject("fixture");
+  assert.equal(latest.candidates.find(item => item.task_id === "A-10")?.eligible, true);
+  const history = await store.taskHistory("fixture", "A-10", { all: true });
+  assert.equal(history.filter(event => event.event_type === "auto_unblock").length, 1);
+});
+
+test("unclaimed, unknown and stopped developer pauses cannot auto-resume", async (t) => {
+  const rows = [row("A-10", "开发中", { owner: "dev", session: "dev-session" }), row("B-10", "已完成")];
+  const forged = await setup(t, rows);
+  await change(forged.store, "A-10", { status: "阻断", assignee: "", sessionId: "" },
+    "developer_paused_for_independent_full_suite_gate", { requiredTask: "B-10" },
+    "developer_ai", "dev-session");
+  await forged.evaluator.evaluateProject("fixture");
+  assert.equal(await status(forged.store, "A-10"), "阻断", "an unclaimed pause is not proof");
+
+  const invalid = await setup(t, rows);
+  await invalid.store.appendTaskEvent("fixture", "A-10", {
+    operationId: "claim.invalidpause.fixture." + (++sequence), eventType: "claim",
+    actorType: "developer_ai", actorId: "fixture-actor", sessionId: "dev-session"
+  });
+  await change(invalid.store, "A-10", { status: "阻断", assignee: "", sessionId: "" },
+    "developer_paused_for_independent_full_suite_gate", { requiredTask: "UNKNOWN" },
+    "developer_ai", "dev-session");
+  await invalid.evaluator.evaluateProject("fixture");
+  assert.equal(await status(invalid.store, "A-10"), "阻断");
+
+  const stopped = await setup(t, rows);
+  await stopped.store.appendTaskEvent("fixture", "A-10", {
+    operationId: "claim.stoppedpause.fixture." + (++sequence), eventType: "claim",
+    actorType: "developer_ai", actorId: "fixture-actor", sessionId: "dev-session"
+  });
+  await change(stopped.store, "A-10", { status: "阻断", assignee: "", sessionId: "" },
+    "developer_paused_for_independent_full_suite_gate", { requiredTask: "B-10" },
+    "developer_ai", "dev-session");
+  await stopped.store.appendTaskEvent("fixture", "A-10", {
+    operationId: "stop.pause.fixture." + (++sequence), eventType: "stop_request", actorType: "user"
+  });
+  await stopped.evaluator.evaluateProject("fixture");
+  assert.equal(await status(stopped.store, "A-10"), "阻断");
+});
+
 test("unknown proof, manual block, unfulfilled dependency and pending STOP never auto-resume", async (t) => {
   const { store, evaluator } = await setup(t, [
     row("A-10", "待开发", { dependencies: "B-10完成" }),
