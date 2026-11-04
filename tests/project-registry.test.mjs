@@ -142,3 +142,49 @@ test("removeProject unregisters management only and preserves project files", as
   const config = JSON.parse(await fs.readFile(path.join(fixture.boardRoot, "config", "projects.json"), "utf8"));
   assert.deepEqual(config.projects, []);
 });
+test("registering only a project root gives distinct IDs without changing existing files", async (t) => {
+  const fixture = await makeFixture();
+  t.after(() => fs.rm(fixture.boardRoot, { recursive: true, force: true }));
+  const registry = await new ProjectRegistry(fixture.boardRoot).load();
+  const roots = [
+    path.join(fixture.boardRoot, "first", "shared"),
+    path.join(fixture.boardRoot, "second", "shared"),
+    path.join(fixture.boardRoot, "中文工程"),
+  ];
+  const original = "# Keep this project's instructions untouched.\n";
+  for (const root of roots) {
+    await fs.mkdir(root, { recursive: true });
+    await fs.writeFile(path.join(root, "AGENTS.md"), original);
+    await fs.writeFile(path.join(root, "README.md"), "Existing documentation\n");
+  }
+  const before = await Promise.all(roots.map((root) => fs.readdir(root)));
+  const results = [];
+  for (const root of roots) results.push(await registry.addProject({ root }));
+  assert.deepEqual(results.map((item) => item.project.id), ["shared", "shared-2", "project"]);
+  for (const [index, result] of results.entries()) {
+    assert.equal(result.validation.adaptationRequired, true, "registration does not silently install missing task files");
+    assert.equal(registry.get(result.project.id).root, await fs.realpath(roots[index]));
+    assert.deepEqual(await fs.readdir(roots[index]), before[index], "registration must not add or overwrite project documents");
+    assert.equal(await fs.readFile(path.join(roots[index], "AGENTS.md"), "utf8"), original);
+  }
+  const persisted = await new ProjectRegistry(fixture.boardRoot).load();
+  for (const result of results) assert.equal(persisted.get(result.project.id).id, result.project.id);
+});
+
+test("duplicate roots, explicit duplicate IDs and invalid roots cannot change registration", async (t) => {
+  const fixture = await makeFixture();
+  t.after(() => fs.rm(fixture.boardRoot, { recursive: true, force: true }));
+  const root = path.join(fixture.boardRoot, "new-project");
+  const anotherRoot = path.join(fixture.boardRoot, "another-project");
+  await fs.mkdir(root);
+  await fs.mkdir(anotherRoot);
+  const registry = await new ProjectRegistry(fixture.boardRoot).load();
+  const created = await registry.addProject({ root });
+  const configPath = path.join(fixture.boardRoot, "config", "projects.json");
+  const before = await fs.readFile(configPath, "utf8");
+  await assert.rejects(registry.addProject({ root: path.join(root, ".") }), (error) => error.code === "PROJECT_ROOT_ALREADY_REGISTERED");
+  await assert.rejects(registry.addProject({ root: anotherRoot, id: created.project.id }), (error) => error.code === "PROJECT_ALREADY_EXISTS");
+  await assert.rejects(registry.addProject({ root: "." }), (error) => error.code === "INVALID_PROJECT_ROOT");
+  assert.equal(await fs.readFile(configPath, "utf8"), before, "rejected registrations must leave configuration unchanged");
+  assert.deepEqual(await fs.readdir(anotherRoot), [], "rejection must not create any project document");
+});
