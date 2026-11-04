@@ -108,18 +108,22 @@ export class ProjectRegistry {
         code: "INVALID_PROJECT_ROOT", status: 400, details: { root: rootInput },
       });
       const rootRealPath = await resolveProjectRoot(rootInput);
-      const id = String(input.id || autoProjectId(rootRealPath)).trim();
-      invariant(id, "无法从目录名自动生成项目ID，请填写项目ID", {
-        code: "PROJECT_ID_REQUIRED", status: 400,
-      });
-      validateId(id, "projectId");
-      invariant(!this.projects.has(id), `项目ID已存在: ${id}`, {
-        code: "PROJECT_ALREADY_EXISTS", status: 409, details: { projectId: id },
-      });
       const duplicateRoot = this.list().find((item) => comparableRoot(item.root) === comparableRoot(rootRealPath));
       invariant(!duplicateRoot, `该项目路径已登记为 ${duplicateRoot?.id || ""}`, {
         code: "PROJECT_ROOT_ALREADY_REGISTERED", status: 409,
         details: { projectId: duplicateRoot?.id, root: rootRealPath },
+      });
+      const baseId = autoProjectId(rootRealPath) || "project";
+      let id = String(input.id || baseId).trim();
+      if (!input.id) {
+        for (let suffix = 2; this.projects.has(id); suffix++) {
+          const ending = `-${suffix}`;
+          id = baseId.slice(0, 64 - ending.length) + ending;
+        }
+      }
+      validateId(id, "projectId");
+      invariant(!this.projects.has(id), `项目ID已存在: ${id}`, {
+        code: "PROJECT_ALREADY_EXISTS", status: 409, details: { projectId: id },
       });
 
       const project = {
