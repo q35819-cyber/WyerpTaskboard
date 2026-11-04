@@ -128,6 +128,26 @@ export function deliveryEvidence(history, workflow) {
   };
 }
 
+async function currentAutoUnblockedBug(store, projectId, task, history) {
+  if (task.track !== "bugfix" || task.status !== "待开发") return false;
+  // A fresh machine transition, not a note or an auto-unblock event from an earlier status round.
+  const event = [...history].reverse().find((item) =>
+    item.old_status && item.new_status && item.old_status !== item.new_status);
+  if (event?.event_type !== "auto_unblock" || event.actor_type !== "system" ||
+    event.actor_id !== "task-scan" || event.old_status !== "阻断" ||
+    event.new_status !== "待开发" || event.metadata?.restoreStatus !== "待开发") return false;
+  const blocked = history.find((item) => item.event_id === event.metadata?.blockedEventId);
+  if (!blocked || blocked.new_status !== "阻断" ||
+    !["temporary_block", "developer_paused_for_independent_full_suite_gate"].includes(blocked.event_type)) return false;
+  const operationId = "auto_unblock." + hash(projectId + "|" + task.id + "|" + blocked.event_id);
+  if (event.operation_id !== operationId) return false;
+  const transaction = await store.transactions.read(operationId);
+  return transaction?.state === "committed" && transaction.projectId === projectId &&
+    transaction.taskId === task.id && transaction.eventId === event.event_id &&
+    transaction.result?.eventId === event.event_id &&
+    transaction.event?.event_type === "auto_unblock";
+}
+
 function activeDeveloperTask(task) {
   return ["开发中", "修复中"].includes(task.status) && Boolean(task.assignee || task.sessionId);
 }
@@ -240,6 +260,8 @@ export class CandidateEvaluator {
         : urgency?.event_type === "priority_change" && urgency.new_priority === "P0";
       const priorDeveloper = [...developerEvents].reverse().find((event) =>
         event.actor_type === "developer_ai" && ["claim", "takeover"].includes(event.event_type));
+      const autoUnblockedBug = eligibleRole === "developer_ai" &&
+        await currentAutoUnblockedBug(this.taskStore, projectId, task, developerEvents);
       if (eligibleRole === "developer_ai") {
         if (!writeTargets.length) blockers.push("未声明计划写文件，不能进入待认领");
         const candidateWrites = normalizedFileRefs(task.writeTargets);
@@ -278,6 +300,7 @@ export class CandidateEvaluator {
         provisional_authorization_event_id: provisional?.eventId || null,
         provisional: Boolean(provisional),
         eligible_role: eligibleRole,
+        auto_unblocked_bug: Boolean(autoUnblockedBug),
         user_urgent: Boolean(userUrgent),
         unlocks_count: unlockCounts.get(task.id) || 0,
         original_developer_actor_id: task.status === "测试失败待修复" ? priorDeveloper?.actor_id || null : null,

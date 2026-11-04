@@ -197,7 +197,8 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
       event.new_status === "开发中");
     if (!claim || !blocked.session_id) return null;
   } else if (blocked?.event_type !== "temporary_block" || blocked.actor_type !== "system") return null;
-  const target = TEMPORARY_RESTORE.get(blocked.old_status);
+  const target = blocked.old_status === "待准备"
+    ? "待开发" : TEMPORARY_RESTORE.get(blocked.old_status);
   const conditions = developerPause
     ? [{ kind: "dependency_completed", taskId: blocked.metadata?.requiredTask }]
     : blocked.metadata?.conditions;
@@ -243,6 +244,8 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
     } else return null;
   }
   if (["待准备", "待开发"].includes(target)) {
+    if (!String(task.writeTargets || "").trim() ||
+      hardDependencyBlockers(task, byId).length) return null;
     try {
       await assertDeveloperClaimExclusive(store, projectId, context, { tasks }, task,
         "task-scan", "auto-unblock");
