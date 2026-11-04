@@ -2,6 +2,20 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { wyerpAiFlowV1 as workflow } from "../server/workflows/wyerp-ai-flow-v1.mjs";
 
+test("ready is a derived column, historical persisted status can exit but not be newly entered", () => {
+  assert.doesNotThrow(() => workflow.validateStatus("待执行"));
+  assert.throws(() => workflow.assertTransition("待开发", "待执行"),
+    e => e.code === "INVALID_STATUS_TRANSITION");
+  assert.throws(() => workflow.assertTransition("测试失败待修复", "待执行"),
+    e => e.code === "INVALID_STATUS_TRANSITION");
+  assert.doesNotThrow(() => workflow.assertTransition("待执行", "开发中"));
+  const columns = workflow.boardColumns;
+  assert.equal(columns.find(c => c.id === "awaiting_work").derived, "eligible_developer_candidates");
+  assert.deepEqual(columns.find(c => c.id === "qa_pending").statuses, ["待独测", "待复测"]);
+  assert.ok(!columns.find(c => c.id === "awaiting_work").statuses.includes("待复测"));
+  assert.ok(!columns.find(c => c.id === "awaiting_work").statuses.includes("待独测"));
+});
+
 test("wyerp-ai-flow-v1 accepts product, bugfix and infrastructure tracks", () => {
   for (const track of ["product", "product/video", "product/video+image", "product/order/return", "bugfix", "infrastructure"]) assert.doesNotThrow(() => workflow.validateTrack(track));
   for (const track of ["unknown", "foo/bar", "product/", "product/video bad"]) assert.throws(() => workflow.validateTrack(track), (error) => error.code === "INVALID_TRACK");

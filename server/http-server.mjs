@@ -758,7 +758,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
       if (req.method === "GET" && url.pathname === "/api/task-scan/status") {
         const candidates = await scanStore.list();
         const eligible = candidates.filter((item) => item.eligible);
-        const developerCandidates = candidates.filter((item) => item.planned_role === "开发AI" && ["待开发", "测试失败待修复", "待准备", "待交付"].includes(item.status));
+        const developerCandidates = candidates.filter((item) => item.eligible_role === "developer_ai" && ["待开发", "待执行", "测试失败待修复", "待准备"].includes(item.status));
         const highest = candidates[0] || null;
         const scheduler = await scanStore.schedulerStatus();
         const scan = await scanStore.status();
@@ -803,6 +803,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
             eligible: item.eligible,
             reason: item.reason,
             blockers: item.blockers || [],
+            originalDeveloperActorId: item.original_developer_actor_id || null,
             readDependencies: item.read_dependencies || [],
             writeTargets: item.write_targets || []
           })),

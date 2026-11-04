@@ -340,7 +340,9 @@ test("static web and workflow metadata are served from independent service", asy
 
   assert.deepEqual(body.boardColumns.find((column) => column.id === "awaiting_delivery_user")?.statuses, ["待交付", "待用户验收"]);
 
-  assert.equal(body.boardColumns.length, 6);
+  assert.equal(body.boardColumns.length, 7);
+  assert.equal(body.boardColumns.find(column => column.id === "awaiting_work")?.derived, "eligible_developer_candidates");
+  assert.deepEqual(body.boardColumns.find(column => column.id === "qa_pending")?.statuses, ["待独测", "待复测"]);
 });
 
 test("session endpoint reports anonymous local browser access without issuing a login or CSRF token", async (t) => {
@@ -1543,6 +1545,20 @@ test("task-scan status endpoint reports scheduler and candidate summary", async 
         project_id: "fixture", task_id: "A-10", track: "product", priority: "P0",
         status: "待开发", planned_role: "开发AI", eligible_role: "developer_ai",
         eligible: true, blockers: [], reason: "开发任务已就绪", dedupe_key: "fixture", source_fingerprint: "fixture"
+      },
+      det_delivery: {
+        detection_id: "det_delivery", first_detected_at: "2026-09-29T00:00:00.000Z",
+        expires_at: "2099-09-29T00:30:00.000Z", consumed_at: null, stale_at: null,
+        project_id: "fixture", task_id: "DEL-ONLY", track: "product", priority: "P0",
+        status: "待交付", planned_role: "开发AI", eligible_role: "controller_ai",
+        eligible: false, blockers: ["总控交付"], reason: "待总控交付", dedupe_key: "delivery"
+      },
+      det_qa: {
+        detection_id: "det_qa", first_detected_at: "2026-09-29T00:00:00.000Z",
+        expires_at: "2099-09-29T00:30:00.000Z", consumed_at: null, stale_at: null,
+        project_id: "fixture", task_id: "QA-ONLY", track: "product", priority: "P0",
+        status: "待复测", planned_role: "独立测试AI", eligible_role: "test_ai",
+        eligible: false, blockers: ["独测待办"], reason: "待独测", dedupe_key: "qa"
       }
     }
   }, null, 2), "utf8");
@@ -1561,13 +1577,15 @@ test("task-scan status endpoint reports scheduler and candidate summary", async 
   assert.equal(body.schedulerSync.scheduler_interval_minutes, 10);
   assert.equal(body.nextExpectedAt, "2026-09-29T00:07:00.000Z");
   assert.equal(body.lastConsumption.claim_event_id, "evt_claim_1");
-  assert.equal(body.candidateCount, 1);
+  assert.equal(body.candidateCount, 3);
   assert.equal(body.eligibleCount, 1);
   assert.equal(body.highestCandidate.taskId, "A-10");
   assert.equal(body.highestCandidate.eligibleRole, "developer_ai");
   assert.equal(body.developerCandidates.length, 1);
   assert.equal(body.developerCandidates[0].taskId, "A-10");
   assert.equal(body.developerCandidates[0].eligible, true);
+  assert.equal(body.developerCandidates[0].originalDeveloperActorId, null);
+  assert.ok(!body.developerCandidates.some(x => ["DEL-ONLY","QA-ONLY"].includes(x.taskId)));
 });
 
 

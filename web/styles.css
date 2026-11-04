@@ -127,3 +127,7 @@
 @media(max-width:760px){.project-service-line{align-items:flex-start;flex-direction:column}.project-service-actions{width:100%}.project-service-actions button{flex:1}}
 
 .reply-stamp{position:absolute;top:8px;right:8px;z-index:2;display:inline-flex;align-items:center;justify-content:center;min-width:52px;padding:3px 8px;border:2px solid #039855;border-radius:4px;background:rgba(236,253,243,.94);color:#027a48;font-size:12px;font-weight:900;letter-spacing:.12em;transform:rotate(-10deg);box-shadow:0 1px 0 rgba(3,152,85,.14);pointer-events:none}
+
+/* Seven actual derived board columns; keep the six-column legacy layout contract. */
+.board:has(>.board-column:nth-child(7)){display:grid;grid-template-columns:repeat(7,minmax(245px,1fr))}
+@media(max-width:900px){.board:has(>.board-column:nth-child(7)){grid-template-columns:repeat(7,80vw)}}

@@ -12,6 +12,50 @@ async function root(t) {
   return value;
 }
 
+test("ready column derives fresh scan eligibility and preserves exclusive QA and delivery columns", async () => {
+  const { wyerpAiFlowV1: flow } = await import("../server/workflows/wyerp-ai-flow-v1.mjs");
+  const source = await fs.readFile(path.resolve(import.meta.dirname, "..", "web", "app.js"), "utf8");
+  const readySource = source.match(/function isReadyTask\(task\)\{[\s\S]*?\n\}/)?.[0];
+  const boardSource = source.match(/function boardTasksForColumn\(column\)\{[\s\S]*?\n\}/)?.[0];
+  assert.ok(readySource && boardSource, "actual UI source includes derived ready column functions");
+  const task = (id,status,role="开发AI") => ({id,status,plannedRole:role,assignee:"",sessionId:""});
+  const A=task("A","待开发"), B=task("B","待开发"), C=task("C","待准备");
+  const QA=task("QA","待独测","独立测试AI"), RE=task("RE","待复测","独立测试AI");
+  const DEL=task("DEL","待交付","总控AI"), LEG=task("LEG","待执行");
+  const state={projectId:"fixture",filtered:[A,B,C,QA,RE,DEL,LEG],scanStatus:{
+    scan:{last_scan_at:new Date().toISOString()},developerCandidates:[
+      {projectId:"fixture",taskId:"A",status:"待开发",eligible:true,blockers:[]},
+      {projectId:"fixture",taskId:"B",status:"待开发",eligible:false,blockers:["A前置未完成"]},
+      {projectId:"fixture",taskId:"C",status:"待准备",eligible:true,blockers:[]},
+      {projectId:"fixture",taskId:"LEG",status:"待执行",eligible:false,blockers:["过期"]}
+    ]
+  }};
+  const candidate=t=>state.scanStatus.developerCandidates.find(x=>x.projectId===state.projectId&&x.taskId===t.id)||null;
+  const ready=new Function("state","developerCandidateFor",readySource+"\nreturn isReadyTask;")(state,candidate);
+  const board=new Function("state","developerCandidateFor","isReadyTask","tasksForColumn",boardSource+"\nreturn boardTasksForColumn;")(
+    state,candidate,ready,(items,statuses)=>items.filter(t=>statuses.includes(t.status)));
+  const get=id=>board(flow.boardColumns.find(c=>c.id===id)).map(t=>t.id);
+  assert.deepEqual(get("awaiting_work"),["A","C"]);
+  assert.deepEqual(get("qa_pending"),["QA","RE"]);
+  assert.deepEqual(get("awaiting_delivery_user"),["DEL"]);
+  assert.deepEqual(get("todo"),["B","LEG"]);
+  assert.equal(state.filtered.filter(ready).length,2);
+  A.status="已完成";
+  C.status="开发中";C.assignee="dev-other";
+  state.scanStatus.developerCandidates=[{projectId:"fixture",taskId:"B",status:"待开发",eligible:true,blockers:[]}];
+  assert.deepEqual(get("awaiting_work"),["B"]);
+  assert.deepEqual(get("qa_pending"),["QA","RE"]);
+  assert.equal(state.filtered.filter(ready).length,1);
+  assert.equal(state.filtered.flatMap(()=>[]).length,0);
+  state.scanStatus.scan.last_scan_at=new Date(Date.now()-31*60*1000).toISOString();
+  assert.deepEqual(get("awaiting_work"),[]);
+  assert.deepEqual(get("todo"),["B","LEG"]);
+  const ids=flow.boardColumns.flatMap(col=>get(col.id));
+  assert.equal(ids.length,state.filtered.length);
+  assert.equal(new Set(ids).size,ids.length);
+  assert.equal(B.status,"待开发");
+});
+
 test("scheduled dispatcher scans busy or idle mode only when due", async (t) => {
   const dir = await root(t);
   let now = Date.parse("2026-09-29T00:00:00Z");
