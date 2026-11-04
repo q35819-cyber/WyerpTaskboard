@@ -9,17 +9,29 @@ import { TaskStore } from "./task-store.mjs";
 const START = "<!-- TASK_STEP_CHECKPOINT_START v1 -->";
 const END = "<!-- TASK_STEP_CHECKPOINT_END -->";
 const SHA = (text) => crypto.createHash("sha256").update(text).digest("hex");
-const ROLE_STEPS = Object.freeze({
+const LEGACY_ROLE_STEPS = Object.freeze({
   controller_ai: ["C01_SCAN", "C02_TRIAGE", "C03_DISPATCH", "C04_VERIFY_NEXT"],
   developer_ai: ["D01_CLAIM", "D02_WORKTREE", "D03_WRITE_SCOPE", "D04_IMPLEMENT", "D05_TEST_1",
     "D06_TEST_2", "D07_TEST_3", "D08_HANDOFF", "D09_MERGE_MAIN", "D10_POSTMERGE",
     "D11_CLEANUP", "D12_COMPLETE", "D13_NEXT"],
   test_ai: ["Q01_ADMISSION", "Q02_TEST", "Q03_RESULT", "Q04_NEXT"]
 });
+const ROLE_STEPS = Object.freeze({
+  controller_ai: ["C00_A_REQUIREMENTS", "C00_B_MAIN_VERSION", "C00_C_SAFE_CLEANUP",
+    "C00_D_ENVIRONMENT", "C01_SCAN", "C02_TRIAGE", "C03_DISPATCH", "C04_MERGE_MAIN",
+    "C05_POSTMERGE", "C06_CLEANUP", "C07_COMPLETE", "C08_NEXT"],
+  developer_ai: ["D01_CLAIM", "D02_WORKTREE", "D03_WRITE_SCOPE", "D04_IMPLEMENT", "D05_TEST_1",
+    "D06_TEST_2", "D07_TEST_3", "D08_HANDOFF", "D09_NEXT"],
+  test_ai: LEGACY_ROLE_STEPS.test_ai
+});
+const FLOW_STEPS = Object.freeze({
+  "role-steps-v1": LEGACY_ROLE_STEPS,
+  "role-steps-v2": ROLE_STEPS
+});
 const EVENT_REQUIRED = {
   C03_DISPATCH: ["controller_dispatch", "task_created"],
   D01_CLAIM: ["claim", "takeover"], D08_HANDOFF: ["handoff"],
-  D12_COMPLETE: ["delivery_complete"],
+  D12_COMPLETE: ["delivery_complete"], C07_COMPLETE: ["delivery_complete"],
   Q01_ADMISSION: ["claim", "takeover"], Q03_RESULT: ["test_result"]
 };
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -36,16 +48,16 @@ async function hardDependenciesCompleted(taskStore, projectId, task) {
   return ids.every((id) => snapshot.tasks.some((entry) =>
     entry.id === id && entry.status === "已完成"));
 }
-function emptyState(projectId, taskId) {
+function emptyState(projectId, taskId, flowVersion) {
   return {
-    version: 1, projectId, taskId, flowVersion: "role-steps-v1",
-    cursors: Object.fromEntries(Object.entries(ROLE_STEPS).map(([role, steps]) => [role, steps[0]])),
+    version: 1, projectId, taskId, flowVersion,
+    cursors: Object.fromEntries(Object.entries(FLOW_STEPS[flowVersion]).map(([role, steps]) => [role, steps[0]])),
     attempts: 1, records: [], lastAction: null
   };
 }
-function parseCheckpoint(text, projectId, taskId) {
+function parseCheckpoint(text, projectId, taskId, flowVersion) {
   const start = text.indexOf(START), end = text.indexOf(END);
-  if (start < 0 && end < 0) return { state: emptyState(projectId, taskId), legacy: text.trim().length > 0 };
+  if (start < 0 && end < 0) return { state: emptyState(projectId, taskId, flowVersion), legacy: text.trim().length > 0 };
   if (start < 0 || end < start || text.indexOf(START, start + START.length) >= 0) {
     throw invalid("CHECKPOINT_FORMAT_INVALID", "任务断点结构化区块重复或损坏");
   }
@@ -56,13 +68,19 @@ function parseCheckpoint(text, projectId, taskId) {
     || !state.cursors || !Array.isArray(state.records)) {
     throw invalid("CHECKPOINT_TASK_MISMATCH", "断点任务编号与当前项目不匹配，拒绝覆盖");
   }
-  return { state, legacy: false };
+  const steps = FLOW_STEPS[state.flowVersion];
+  if (!steps || !Object.entries(steps).every(([role, names]) =>
+    state.cursors[role] === null || names.includes(state.cursors[role]))) {
+    throw invalid("CHECKPOINT_FLOW_VERSION_INVALID", "旧/新步骤游标不受支持，禁止猜测并跳级");
+  }
+  return { state, legacy: state.flowVersion === "role-steps-v1" };
 }
 function renderCheckpoint(original, state) {
   const begin = original.indexOf(START), finish = original.indexOf(END);
   const visible = [
     "", "## 当前执行步骤（由任务看板原子维护）",
-    ...Object.entries(ROLE_STEPS).map(([role]) => "- " + role + " 下一步：" + (state.cursors[role] || "已完成")),
+    ...Object.keys(FLOW_STEPS[state.flowVersion]).map((role) =>
+      "- " + role + " 下一步：" + (state.cursors[role] || "已完成")),
     "- 最近执行：" + (state.lastAction?.stepId || "无") + " / " + (state.lastAction?.result || "—"),
     "- 记录条数：" + state.records.length,
     "", START, JSON.stringify(state, null, 2), END, ""
@@ -90,9 +108,11 @@ async function writeFileAtomically(filename, text) {
 export const ROLE_STAGE_STEPS = ROLE_STEPS;
 
 export class TaskStepCheckpoint {
-  constructor(rootDir, { taskStore = null } = {}) {
+  constructor(rootDir, { taskStore = null, flowVersion = "role-steps-v2" } = {}) {
+    if (!FLOW_STEPS[flowVersion]) throw invalid("CHECKPOINT_FLOW_VERSION_INVALID", "不支持的角色步骤版本", 400);
     this.rootDir = rootDir;
     this.taskStore = taskStore;
+    this.flowVersion = flowVersion;
   }
   async init() {
     this.taskStore ||= await new TaskStore(this.rootDir).init();
@@ -116,7 +136,7 @@ export class TaskStepCheckpoint {
   async show(projectId, taskId) {
     const file = await this.location(projectId, taskId);
     const content = await fs.readFile(file, "utf8").catch((e) => e.code === "ENOENT" ? "" : Promise.reject(e));
-    const { state, legacy } = parseCheckpoint(content, projectId, taskId);
+    const { state, legacy } = parseCheckpoint(content, projectId, taskId, this.flowVersion);
     const context = await this.taskStore.projects.context(projectId);
     const relativeFile = path.relative(context.rootRealPath, file).split(path.sep).join("/");
     return { file: relativeFile, sha256: SHA(content), exists: Boolean(content), legacy, state };
@@ -125,8 +145,8 @@ export class TaskStepCheckpoint {
     sessionId, result = "PASS", evidence, eventId = null, note = "", substepId = null } = {}) {
     if (!ID_PATTERN.test(operationId || "") || !expectedSha256 || !ID_PATTERN.test(actorId || "")
       || !String(sessionId || "").trim()) throw invalid("CHECKPOINT_ARGUMENT_REQUIRED", "缺少操作编号/断点版本/actor/Session", 400);
-    const steps = ROLE_STEPS[actorType];
-    if (!steps || !steps.includes(stepId)) throw invalid("CHECKPOINT_ROLE_STEP_INVALID", "角色与步骤不匹配", 403);
+    const supported = Object.values(FLOW_STEPS).some((roleSteps) => roleSteps[actorType]?.includes(stepId));
+    if (!supported) throw invalid("CHECKPOINT_ROLE_STEP_INVALID", "角色与步骤不匹配", 403);
     if (!["PASS", "FAIL", "BLOCK", "PROGRESS"].includes(result)) throw invalid("CHECKPOINT_RESULT_INVALID", "步骤结果非法", 400);
     if (result === "PROGRESS" && !ID_PATTERN.test(substepId || "")) throw invalid("CHECKPOINT_SUBSTEP_REQUIRED", "小功能完成须提供唯一子步骤编号", 400);
     if (typeof evidence !== "string" || evidence.trim().length < 8) {
@@ -135,6 +155,14 @@ export class TaskStepCheckpoint {
     return withProjectLock(this.rootDir, projectId, operationId, async () => {
       const previous = await this.show(projectId, taskId);
       const state = previous.state;
+      const roleSteps = FLOW_STEPS[state.flowVersion];
+      const steps = roleSteps[actorType];
+      if (!steps?.includes(stepId)) throw invalid("CHECKPOINT_ROLE_STEP_INVALID", "该断点版本不允许此步骤", 403);
+      const modern = state.flowVersion === "role-steps-v2";
+      const optionalEnvironment = modern && actorType === "controller_ai"
+        && stepId === "C00_D_ENVIRONMENT" && state.cursors.controller_ai === "C01_SCAN"
+        && state.records.some((r) => r.stepId === "C00_C_SAFE_CLEANUP" && r.result === "PASS" && r.attempt === state.attempts)
+        && !state.records.some((r) => r.stepId === "C00_D_ENVIRONMENT" && r.result === "PASS" && r.attempt === state.attempts);
       const prior = state.records.find((x) => x.operationId === operationId);
       if (prior) {
         if (prior.stepId !== stepId || prior.actorId !== actorId || prior.sessionId !== sessionId
@@ -148,6 +176,29 @@ export class TaskStepCheckpoint {
       }
       const history = await this.taskStore.taskHistory(projectId, taskId, { all: true });
       const { task } = await this.taskStore.getTask(projectId, taskId);
+      if (state.flowVersion === "role-steps-v2" && actorType === "controller_ai"
+        && stepId === "C00_A_REQUIREMENTS" && state.cursors.controller_ai === null
+        && task.status === "交付中" && !state.records.some((r) =>
+          r.stepId === "C00_A_REQUIREMENTS" && r.attempt > state.attempts)) {
+        const claimIndex = history.findLastIndex((entry) =>
+          entry.event_type === "claim" && entry.actor_type === "controller_ai"
+          && entry.new_status === "交付中");
+        const claim = history[claimIndex];
+        const qaPassIndex = history.findLastIndex((entry, i) => i < claimIndex
+          && entry.event_type === "test_result" && entry.actor_type === "test_ai"
+          && entry.metadata?.atomicLifecycle === true
+          && entry.metadata?.testResult === "pass"
+          && entry.new_status === "待交付");
+        const previousEnd = state.records.some((entry) =>
+          entry.stepId === "C08_NEXT" && entry.result === "PASS" && entry.attempt === state.attempts);
+        if (claimIndex >= 0 && claim?.actor_id === actorId && claim?.session_id === sessionId
+          && task.sessionId === sessionId && qaPassIndex >= 0 && previousEnd
+          && !(await this.taskStore.stopState(projectId, taskId)).stopRequested
+          && await hardDependenciesCompleted(this.taskStore, projectId, task)) {
+          state.attempts += 1;
+          state.cursors.controller_ai = "C00_A_REQUIREMENTS";
+        }
+      }
       const currentClaim = [...history].reverse().find((entry) =>
         entry.actor_type === "developer_ai" && ["claim", "takeover"].includes(entry.event_type));
       const currentClaimIndex = history.indexOf(currentClaim);
@@ -281,7 +332,7 @@ export class TaskStepCheckpoint {
           resumedQaAttempt = true;
         }
       }
-      if (state.cursors[actorType] !== stepId) {
+      if (state.cursors[actorType] !== stepId && !optionalEnvironment) {
         throw invalid("CHECKPOINT_STEP_ORDER", "上一步尚未通过，不得越级执行；请先读取唯一下一步");
       }
       const authority = [...history].reverse().find((entry) =>
@@ -317,13 +368,13 @@ export class TaskStepCheckpoint {
           throw invalid("CHECKPOINT_PREDECESSOR_REQUIRED", "总控未完成可信正式派工");
         }
       }
-      if (actorType === "developer_ai" && stepId === "D09_MERGE_MAIN"
+      if (!modern && actorType === "developer_ai" && stepId === "D09_MERGE_MAIN"
         && (!state.records.some((r) => r.stepId === "Q03_RESULT" && r.result === "PASS"
           && r.verdict === "pass" && r.attempt === state.attempts)
         || state.cursors.test_ai !== null)) {
         throw invalid("CHECKPOINT_QA_PASS_REQUIRED", "最新一次独测没有正式PASS");
       }
-      if (actorType === "developer_ai" && stepId === "D12_COMPLETE"
+      if (!modern && actorType === "developer_ai" && stepId === "D12_COMPLETE"
         && !state.records.some((r) => r.stepId === "D11_CLEANUP" && r.result === "PASS"
           && r.attempt === state.attempts)) {
         throw invalid("CHECKPOINT_CLEANUP_REQUIRED", "清理未完成不能关闭任务");
@@ -332,10 +383,25 @@ export class TaskStepCheckpoint {
         && (!authority || authority.actor_id !== actorId || authority.session_id !== sessionId)) {
         throw invalid("CHECKPOINT_SESSION_MISMATCH", "未用当前正式认领身份写断点", 403);
       }
-      if (actorType === "controller_ai" && stepId !== "C01_SCAN") {
-        const controllerStart = state.records.find((entry) => entry.stepId === "C01_SCAN" && entry.result === "PASS");
+      if (actorType === "controller_ai" && stepId !== (modern ? "C00_A_REQUIREMENTS" : "C01_SCAN")) {
+        const firstStep = modern ? "C00_A_REQUIREMENTS" : "C01_SCAN";
+        const controllerStart = state.records.find((entry) =>
+          entry.stepId === firstStep && entry.result === "PASS" && entry.attempt === state.attempts);
         if (!controllerStart || (!lastTakeover && (controllerStart.actorId !== actorId || controllerStart.sessionId !== sessionId))) {
           throw invalid("CHECKPOINT_SESSION_MISMATCH", "总控换窗口须先进行合法接管", 403);
+        }
+      }
+      if (modern && actorType === "controller_ai" && stepId === "C04_MERGE_MAIN" && result === "PASS") {
+        const deliveryClaim = [...history].reverse().find((entry) =>
+          entry.event_type === "claim" && entry.actor_type === "controller_ai"
+          && entry.new_status === "交付中");
+        const qaPass = history.findLast((entry) =>
+          entry.event_type === "test_result" && entry.actor_type === "test_ai"
+          && entry.metadata?.testResult === "pass");
+        if (!deliveryClaim || !qaPass || history.indexOf(qaPass) >= history.indexOf(deliveryClaim)
+          || deliveryClaim.actor_id !== actorId || deliveryClaim.session_id !== sessionId
+          || task.status !== "交付中") {
+          throw invalid("CHECKPOINT_QA_PASS_REQUIRED", "交付步骤需要最新可信独测PASS及当前总控正式认领");
         }
       }
       const required = EVENT_REQUIRED[stepId] || [];
@@ -380,7 +446,8 @@ export class TaskStepCheckpoint {
       if (result === "PASS" && stepId === "Q03_RESULT" && !["pass", "fail", "blocked"].includes(event?.metadata?.testResult)) {
         throw invalid("CHECKPOINT_QA_RESULT_INVALID", "独测正式事件缺少真实判定");
       }
-      if (result === "PASS" && stepId === "D12_COMPLETE" && event?.new_status !== "已完成") {
+      if (result === "PASS" && ["D12_COMPLETE", "C07_COMPLETE"].includes(stepId)
+        && !["已完成", "待用户验收"].includes(event?.new_status)) {
         throw invalid("CHECKPOINT_DELIVERY_NOT_CLOSED", "任务未在真实看板关闭");
       }
       if (result === "PASS" && stepId === "Q01_ADMISSION"
@@ -435,7 +502,8 @@ export class TaskStepCheckpoint {
         };
         state.records.push(recovered);
         if (!legacyEmpty) {
-          state.cursors.developer_ai = ROLE_STEPS.developer_ai[ROLE_STEPS.developer_ai.indexOf("D08_HANDOFF") + 1];
+          state.cursors.developer_ai = FLOW_STEPS[state.flowVersion].developer_ai[
+            FLOW_STEPS[state.flowVersion].developer_ai.indexOf("D08_HANDOFF") + 1];
         }
       }
       const item = {
@@ -447,7 +515,12 @@ export class TaskStepCheckpoint {
       state.records.push(item);
       state.lastAction = item;
       if (result === "PASS") {
-        state.cursors[actorType] = steps[index + 1] || null;
+        state.cursors[actorType] = optionalEnvironment ||
+          (modern && stepId === "C00_C_SAFE_CLEANUP") ? "C01_SCAN" : (steps[index + 1] || null);
+        if (modern && stepId === "C03_DISPATCH") {
+          state.cursors.controller_ai = ["待交付", "交付中"].includes(task.status)
+            ? "C04_MERGE_MAIN" : "C08_NEXT";
+        }
         if (stepId === "Q04_NEXT") {
           const lastVerdict = [...state.records].reverse().find((r) => r.stepId === "Q03_RESULT" && r.attempt === state.attempts);
           if (lastVerdict && lastVerdict.verdict !== "pass") {
