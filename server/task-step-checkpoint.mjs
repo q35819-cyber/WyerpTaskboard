@@ -239,12 +239,25 @@ export class TaskStepCheckpoint {
           && afterBlock.slice(returnOffset + 1).some((e) =>
             e.actor_type === "controller_ai"
             && /^controller_dispatch(?:_[a-z0-9_]+)?$/i.test(e.event_type));
+        // A real user may order a blocked task back to its original developer.
+        // Require both server-committed transitions and that actor's latest formal claim.
+        const userRequeueIndex = afterBlock.findLastIndex((e) =>
+          e.event_type === "developer_user_directed_bugfix_requeue"
+          && e.actor_type === "developer_ai"
+          && e.actor_id === currentClaim?.actor_id && e.session_id === currentClaim?.session_id
+          && e.old_status === "HOLD" && e.new_status === "测试失败待修复");
+        const userAuthorizedReturn = userRequeueIndex >= 0
+          && afterBlock.slice(0, userRequeueIndex).some((e) =>
+            e.event_type === "developer_user_directed_bugfix_hold"
+            && e.actor_type === "developer_ai"
+            && e.actor_id === currentClaim?.actor_id && e.session_id === currentClaim?.session_id
+            && e.old_status === "阻断" && e.new_status === "HOLD");
         const validBlockedReturn = blockedIndex === latestQaResultIndex
           && blockedIndex >= 0 && currentClaimIndex > blockedIndex
           && blockedQaClaim?.actor_id === blocked?.actor_id
           && blockedQaClaim?.session_id === blocked?.session_id
           && currentClaim?.old_status === "测试失败待修复"
-          && hasFreshDispatch
+          && (hasFreshDispatch || userAuthorizedReturn)
           && state.records.some((r) =>
             r.stepId === "Q02_TEST" && r.result === "BLOCK" && r.attempt === state.attempts);
         if (currentClaim?.event_id === eventId
