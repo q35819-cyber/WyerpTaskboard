@@ -313,19 +313,54 @@ export class TaskStepCheckpoint {
           && oldSha.toLowerCase() === repairedSha.toLowerCase());
         const genuineRepair = repair && repairClaim && changedSha
           && repair.actor_id === repairClaim.actor_id && repair.session_id === repairClaim.session_id;
+        // The old Q04 PASS can be followed by a genuinely new development candidate.
+        const candidateSha = (entry) => String(entry?.metadata?.commitSha
+          || String(entry?.note || "").match(/候选\s*([a-f0-9]{40})/i)?.[1] || "").toLowerCase();
+        const formerPassIndex = history.findLastIndex((e, i) => i < qaIndex
+          && e.event_type === "test_result" && e.actor_type === "test_ai"
+          && e.metadata?.atomicLifecycle === true && e.metadata?.testResult === "pass"
+          && /^[a-f0-9]{40}$/.test(candidateSha(e)));
+        const handoffIndex = history.findLastIndex((e, i) => i > formerPassIndex && i < qaIndex
+          && e.event_type === "handoff" && e.actor_type === "developer_ai"
+          && e.old_status === "开发中" && e.new_status === "待独测"
+          && e.metadata?.atomicLifecycle === true);
+        const newHandoff = history[handoffIndex];
+        const devEvents = history.slice(formerPassIndex + 1, handoffIndex);
+        const developerClaim = devEvents.findLast((e) => e.actor_type === "developer_ai"
+          && ["claim", "takeover"].includes(e.event_type)
+          && e.actor_id === newHandoff?.actor_id && e.session_id === newHandoff?.session_id
+          && e.new_status === "开发中");
+        const developerPass = devEvents.findLast((e) => e.event_type === "test_result"
+          && e.actor_type === "developer_ai" && e.metadata?.testResult === "pass"
+          && e.metadata?.reportPath && e.actor_id === newHandoff?.actor_id
+          && e.session_id === newHandoff?.session_id);
+        const newSha = candidateSha(newHandoff);
+        const newCandidateRestart = formerPassIndex >= 0 && handoffIndex > formerPassIndex
+          && developerClaim && developerPass && newHandoff
+          && /^[a-f0-9]{40}$/.test(newSha)
+          && newSha === candidateSha(developerPass)
+          && newSha !== candidateSha(history[formerPassIndex])
+          && devEvents.indexOf(developerClaim) < devEvents.indexOf(developerPass)
+          && !devEvents.some((e) => e.event_type === "test_result"
+            && e.actor_type === "test_ai" && e.metadata?.testResult === "fail")
+          && state.records.some((r) => r.stepId === "Q04_NEXT" && r.result === "PASS"
+            && r.attempt === state.attempts);
         const validRestart = (verdict?.metadata?.testResult === "blocked"
             && verdict.new_status === "阻断" && restored)
           || (verdict?.metadata?.testResult === "pass" && verdict.new_status === "待交付"
             && failedDelivery && restored)
           || (["blocked", "fail"].includes(verdict?.metadata?.testResult) && genuineRepair);
         if (qaClaim?.event_id === eventId && qaClaim.actor_id === actorId
-          && qaClaim.session_id === sessionId && qaClaim.old_status === "待复测"
-          && qaClaim.new_status === "复测中" && task.status === "复测中"
+          && qaClaim.session_id === sessionId
+          && ((qaClaim.old_status === "待复测" && qaClaim.new_status === "复测中"
+              && task.status === "复测中" && validRestart)
+            || (qaClaim.old_status === "待独测" && qaClaim.new_status === "独测中"
+              && task.status === "独测中" && newCandidateRestart))
           && task.sessionId === sessionId && formerQA
           && formerQA.actor_id === verdict?.actor_id && formerQA.session_id === verdict?.session_id
           && state.records.some((r) => r.stepId === "Q01_ADMISSION"
             && r.result === "PASS" && r.attempt === state.attempts)
-          && validRestart && !(await this.taskStore.stopState(projectId, taskId)).stopRequested
+          && !(await this.taskStore.stopState(projectId, taskId)).stopRequested
           && await hardDependenciesCompleted(this.taskStore, projectId, task)) {
           state.attempts += 1;
           state.cursors.test_ai = "Q01_ADMISSION";
