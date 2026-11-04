@@ -189,6 +189,27 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
   const blocked = [...history].reverse().find((event) =>
     event.old_status !== "阻断" && event.new_status === "阻断");
   const developerPause = blocked?.event_type === "developer_paused_for_independent_full_suite_gate";
+  const d01Blocked = blocked?.event_type === "developer_d01_missing_controller_dispatch_block";
+  if (d01Blocked) {
+    const blockIndex = history.indexOf(blocked);
+    const oldClaimIndex = history.findLastIndex((event, index) => index < blockIndex
+      && event.event_type === "claim" && event.actor_type === "developer_ai");
+    const oldClaim = history[oldClaimIndex];
+    const newDispatch = history.slice(blockIndex + 1).some((event) =>
+      event.event_type === "controller_dispatch" && event.actor_type === "controller_ai"
+      && Boolean(event.actor_id) && Boolean(event.session_id));
+    if (blocked.old_status !== "开发中" || blocked.actor_type !== "developer_ai"
+      || !blocked.session_id || !oldClaim || oldClaim.new_status !== "开发中"
+      || oldClaim.actor_id !== blocked.actor_id || oldClaim.session_id !== blocked.session_id
+      || !newDispatch || history.slice(oldClaimIndex + 1, blockIndex).some((event) =>
+        event.event_type === "controller_dispatch" && event.actor_type === "controller_ai")
+      || history.slice(blockIndex + 1).some((event) =>
+        event.event_type === "claim" && event.actor_type === "developer_ai")) return null;
+    const messages = await store.userMessageState(projectId, task.id, {
+      actorType: "scanner", actorId: "task-scan", sessionId: "task-scan"
+    });
+    if (messages.messages?.at(-1)?.replies?.length === 0) return null;
+  }
   if (developerPause) {
     if (blocked.actor_type !== "developer_ai" || blocked.old_status !== "开发中") return null;
     const claim = history.slice(0, history.indexOf(blocked)).findLast((event) =>
@@ -196,13 +217,14 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
       event.actor_id === blocked.actor_id && event.session_id === blocked.session_id &&
       event.new_status === "开发中");
     if (!claim || !blocked.session_id) return null;
-  } else if (blocked?.event_type !== "temporary_block" || blocked.actor_type !== "system") return null;
+  } else if (!d01Blocked && (blocked?.event_type !== "temporary_block" || blocked.actor_type !== "system")) return null;
   const target = blocked.old_status === "待准备"
     ? "待开发" : TEMPORARY_RESTORE.get(blocked.old_status);
-  const conditions = developerPause
+  const conditions = d01Blocked ? [] : developerPause
     ? [{ kind: "dependency_completed", taskId: blocked.metadata?.requiredTask }]
     : blocked.metadata?.conditions;
-  if (!target || !Array.isArray(conditions) || !conditions.length || conditions.length > 8) return null;
+  if (!target || !Array.isArray(conditions) || (!d01Blocked && !conditions.length)
+    || conditions.length > 8) return null;
   if ((await store.stopState(projectId, task.id)).stopRequested) return null;
   const lastFailure = history.findLastIndex((event) =>
     event.event_type === "test_result" && event.metadata?.testResult === "fail");
@@ -637,7 +659,8 @@ export class TaskStore {
     for (const task of before.tasks) {
       const blocked = [...(history.get(task.id) || [])].reverse().find((event) =>
         event.old_status !== "阻断" && event.new_status === "阻断");
-      if (!["temporary_block", "developer_paused_for_independent_full_suite_gate"].includes(blocked?.event_type)) continue;
+      if (!["temporary_block", "developer_paused_for_independent_full_suite_gate",
+        "developer_d01_missing_controller_dispatch_block"].includes(blocked?.event_type)) continue;
       const operationId = autoUnblockOperationId(projectId, task.id, blocked.event_id);
       const transaction = await this.transactions.read(operationId);
       if (!transaction || ["committed", "aborted_no_effect"].includes(transaction.state)) continue;
