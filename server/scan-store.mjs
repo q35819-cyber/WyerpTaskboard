@@ -294,6 +294,7 @@ export class ScanStore {
           existing.write_targets = candidate.write_targets;
           existing.checkpoint_report_refs = candidate.checkpoint_report_refs;
           existing.eligible_role = candidate.eligible_role;
+          existing.auto_unblocked_bug = candidate.auto_unblocked_bug;
           existing.user_urgent = candidate.user_urgent;
           existing.unlocks_count = candidate.unlocks_count;
           existing.original_developer_actor_id = candidate.original_developer_actor_id;
@@ -339,9 +340,11 @@ export class ScanStore {
     const priorityRank = { P0: 0, P1: 1, P2: 2 };
     const queueRank = (item) => {
       if (item.eligible_role === "developer_ai") {
-        if (["测试失败待修复", "阻断"].includes(item.status)) return 1;
-        if (["待执行", "待开发"].includes(item.status)) return 2;
-        return 3;
+        if (item.auto_unblocked_bug && item.track === "bugfix") return 2;
+        if (item.track === "bugfix") return 3;
+        if (["测试失败待修复", "阻断"].includes(item.status)) return 4;
+        if (["待执行", "待开发"].includes(item.status)) return 5;
+        return 6;
       }
       if (item.eligible_role === "test_ai") {
         if (item.status === "待复测") return 0;

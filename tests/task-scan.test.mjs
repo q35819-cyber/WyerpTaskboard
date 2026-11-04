@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -71,6 +72,100 @@ test("derived ready candidates honor dependencies, urgency, sorting and historic
   assert.equal(changed.candidates.find(x => x.task_id === "B-WAIT").eligible, true);
   assert.ok(!changed.candidates.some(x => x.task_id === "Z-LEGACY"));
   assert.equal(changed.candidates.find(x => x.task_id === "B-WAIT").status, "待开发");
+});
+
+test("machine-proven current-round auto-unblocked BUG outranks other BUG and new work without changing priority or QA", async (t) => {
+  const f = await fixtureWithLedger(t);
+  const row = (id, track, priority, status = "待开发", dependencies = "") => [
+    id, "F-QUEUE", track, priority, status,
+    ["待独测", "待复测"].includes(status) ? "独立测试AI" : "开发AI",
+    "—", "—", "—", "2026-11-05T00:00:00Z", "bug order",
+    "plan.md", "trace/" + id, dependencies, "write/" + id + ".js", "cp/" + id + ".md"
+  ];
+  await fs.writeFile(f.registryPath, registryText([
+    row("AUTO-BUG", "bugfix", "P1", "待准备", "DONE完成"),
+    row("HISTORY-BUG", "bugfix", "P1", "待开发", "DONE完成"),
+    row("FAKE-BUG", "bugfix", "P0", "待开发", "DONE完成"),
+    row("URGENT-BUG", "bugfix", "P2"),
+    row("REGULAR-BUG", "bugfix", "P0"),
+    row("PRODUCT-RESTORE", "product", "P0", "待准备", "DONE完成"),
+    row("NEW-PRODUCT", "product", "P0"),
+    row("BLOCKED-BUG", "bugfix", "P0", "待开发", "MISSING完成"),
+    row("QA-RETEST", "product", "P0", "待复测"),
+    row("QA-NEW", "product", "P1", "待独测"),
+    row("DONE", "infrastructure", "P2", "已完成")
+  ]), "utf8");
+  const taskStore = await new TaskStore(f.boardRoot).init();
+  const requirementStore = await new RequirementStore(f.boardRoot).init();
+  const evaluator = new CandidateEvaluator(f.boardRoot, { taskStore, requirementStore });
+  const scanStore = await new ScanStore(f.boardRoot).init();
+  let n = 0;
+  const mutate = async (id, status, eventType, actorType = "system", metadata = {}) => {
+    const { snapshot } = await taskStore.getTask("fixture", id);
+    return taskStore.updateTask("fixture", id, { status, assignee: "", sessionId: "" }, {
+      operationId: "auto.bug.order." + (++n), expectedRevision: snapshot.registryRevision,
+      eventType, actorType, actorId: actorType === "system" ? "task-scan" : "human",
+      metadata
+    });
+  };
+  for (const id of ["AUTO-BUG", "HISTORY-BUG", "FAKE-BUG", "PRODUCT-RESTORE"]) {
+    await mutate(id, "阻断", "temporary_block", "system", {
+      conditions: [{ kind: "dependency_completed", taskId: "DONE" }]
+    });
+  }
+  await taskStore.appendTaskEvent("fixture", "URGENT-BUG", {
+    operationId: "auto.bug.order.urgent", eventType: "priority_change", actorType: "user",
+    actorId: "human", metadata: { urgent: true }
+  });
+  await evaluator.evaluateProject("fixture");
+  for (const id of ["AUTO-BUG", "HISTORY-BUG", "FAKE-BUG", "PRODUCT-RESTORE"]) {
+    assert.equal((await taskStore.getTask("fixture", id)).task.status, "待开发", id);
+  }
+  // A later real status cycle must invalidate the old machine ranking proof.
+  await mutate("HISTORY-BUG", "HOLD", "status_change", "user");
+  await mutate("HISTORY-BUG", "待开发", "status_change", "user");
+  // A journal-less forged auto_unblock event must not grant the top tier.
+  const fakeHistory = await taskStore.taskHistory("fixture", "FAKE-BUG", { all: true });
+  const blocked = fakeHistory.find((event) => event.event_type === "temporary_block");
+  const operationId = "auto_unblock." + crypto.createHash("sha256")
+    .update("fixture|FAKE-BUG|" + blocked.event_id).digest("hex");
+  await taskStore.events.append("fixture", {
+    operation_id: "forged." + operationId, project_id: "fixture", task_id: "FAKE-BUG",
+    timestamp: "2099-01-01T00:00:00.000Z",
+    event_type: "auto_unblock", actor_type: "system", actor_id: "task-scan",
+    old_status: "阻断", new_status: "待开发",
+    metadata: { blockedEventId: blocked.event_id, restoreStatus: "待开发" }
+  });
+  const result = await evaluator.evaluateProject("fixture");
+  const candidate = new Map(result.candidates.map((item) => [item.task_id, item]));
+  assert.equal(candidate.get("AUTO-BUG").auto_unblocked_bug, true);
+  for (const id of ["HISTORY-BUG", "FAKE-BUG", "PRODUCT-RESTORE", "REGULAR-BUG"]) {
+    assert.equal(candidate.get(id).auto_unblocked_bug, false, id);
+  }
+  assert.equal(candidate.get("BLOCKED-BUG").eligible, false);
+  assert.equal(candidate.get("AUTO-BUG").priority, "P1");
+  assert.equal(candidate.get("URGENT-BUG").priority, "P2");
+  assert.equal(candidate.get("REGULAR-BUG").priority, "P0");
+  await scanStore.upsertScan({ runId: "auto.bug.order.scan.one", detectedAt: result.detected_at, projectResults: [result] });
+  const list = await scanStore.list();
+  const eligibleDevelopers = list.filter((item) => item.eligible && item.eligible_role === "developer_ai");
+  assert.equal(eligibleDevelopers[0].task_id, "AUTO-BUG", "P1 machine recovery outranks P0 plain bug");
+  assert.equal(eligibleDevelopers[1].task_id, "URGENT-BUG", "urgent other bug leads its tier");
+  const bugIds = eligibleDevelopers.filter((item) => item.track === "bugfix").map((item) => item.task_id);
+  const productIds = eligibleDevelopers.filter((item) => item.track !== "bugfix").map((item) => item.task_id);
+  assert.ok(bugIds.length >= 4);
+  assert.ok(productIds.length >= 2);
+  assert.ok(eligibleDevelopers.findIndex((item) => item.task_id === bugIds.at(-1)) <
+    eligibleDevelopers.findIndex((item) => item.task_id === productIds[0]), "all eligible bugs precede product tasks");
+  assert.equal(list.find((item) => item.task_id === "BLOCKED-BUG").eligible, false);
+  assert.deepEqual(list.filter((item) => item.eligible_role === "test_ai")
+    .map((item) => item.status), ["待复测", "待独测"], "QA queue unchanged");
+
+  const repeated = await evaluator.evaluateProject("fixture");
+  await scanStore.upsertScan({ runId: "auto.bug.order.scan.two", detectedAt: repeated.detected_at, projectResults: [repeated] });
+  assert.equal((await scanStore.list()).find((item) => item.task_id === "AUTO-BUG").auto_unblocked_bug, true);
+  assert.equal((await taskStore.taskHistory("fixture", "AUTO-BUG", { all: true }))
+    .filter((event) => event.event_type === "auto_unblock").length, 1);
 });
 
 test("scanner creates role-aware candidates, dedupes repeated scans and expires after 30 minutes", async (t) => {

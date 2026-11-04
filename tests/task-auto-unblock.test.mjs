@@ -39,6 +39,44 @@ async function block(store, id, conditions) {
 }
 const status = async (store, id) => (await store.getTask("fixture", id)).task.status;
 
+test("prepared developer is restored to ready only after every real hard prerequisite is complete", async (t) => {
+  const { store, evaluator } = await setup(t, [
+    row("A-10", "待准备", { dependencies: "B-10完成;C-10完成" }),
+    row("B-10", "已完成"),
+    row("C-10", "独测中", { owner: "tester", session: "qa-session" })
+  ]);
+  await block(store, "A-10", [{ kind: "dependency_completed", taskId: "B-10" }]);
+  await evaluator.evaluateProject("fixture");
+  assert.equal(await status(store, "A-10"), "阻断", "another unfinished hard dependency must prevent release");
+  await change(store, "C-10", { status: "已完成", assignee: "", sessionId: "", sessionWindowName: "" },
+    "test_result", { atomicLifecycle: true, testResult: "pass", acceptanceScope: "system",
+      reportPath: "reports/C-10/PASS.md", deliveryActions: [] }, "test_ai", "qa-session");
+  const scan = await evaluator.evaluateProject("fixture");
+  assert.equal(await status(store, "A-10"), "待开发");
+  const candidate = scan.candidates.find((item) => item.task_id === "A-10");
+  assert.equal(candidate.eligible, true);
+  assert.equal(candidate.auto_unblocked_bug, true);
+  assert.equal(candidate.priority, "P0");
+  await evaluator.evaluateProject("fixture");
+  const history = await store.taskHistory("fixture", "A-10", { all: true });
+  const unblock = history.filter((item) => item.event_type === "auto_unblock");
+  assert.equal(unblock.length, 1);
+  assert.equal(unblock[0].old_status, "阻断");
+  assert.equal(unblock[0].new_status, "待开发");
+  assert.equal((await store.transactions.read(unblock[0].operation_id))?.state, "committed");
+});
+
+test("prepared developer without declared write targets remains blocked after machine conditions pass", async (t) => {
+  const missingWrites = row("A-10", "待准备", { dependencies: "B-10完成" });
+  missingWrites[14] = "";
+  const { store, evaluator } = await setup(t, [missingWrites, row("B-10", "已完成")]);
+  await block(store, "A-10", [{ kind: "dependency_completed", taskId: "B-10" }]);
+  await evaluator.evaluateProject("fixture");
+  assert.equal(await status(store, "A-10"), "阻断");
+  assert.equal((await store.taskHistory("fixture", "A-10", { all: true }))
+    .filter((item) => item.event_type === "auto_unblock").length, 0);
+});
+
 test("machine-confirmed prerequisite completion automatically restores the original eligible stage once", async (t) => {
   const { store, evaluator } = await setup(t, [
     row("A-10", "待开发", { dependencies: "B-10完成" }),
