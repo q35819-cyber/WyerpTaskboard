@@ -231,6 +231,43 @@ export class TaskStepCheckpoint {
           }
         }
       }
+      let qaBlockedRetry = false;
+      if (actorType === "test_ai" && stepId === "Q01_ADMISSION"
+        && state.cursors.test_ai !== "Q01_ADMISSION") {
+        const claimIndex = history.findLastIndex((entry) => entry.actor_type === "test_ai"
+          && ["claim", "takeover"].includes(entry.event_type));
+        const claim = history[claimIndex];
+        if (claim && (claim.actor_id !== actorId || claim.session_id !== sessionId))
+          throw invalid("CHECKPOINT_SESSION_MISMATCH", "旧独测Session不能开启新的测试轮次", 403);
+        const blockedIndex = history.findLastIndex((entry, i) => i < claimIndex
+          && entry.event_type === "test_result" && entry.actor_type === "test_ai");
+        const blocked = history[blockedIndex];
+        const oldClaim = blockedIndex >= 0 && [...history.slice(0, blockedIndex)].reverse().find(
+          (entry) => entry.actor_type === "test_ai" && ["claim", "takeover"].includes(entry.event_type));
+        const between = history.slice(blockedIndex + 1, claimIndex);
+        const restored = between.some((entry) => entry.actor_type === "controller_ai"
+          && entry.old_status === "阻断" && entry.new_status === "待复测");
+        const developerChanged = between.some((entry) => entry.actor_type === "developer_ai"
+          && ["claim", "takeover"].includes(entry.event_type));
+        if (claim && claim.event_id === eventId && claim.actor_id === actorId
+          && claim.session_id === sessionId && claim.new_status === "复测中"
+          && claim.old_status === "待复测" && task.status === "复测中"
+          && task.sessionId === sessionId && blockedIndex >= 0
+          && blocked.metadata?.atomicLifecycle === true
+          && blocked.metadata?.testResult === "blocked"
+          && ["独测中", "复测中"].includes(blocked.old_status)
+          && blocked.new_status === "阻断" && blocked.metadata?.reportPath
+          && oldClaim?.actor_id === blocked.actor_id
+          && oldClaim?.session_id === blocked.session_id
+          && restored && !developerChanged
+          && state.records.some((entry) => entry.stepId === "Q01_ADMISSION" && entry.result === "PASS")
+          && !(await this.taskStore.stopState(projectId, taskId)).stopRequested
+          && await hardDependenciesCompleted(this.taskStore, projectId, task)) {
+          state.attempts += 1;
+          state.cursors.test_ai = "Q01_ADMISSION";
+          qaBlockedRetry = true;
+        }
+      }
       if (state.cursors[actorType] !== stepId && !optionalEnvironment) {
         throw invalid("CHECKPOINT_STEP_ORDER", "上一步尚未通过，不得越级执行；请先读取唯一下一步");
       }
@@ -373,7 +410,7 @@ export class TaskStepCheckpoint {
                   && later.new_status === "待复测")))
           || (entry.actor_type === "developer_ai"
             && ["claim", "takeover"].includes(entry.event_type)));
-        if ((!legacyEmpty && state.cursors.developer_ai !== "D08_HANDOFF") || !handoff || handoffIndex < 0
+        if ((!legacyEmpty && !qaBlockedRetry && state.cursors.developer_ai !== "D08_HANDOFF") || !handoff || handoffIndex < 0
           || !devAuthority || !event || !["claim", "takeover"].includes(event.event_type)
           || event.actor_type !== "test_ai" || event.actor_id !== actorId
           || event.session_id !== sessionId || qaClaimIndex <= handoffIndex
@@ -387,19 +424,19 @@ export class TaskStepCheckpoint {
           throw invalid("CHECKPOINT_PREDECESSOR_REQUIRED", "缺少本轮可信正式开发交接事件，不能进入独测");
         }
         const recovered = {
-          operationId: "recovered." + handoff.event_id,
-          stepId: legacyEmpty ? "HISTORICAL_HANDOFF" : "D08_HANDOFF", actorType: "developer_ai",
+          operationId: qaBlockedRetry ? "recovered.qa-retry." + event.event_id : "recovered." + handoff.event_id,
+          stepId: legacyEmpty || qaBlockedRetry ? "HISTORICAL_HANDOFF" : "D08_HANDOFF", actorType: "developer_ai",
           actorId: handoff.actor_id, sessionId: handoff.session_id,
-          result: legacyEmpty ? "RECOVERED" : "PASS", substepId: null, attempt: state.attempts,
+          result: legacyEmpty || qaBlockedRetry ? "RECOVERED" : "PASS", substepId: null, attempt: state.attempts,
           at: new Date().toISOString(),
           evidence: "基于已发生的正式handoff事件恢复缺失断点",
           eventId: handoff.event_id, verdict: null,
-          note: legacyEmpty
+          note: legacyEmpty || qaBlockedRetry
             ? "历史空断点仅登记可信交接，不补造D01-D08的开发步骤PASS"
             : "历史事件投影恢复，原开发会话不获得新的执行权"
         };
         state.records.push(recovered);
-        if (!legacyEmpty) {
+        if (!legacyEmpty && !qaBlockedRetry) {
           state.cursors.developer_ai = FLOW_STEPS[state.flowVersion].developer_ai[
             FLOW_STEPS[state.flowVersion].developer_ai.indexOf("D08_HANDOFF") + 1];
         }
