@@ -268,6 +268,36 @@ export class TaskStepCheckpoint {
           record.stepId === "D01_CLAIM" && record.result === "PASS");
         const alreadyRestarted = state.records.some((record) =>
           record.stepId === "D01_CLAIM" && record.eventId === currentClaim?.event_id);
+        // A completed legacy QA pass can leave D09 as the developer cursor.
+        // A new controller dispatch and a genuinely fresh claim start a new attempt.
+        if (!modern && result === "PASS" && state.cursors.developer_ai === "D09_MERGE_MAIN"
+          && currentClaim?.event_id === eventId && currentClaim?.actor_id === actorId
+          && currentClaim?.session_id === sessionId && currentClaim?.old_status === "待开发"
+          && currentClaim?.new_status === "开发中" && task.status === "开发中"
+          && task.sessionId === sessionId && !alreadyRestarted && previouslyStarted
+          && !(await this.taskStore.stopState(projectId, taskId)).stopRequested
+          && await hardDependenciesCompleted(this.taskStore, projectId, task)) {
+          const oldClaim = history.slice(0, currentClaimIndex).findLast((entry) =>
+            entry.actor_type === "developer_ai" && ["claim", "takeover"].includes(entry.event_type));
+          const qaResultIndex = history.findLastIndex((entry, index) => index < currentClaimIndex
+            && entry.event_type === "test_result" && entry.actor_type === "test_ai");
+          const qaResult = history[qaResultIndex];
+          const dispatchIndex = history.findLastIndex((entry, index) => index < currentClaimIndex
+            && entry.actor_type === "controller_ai"
+            && /^controller_dispatch(?:_[a-z0-9_]+)?$/i.test(entry.event_type));
+          const previousPass = state.records.some((r) => r.attempt === state.attempts
+            && r.stepId === "D08_HANDOFF" && r.result === "PASS")
+            && state.records.some((r) => r.attempt === state.attempts
+              && r.stepId === "Q03_RESULT" && r.result === "PASS" && r.verdict === "pass");
+          if (oldClaim && oldClaim.actor_id !== actorId && oldClaim.session_id !== sessionId
+            && previousPass && qaResult?.metadata?.atomicLifecycle === true
+            && qaResult.metadata.testResult === "pass"
+            && dispatchIndex > qaResultIndex && qaResultIndex > history.indexOf(oldClaim)) {
+            state.attempts += 1;
+            state.cursors.developer_ai = "D01_CLAIM";
+            state.cursors.test_ai = "Q01_ADMISSION";
+          }
+        }
         if ((validFailure || validBlockedReturn) && previouslyStarted && !alreadyRestarted
           && currentClaimIndex > (validBlockedReturn ? blockedIndex : lastFailIndex) && currentClaim?.event_id === eventId
           && currentClaim?.actor_id === actorId && currentClaim?.session_id === sessionId
