@@ -129,24 +129,25 @@ export function deliveryEvidence(history, workflow) {
 }
 
 function activeDeveloperTask(task) {
-  return ["开发中", "修复中", "交付中"].includes(task.status) && Boolean(task.assignee || task.sessionId);
+  return ["开发中", "修复中"].includes(task.status) && Boolean(task.assignee || task.sessionId);
 }
 function activeTestTask(task) {
   return ["独测中", "复测中"].includes(task.status) && Boolean(task.assignee || task.sessionId);
 }
 const TEST_WATCH_STATUSES = new Set(["待独测", "独测中", "待复测", "复测中"]);
-const DEVELOPER_WATCH_STATUSES = new Set(["待准备", "待开发", "开发中", "测试失败待修复", "修复中", "待交付", "交付中"]);
+const DEVELOPER_WATCH_STATUSES = new Set(["待准备", "待开发", "待执行", "开发中", "测试失败待修复", "修复中"]);
 function roleFor(task) {
-  if (["待开发", "测试失败待修复", "待交付"].includes(task.status)) return "developer_ai";
+  if (["待开发", "待执行", "测试失败待修复"].includes(task.status)) return "developer_ai";
+  if (task.status === "待交付") return "controller_ai";
   if (["待独测", "待复测"].includes(task.status)) return "test_ai";
   if (task.status === "待准备" && task.plannedRole === "开发AI") return "developer_ai";
   return null;
 }
 function reasonFor(task, eligibleRole, blockers) {
   if (blockers.length) return blockers.join("；");
+  if (eligibleRole === "controller_ai") return "已登记真实交付动作，等待总控AI交付";
   if (eligibleRole === "developer_ai") {
     if (task.status === "测试失败待修复") return "已有缺陷等待开发修复";
-    if (task.status === "待交付") return "已登记真实交付动作，等待开发AI执行交付";
     if (task.status === "待准备") return "准备条件需要开发AI补齐";
     return "开发任务已就绪";
   }
@@ -192,6 +193,16 @@ export class CandidateEvaluator {
     const candidates = [];
     const activeDeveloperTasks = parsed.tasks.filter(activeDeveloperTask);
     const tasksById = new Map(parsed.tasks.map((task) => [task.id, task]));
+    const unlockCounts = new Map(parsed.tasks.map((task) => [task.id, 0]));
+    for (const dependent of parsed.tasks) {
+      if (["已完成", "已取消"].includes(dependent.status)) continue;
+      for (const dependencyId of new Set(splitRefs(dependent.readDependencies).map(hardTaskDependencyId).filter(Boolean))) {
+        if (dependencyId !== dependent.id && tasksById.has(dependencyId)
+          && tasksById.get(dependencyId).status !== "已完成") {
+          unlockCounts.set(dependencyId, (unlockCounts.get(dependencyId) || 0) + 1);
+        }
+      }
+    }
 
     for (const task of parsed.tasks) {
       let delivery = null;
@@ -219,6 +230,16 @@ export class CandidateEvaluator {
       if (unresolved) blockers.push("存在尚未获得AI回复的最新用户留言");
       const readDependencies = splitRefs(task.readDependencies);
       const writeTargets = splitRefs(task.writeTargets);
+      const developerEvents = eligibleRole === "developer_ai"
+        ? await this.taskStore.taskHistory(projectId, task.id, { limit: 100 })
+        : [];
+      const urgency = [...developerEvents].reverse().find((event) => event.actor_type === "user"
+        && (typeof event.metadata?.urgent === "boolean" || event.event_type === "priority_change"));
+      const userUrgent = typeof urgency?.metadata?.urgent === "boolean"
+        ? urgency.metadata.urgent
+        : urgency?.event_type === "priority_change" && urgency.new_priority === "P0";
+      const priorDeveloper = [...developerEvents].reverse().find((event) =>
+        event.actor_type === "developer_ai" && ["claim", "takeover"].includes(event.event_type));
       if (eligibleRole === "developer_ai") {
         if (!writeTargets.length) blockers.push("未声明计划写文件，不能进入待认领");
         const candidateWrites = normalizedFileRefs(task.writeTargets);
@@ -257,8 +278,11 @@ export class CandidateEvaluator {
         provisional_authorization_event_id: provisional?.eventId || null,
         provisional: Boolean(provisional),
         eligible_role: eligibleRole,
-        eligible_actor_id: provisional?.actorId || delivery?.developerActorId || null,
-        eligible_session_id: provisional?.sessionId || delivery?.developerSessionId || null,
+        user_urgent: Boolean(userUrgent),
+        unlocks_count: unlockCounts.get(task.id) || 0,
+        original_developer_actor_id: task.status === "测试失败待修复" ? priorDeveloper?.actor_id || null : null,
+        eligible_actor_id: eligibleRole === "controller_ai" ? null : (provisional?.actorId || delivery?.developerActorId || null),
+        eligible_session_id: eligibleRole === "controller_ai" ? null : (provisional?.sessionId || delivery?.developerSessionId || null),
         eligible: Boolean(blockers.length === 0),
         blockers,
         reason: reasonFor(task, eligibleRole, blockers),

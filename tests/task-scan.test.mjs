@@ -21,6 +21,58 @@ async function fixtureWithLedger(t) {
   return fixture;
 }
 
+test("derived ready candidates honor dependencies, urgency, sorting and historical status without writing a new state", async (t) => {
+  const f = await fixtureWithLedger(t);
+  const row = (id, status, dependency = "") => [
+    id, "F-READY", "product", "P0", status, status === "已完成" ? "" : "开发AI",
+    "—", "—", "—", "2026-11-03T01:00:00Z", "derived queue fixture",
+    "ready-plan.md", "tests/fixture-source.txt", dependency, "write/" + id + ".js", "cp/" + id + ".md"
+  ];
+  const rows = [
+    row("A-READY", "待开发"), row("Z-LEGACY", "待执行"),
+    row("B-WAIT", "待开发", "Z-LEGACY 完成"),
+    row("C-MISSING", "待开发", "NO-SUCH-TASK 完成"),
+    row("D-CYCLE", "待开发", "E-CYCLE 完成"),
+    row("E-CYCLE", "待开发", "D-CYCLE 完成")
+  ];
+  await fs.writeFile(f.registryPath, registryText(rows), "utf8");
+  const taskStore = await new TaskStore(f.boardRoot).init();
+  const requirementStore = await new RequirementStore(f.boardRoot).init();
+  const evaluator = new CandidateEvaluator(f.boardRoot, { taskStore, requirementStore });
+  const scanStore = await new ScanStore(f.boardRoot).init();
+  const first = await evaluator.evaluateProject("fixture");
+  const byId = new Map(first.candidates.map(x => [x.task_id, x]));
+  assert.equal(byId.get("A-READY").eligible, true);
+  assert.equal(byId.get("Z-LEGACY").eligible, true);
+  assert.equal(byId.get("Z-LEGACY").unlocks_count, 1);
+  assert.equal(byId.get("B-WAIT").eligible, false);
+  assert.match(byId.get("B-WAIT").blockers.join(" "), /Z-LEGACY未完成/);
+  assert.match(byId.get("C-MISSING").blockers.join(" "), /未登记/);
+  assert.equal(byId.get("D-CYCLE").eligible, false);
+  await scanStore.upsertScan({ runId: "ready.scan.one", detectedAt: first.detected_at, projectResults: [first] });
+  assert.deepEqual((await scanStore.list()).filter(x => x.eligible).map(x => x.task_id), ["Z-LEGACY", "A-READY"]);
+  await taskStore.appendTaskEvent("fixture", "A-READY", {
+    operationId: "ready.urgent.true", eventType: "priority_change",
+    actorType: "user", actorId: "user", sessionId: "user", metadata: { urgent: true }
+  });
+  const second = await evaluator.evaluateProject("fixture");
+  await scanStore.upsertScan({ runId: "ready.scan.two", detectedAt: second.detected_at, projectResults: [second] });
+  assert.equal((await scanStore.list()).filter(x => x.eligible)[0].task_id, "A-READY");
+  await taskStore.appendTaskEvent("fixture", "A-READY", {
+    operationId: "ready.urgent.false", eventType: "priority_change",
+    actorType: "user", actorId: "user", sessionId: "user", metadata: { urgent: false }
+  });
+  const third = await evaluator.evaluateProject("fixture");
+  await scanStore.upsertScan({ runId: "ready.scan.three", detectedAt: third.detected_at, projectResults: [third] });
+  assert.equal((await scanStore.list()).filter(x => x.eligible)[0].task_id, "Z-LEGACY");
+  rows[1] = row("Z-LEGACY", "已完成");
+  await fs.writeFile(f.registryPath, registryText(rows), "utf8");
+  const changed = await evaluator.evaluateProject("fixture");
+  assert.equal(changed.candidates.find(x => x.task_id === "B-WAIT").eligible, true);
+  assert.ok(!changed.candidates.some(x => x.task_id === "Z-LEGACY"));
+  assert.equal(changed.candidates.find(x => x.task_id === "B-WAIT").status, "待开发");
+});
+
 test("scanner creates role-aware candidates, dedupes repeated scans and expires after 30 minutes", async (t) => {
   const fixture = await fixtureWithLedger(t);
   let now = Date.parse("2026-09-29T00:00:00Z");
@@ -133,10 +185,10 @@ test("delivery candidates require a recorded non-empty real delivery action", as
   assert.ok(empty.blockers.some((item) => item.includes("缺少有效的最新独立测试PASS")));
   const real = evaluated.candidates.find((item) => item.task_id === "D-REAL");
   assert.ok(real);
-  assert.equal(real.eligible_role, "developer_ai");
+  assert.equal(real.eligible_role, "controller_ai");
   assert.equal(real.eligible, true);
-  assert.equal(real.eligible_actor_id, "developer");
-  assert.equal(real.eligible_session_id, "developer-session");
+  assert.equal(real.eligible_actor_id, null);
+  assert.equal(real.eligible_session_id, null);
   assert.match(real.reason, /真实交付动作/);
 });
 
@@ -370,7 +422,7 @@ test("developer claimable eligibility is recalculated when write conflicts appea
   assert.deepEqual(restored.blockers, []);
 });
 
-test("developer candidate queue order prefers delivery then failures then waiting development before priority", async (t) => {
+test("developer queue prefers failed task and never claims controller delivery", async (t) => {
   const fixture = await fixtureWithLedger(t);
   await fs.writeFile(fixture.registryPath, registryText([
     ["DEV-DELIVERY","F-D","product","P2","待交付","开发AI","—","—","—","2026-09-29T00:00:00Z","交付","计划D.md","trace/D.md","read/d.md","src/delivery.js","cp/DEV-DELIVERY.md"],
@@ -404,7 +456,10 @@ test("developer candidate queue order prefers delivery then failures then waitin
   const scanner = await new TaskScanner(fixture.boardRoot, { taskStore, requirementStore, scanStore }).init();
   await scanner.scanOnce();
   const developer = (await scanStore.list()).filter((x) => x.eligible_role === "developer_ai");
-  assert.deepEqual(developer.map((x) => x.task_id), ["DEV-DELIVERY","DEV-FAIL","DEV-WAIT"]);
+  assert.deepEqual(developer.map((x) => x.task_id), ["DEV-FAIL","DEV-WAIT"]);
+  const controller = (await scanStore.list()).find(x => x.task_id === "DEV-DELIVERY");
+  assert.equal(controller?.eligible_role, "controller_ai");
+  assert.equal(controller?.eligible, true);
   const testCandidates = (await scanStore.list()).filter((x) => x.eligible_role === "test_ai");
   assert.deepEqual(testCandidates.map((x) => x.status), ["待复测"]);
 });
