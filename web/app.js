@@ -174,10 +174,12 @@ function isReadyTask(task){
     &&Number.isFinite(age)&&age>=0&&age<30*60*1000;
 }
 function boardTasksForColumn(column){
-  if(column.id==="awaiting_work"){
+  if(column.id==="qa_pending"){
     const order=new Map((state.scanStatus?.developerCandidates||[]).filter(item=>item.projectId===state.projectId).map((item,index)=>[item.taskId,index]));
-    return state.filtered.filter(isReadyTask).sort((a,b)=>
+    const ready=state.filtered.filter(isReadyTask).sort((a,b)=>
       (order.get(a.id)??99999)-(order.get(b.id)??99999)||String(a.id).localeCompare(String(b.id)));
+    const qa=tasksForColumn(state.filtered,column.statuses);
+    return [...new Map([...ready,...qa].map(task=>[task.id,task])).values()];
   }
   const tasks=tasksForColumn(state.filtered,column.statuses);
   return column.id==="todo"?state.filtered.filter(task=>
@@ -422,6 +424,11 @@ function renderBoard(){
     const head=document.createElement("div");head.className="column-head";
     const columnTitle=document.createElement("span");columnTitle.textContent=column.title.replace(/HOLD/g,"暂停");
     const columnCount=document.createElement("span");columnCount.className="count";columnCount.textContent=tasks.length+"项";
+    if(column.id==="qa_pending"){
+      const developers=tasks.filter(isReadyTask).length;
+      columnCount.textContent="开发 "+developers+" 项 · 测试 "+(tasks.length-developers)+" 项";
+      columnCount.classList.add("shared-ready-count");columnTitle.classList.add("shared-ready-title");
+    }
     head.append(columnTitle,columnCount);col.append(head);
     if(visible.length)col.append(...visible.map(taskCard));
     else{const empty=document.createElement("div");empty.className="column-empty";empty.textContent="暂无任务";col.append(empty)}

@@ -340,9 +340,10 @@ test("static web and workflow metadata are served from independent service", asy
 
   assert.deepEqual(body.boardColumns.find((column) => column.id === "awaiting_delivery_user")?.statuses, ["待交付", "待用户验收"]);
 
-  assert.equal(body.boardColumns.length, 7);
-  assert.equal(body.boardColumns.find(column => column.id === "awaiting_work")?.derived, "eligible_developer_candidates");
+  assert.equal(body.boardColumns.length, 6);
+  assert.equal(body.boardColumns.some(column => column.id === "awaiting_work"), false);
   assert.deepEqual(body.boardColumns.find(column => column.id === "qa_pending")?.statuses, ["待独测", "待复测"]);
+  assert.equal(body.boardColumns.find(column => column.id === "qa_pending")?.derived, "eligible_developer_candidates");
 });
 
 test("session endpoint reports anonymous local browser access without issuing a login or CSRF token", async (t) => {

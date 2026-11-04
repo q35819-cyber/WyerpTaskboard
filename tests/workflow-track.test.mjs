@@ -10,10 +10,11 @@ test("ready is a derived column, historical persisted status can exit but not be
     e => e.code === "INVALID_STATUS_TRANSITION");
   assert.doesNotThrow(() => workflow.assertTransition("待执行", "开发中"));
   const columns = workflow.boardColumns;
-  assert.equal(columns.find(c => c.id === "awaiting_work").derived, "eligible_developer_candidates");
+  assert.equal(columns.length, 6, "the board has at most six physical columns");
+  assert.equal(columns.some(c => c.id === "awaiting_work"), false, "no seventh developer column");
+  assert.equal(columns.filter(c => c.id === "qa_pending").length, 1);
+  assert.equal(columns.find(c => c.id === "qa_pending").derived, "eligible_developer_candidates");
   assert.deepEqual(columns.find(c => c.id === "qa_pending").statuses, ["待独测", "待复测"]);
-  assert.ok(!columns.find(c => c.id === "awaiting_work").statuses.includes("待复测"));
-  assert.ok(!columns.find(c => c.id === "awaiting_work").statuses.includes("待独测"));
 });
 
 test("wyerp-ai-flow-v1 accepts product, bugfix and infrastructure tracks", () => {

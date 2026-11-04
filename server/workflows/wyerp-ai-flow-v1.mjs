@@ -64,8 +64,7 @@ export const wyerpAiFlowV1 = {
   roles: ["开发AI", "独立测试AI", "用户", "—"],
   boardColumns: [
     { id: "todo", title: "待处理 / 待认领", statuses: ["待确认", "待准备", "待开发"], derived: "developer_candidate_state" },
-    { id: "awaiting_work", title: "待执行", statuses: ["待执行"], derived: "eligible_developer_candidates" },
-    { id: "qa_pending", title: "待独测 / 待复测", statuses: ["待独测", "待复测"] },
+    { id: "qa_pending", title: "待执行 / 待独测 / 待复测", statuses: ["待独测", "待复测"], derived: "eligible_developer_candidates" },
     { id: "executing", title: "执行中", statuses: ["开发中", "修复中", "交付中", "独测中", "复测中"] },
     { id: "awaiting_delivery_user", title: "待交付 / 待用户", statuses: ["待交付", "待用户验收"] },
     { id: "blocked", title: "失败 / 阻断 / 暂停", statuses: ["测试失败待修复", "阻断", "HOLD"] },
