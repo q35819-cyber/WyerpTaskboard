@@ -155,6 +155,24 @@ function reasonFor(task, eligibleRole, blockers) {
   return "当前阶段不进入认领候选";
 }
 
+/** Select only: guard/preclaim/claim remain required for the awake role. */
+export function nextRoleCandidate(candidates, { role, actorId, sessionId, attemptedTaskIds = [] } = {}) {
+  if (!["developer_ai", "test_ai", "controller_ai"].includes(role) ||
+    !String(actorId || "").trim() || !String(sessionId || "").trim())
+    return { state: "blocked", candidate: null, reason: "role_actor_session_required" };
+  const attempted = new Set(attemptedTaskIds);
+  const own = candidates.filter((item) => item.eligible_role === role &&
+    (!item.eligible_actor_id || item.eligible_actor_id === actorId) &&
+    (!item.eligible_session_id || item.eligible_session_id === sessionId));
+  const ready = own.filter((item) => item.eligible && !attempted.has(item.task_id));
+  const rank = (priority) => ({ P0: 0, P1: 1, P2: 2 })[priority] ?? 3;
+  ready.sort((a, b) => rank(a.priority) - rank(b.priority) || a.task_id.localeCompare(b.task_id));
+  return ready.length
+    ? { state: "ready", candidate: ready[0], reason: "guard_preclaim_claim_required" }
+    : { state: "exhausted", candidate: null,
+        reason: own.some((item) => !item.eligible) ? "all_candidates_blocked_or_attempted" : "no_eligible_role_task" };
+}
+
 export class CandidateEvaluator {
   constructor(rootDir, { taskStore, requirementStore, clock = () => Date.now() } = {}) {
     this.rootDir = rootDir;

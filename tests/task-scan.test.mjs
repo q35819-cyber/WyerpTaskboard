@@ -8,7 +8,7 @@ import { makeFixture, registryText } from "./helpers.mjs";
 import { TaskStore } from "../server/task-store.mjs";
 import { RequirementStore } from "../server/requirement-store.mjs";
 import { ScanStore } from "../server/scan-store.mjs";
-import { CandidateEvaluator } from "../server/candidate-evaluator.mjs";
+import { CandidateEvaluator, nextRoleCandidate } from "../server/candidate-evaluator.mjs";
 import { TaskScanner } from "../server/task-scanner.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -20,6 +20,31 @@ async function fixtureWithLedger(t) {
   await fs.writeFile(path.join(fixture.projectRoot, "ledger.md"), "# ledger\n", "utf8");
   return fixture;
 }
+
+test("awake developer selects P0 before P1, skips 409 and STOP, never selects other roles", () => {
+  const c = (task_id, priority, eligible) => ({ task_id, priority, eligible, eligible_role: "developer_ai" });
+  const candidates = [c("P1-READY", "P1", true), c("P0-STOP", "P0", false),
+    c("P0-READY", "P0", true), { ...c("P0-OTHER", "P0", true), eligible_actor_id: "other" },
+    { ...c("QA", "P0", true), eligible_role: "test_ai" }];
+  const actor = { role: "developer_ai", actorId: "developer-1", sessionId: "wc_sess_developer1" };
+  assert.equal(nextRoleCandidate(candidates, actor).candidate.task_id, "P0-READY");
+  assert.equal(nextRoleCandidate(candidates, { ...actor, attemptedTaskIds: ["P0-READY"] }).candidate.task_id, "P1-READY");
+  assert.equal(nextRoleCandidate(candidates, { ...actor, attemptedTaskIds: ["P0-READY", "P1-READY"] }).state, "exhausted");
+  assert.equal(nextRoleCandidate(candidates, { role: "developer_ai" }).state, "blocked");
+  assert.equal(nextRoleCandidate(candidates, { ...actor, role: "test_ai" }).candidate.task_id, "QA");
+});
+
+test("scanner returns current awake role candidate and never claims or wakes", async (t) => {
+  const fixture = await fixtureWithLedger(t);
+  const scanner = await new TaskScanner(fixture.boardRoot).init();
+  const identity = { projectId: "fixture", role: "developer_ai", actorId: "dev-next", sessionId: "wc_sess_devnext" };
+  const result = await scanner.nextForAwakeRole(identity);
+  assert.equal(result.state, "ready");
+  assert.equal(result.candidate.task_id, "A-10");
+  assert.equal((await scanner.nextForAwakeRole({ ...identity, attemptedTaskIds: ["A-10"] })).state, "exhausted");
+  assert.equal((await scanner.taskStore.snapshot("fixture")).tasks.find(x => x.id === "A-10").status, "待开发");
+  t.after(() => fs.rm(fixture.boardRoot, { recursive: true, force: true }));
+});
 
 test("scanner creates role-aware candidates, dedupes repeated scans and expires after 30 minutes", async (t) => {
   const fixture = await fixtureWithLedger(t);

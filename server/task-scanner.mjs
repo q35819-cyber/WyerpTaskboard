@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { TaskStore } from "./task-store.mjs";
 import { RequirementStore } from "./requirement-store.mjs";
 import { ScanStore } from "./scan-store.mjs";
-import { CandidateEvaluator } from "./candidate-evaluator.mjs";
+import { CandidateEvaluator, nextRoleCandidate } from "./candidate-evaluator.mjs";
 import { WakeBridge } from "./wake-bridge.mjs";
 import { ChatBrowserWake } from "./chat-browser-wake.mjs";
 import { AiExecutionSettingsStore } from "./ai-execution-settings.mjs";
@@ -32,6 +32,16 @@ export class TaskScanner {
       clock: this.clock,
     });
     return this;
+  }
+
+  async nextForAwakeRole({ projectId, role, actorId, sessionId, attemptedTaskIds = [] } = {}) {
+    if (!projectId) return { state: "blocked", candidate: null, reason: "project_required" };
+    if (!this.evaluator) await this.init();
+    const current = await this.evaluator.evaluateProject(projectId);
+    const next = nextRoleCandidate(current.candidates, { role, actorId, sessionId, attemptedTaskIds });
+    if (next.state !== "ready") return next;
+    const recheck = await this.evaluator.recheck(next.candidate);
+    return recheck.ok ? next : { state: "blocked", candidate: null, reason: "candidate_stale_retry_scan" };
   }
 
   async scanOnce({ trigger = "manual" } = {}) {
