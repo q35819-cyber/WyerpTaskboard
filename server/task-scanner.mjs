@@ -3,6 +3,7 @@ import { TaskStore } from "./task-store.mjs";
 import { RequirementStore } from "./requirement-store.mjs";
 import { ScanStore } from "./scan-store.mjs";
 import { CandidateEvaluator } from "./candidate-evaluator.mjs";
+import { SplitParentReconciler } from "./split-parent-reconciler.mjs";
 import { WakeBridge } from "./wake-bridge.mjs";
 import { ChatBrowserWake } from "./chat-browser-wake.mjs";
 import { AiExecutionSettingsStore } from "./ai-execution-settings.mjs";
@@ -31,6 +32,7 @@ export class TaskScanner {
       requirementStore: this.requirementStore,
       clock: this.clock,
     });
+    this.splitParentReconciler = new SplitParentReconciler(this.taskStore, { requirementStore: this.requirementStore });
     return this;
   }
 
@@ -49,7 +51,10 @@ export class TaskScanner {
       await this.scanStore.writeStatus({ state: "running", run_id: runId, scan_started_at: detectedAt });
       for (const project of this.taskStore.projects.list()) {
         try {
-          projectResults.push(await this.evaluator.evaluateProject(project.id));
+          const splitParents = this.splitParentReconciler
+            ? await this.splitParentReconciler.reconcile(project.id) : [];
+          const evaluation = await this.evaluator.evaluateProject(project.id);
+          projectResults.push({ ...evaluation, split_parents: splitParents });
         } catch (error) {
           projectResults.push({
             project_id: project.id,
@@ -119,6 +124,8 @@ export class TaskScanner {
         duration_ms: Math.max(0, finished - started),
         project_count: projectResults.length,
         project_errors: projectResults.filter((x) => x.status !== "ok").length,
+        split_parent_reconciliation: projectResults.flatMap((item) =>
+          (item.split_parents || []).map(parent => ({ project_id: item.project_id, ...parent }))),
         active_candidates: persisted.active,
         created_candidates: persisted.created,
         refreshed_candidates: persisted.refreshed,
