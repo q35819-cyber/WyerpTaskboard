@@ -4,15 +4,11 @@ import crypto from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { resolveProjectPath } from "./core/path-safety.mjs";
-import isPathInside from "./core/vendor/is-path-inside.mjs";
 
 const gitExec = promisify(execFile);
 function hash(value) { return crypto.createHash("sha256").update(value).digest("hex"); }
 function splitRefs(value) {
   return String(value || "").split(/[；;]/).map((x) => x.replace(/`/g, "").trim()).filter(Boolean);
-}
-function normalizedFileRefs(value) {
-  return splitRefs(value).map((item) => item.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase());
 }
 function hardTaskDependencyId(value) {
   const token = String(value || "").replace(/`/g, "").trim();
@@ -211,7 +207,6 @@ export class CandidateEvaluator {
     const resourceLedgerSha = await this.projectResourceSha(context);
     const requirements = await this.requirementStore.pending(projectId).catch(() => ({ pendingCount: 0, waitingUserCount: 0 }));
     const candidates = [];
-    const activeDeveloperTasks = parsed.tasks.filter(activeDeveloperTask);
     const tasksById = new Map(parsed.tasks.map((task) => [task.id, task]));
     const unlockCounts = new Map(parsed.tasks.map((task) => [task.id, 0]));
     for (const dependent of parsed.tasks) {
@@ -264,18 +259,6 @@ export class CandidateEvaluator {
         await currentAutoUnblockedBug(this.taskStore, projectId, task, developerEvents);
       if (eligibleRole === "developer_ai") {
         if (!writeTargets.length) blockers.push("未声明计划写文件，不能进入待认领");
-        const candidateWrites = normalizedFileRefs(task.writeTargets);
-        for (const active of activeDeveloperTasks) {
-          if (active.id === task.id) continue;
-          const activeWrites = normalizedFileRefs(active.writeTargets);
-          if (!activeWrites.length) {
-            blockers.push("开发中任务" + active.id + "未声明写文件组，无法证明无冲突");
-            continue;
-          }
-          const conflict = activeWrites.find((item) => candidateWrites.some((candidate) =>
-            candidate === item || isPathInside(candidate, item) || isPathInside(item, candidate)));
-          if (conflict && !provisional) blockers.push("计划写文件与开发中任务" + active.id + "冲突：" + conflict);
-        }
       }
 
       const dedupeKey = hash([projectId, task.id, task.status, task.updatedAt || "", task.plannedRole || "", eligibleRole].join("|"));

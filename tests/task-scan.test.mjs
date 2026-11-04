@@ -443,7 +443,7 @@ test("one unavailable project is isolated while other whitelist projects continu
 });
 
 
-test("developer candidates require declared write targets and exclude conflicts with active development", async (t) => {
+test("developer candidates require write targets but allow independent overlapping development", async (t) => {
   const fixture = await fixtureWithLedger(t);
   const rows = [
     ["DEV-A","F-A","product","P0","待开发","开发AI","—","—","—","—","候选A","计划A.md","trace/A.md","read/shared.md","src/shared.js","cp/DEV-A.md"],
@@ -469,25 +469,25 @@ test("developer candidates require declared write targets and exclude conflicts 
   const e = candidates.find((x) => x.task_id === "DEV-E");
   const g = candidates.find((x) => x.task_id === "DEV-G");
   const h = candidates.find((x) => x.task_id === "DEV-H");
-  assert.equal(a.eligible, false);
+  assert.equal(a.eligible, true);
+  assert.deepEqual(a.blockers, []);
   assert.deepEqual(a.read_dependencies, ["read/shared.md"]);
   assert.deepEqual(a.write_targets, ["src/shared.js"]);
-  assert.ok(a.blockers.some((x) => x.includes("DEV-B") && x.includes("src/shared.js")));
   assert.equal(c.eligible, false);
   assert.ok(c.blockers.includes("未声明计划写文件，不能进入待认领"));
   assert.equal(d.eligible, true);
   assert.equal(d.eligible_role, "developer_ai");
   assert.deepEqual(d.write_targets, ["src/fix-d.js"]);
-  assert.equal(e.eligible, false);
-  assert.ok(e.blockers.some((x) => x.includes("DEV-F")));
+  assert.equal(e.eligible, true);
+  assert.deepEqual(e.blockers, []);
   assert.equal(g.eligible, true);
-  assert.equal(h.eligible, false);
-  assert.ok(h.blockers.some((x) => x.includes("DEV-I")));
+  assert.equal(h.eligible, true);
+  assert.deepEqual(h.blockers, []);
 });
 
 
 
-test("developer claimable eligibility is recalculated when write conflicts appear and disappear", async (t) => {
+test("developer candidate remains eligible as independent overlapping development appears and disappears", async (t) => {
   const fixture = await fixtureWithLedger(t);
   const taskStore = await new TaskStore(fixture.boardRoot).init();
   const requirementStore = await new RequirementStore(fixture.boardRoot).init();
@@ -506,8 +506,8 @@ test("developer claimable eligibility is recalculated when write conflicts appea
   await scanner.scanOnce();
   const conflicted = (await scanStore.list()).find((x) => x.task_id === "DEV-A");
   assert.equal(conflicted.detection_id, firstDetection);
-  assert.equal(conflicted.eligible, false);
-  assert.ok(conflicted.blockers.some((x) => x.includes("DEV-B") && x.includes("src/shared.js")));
+  assert.equal(conflicted.eligible, true);
+  assert.deepEqual(conflicted.blockers, []);
 
   await fs.writeFile(fixture.registryPath, registryText([waiting]), "utf8");
   await scanner.scanOnce();
