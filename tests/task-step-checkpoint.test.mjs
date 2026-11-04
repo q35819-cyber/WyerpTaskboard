@@ -48,6 +48,103 @@ async function claimDev(store) {
   });
 }
 
+async function newCandidateAfterQ04(t, { candidate = "2".repeat(40), selfTest = true,
+  testSha = candidate, stop = false } = {}) {
+  const { cp, taskStore } = await fixture(t);
+  const move = async (patch, eventType, actorType, actorId, sessionId, metadata = {}, note = "") =>
+    taskStore.updateTask("fixture", "A-10", patch, {
+      operationId: "fixture.q04fresh." + String(sequence++).padStart(8, "0"),
+      expectedRevision: (await taskStore.snapshot("fixture")).registryRevision,
+      eventType, actorType, actorId, sessionId, metadata, note
+    });
+  await claimDev(taskStore);
+  await move({ status: "待独测", assignee: "", sessionId: "", sessionWindowName: "" },
+    "handoff", "developer_ai", "developer", "developer_ai.session",
+    { atomicLifecycle: true, completedFromStatus: "开发中", handoffTarget: "待独测" });
+  const firstQa = await move({ status: "独测中", assignee: "qa", sessionWindowName: "qa", sessionId: "test_ai.session" },
+    "claim", "test_ai", "qa", "test_ai.session");
+  await step(cp, "test_ai", "Q01_ADMISSION", { eventId: firstQa.eventId });
+  await step(cp, "test_ai", "Q02_TEST");
+  const pass = await move({ status: "待交付", assignee: "", sessionId: "", sessionWindowName: "" },
+    "test_result", "test_ai", "qa", "test_ai.session",
+    { atomicLifecycle: true, testResult: "pass", acceptanceScope: "system",
+      reportPath: "reports/qa-old.md", deliveryActions: ["candidate_merge"],
+      commitSha: "1".repeat(40) });
+  await step(cp, "test_ai", "Q03_RESULT", { eventId: pass.eventId });
+  await step(cp, "test_ai", "Q04_NEXT");
+  const finished = await cp.show("fixture", "A-10");
+  assert.equal(finished.state.cursors.test_ai, null);
+  await move({ status: "交付中", assignee: "controller", sessionWindowName: "controller", sessionId: "controller-session" },
+    "claim", "controller_ai", "controller", "controller-session");
+  await move({ status: "阻断", assignee: "", sessionId: "" },
+    "controller_delivery_blocked", "controller_ai", "controller", "controller-session");
+  await move({ status: "HOLD" }, "controller_hold_for_refactor",
+    "controller_ai", "controller", "controller-session");
+  await move({ status: "待开发" }, "controller_restore_dev",
+    "controller_ai", "controller", "controller-session");
+  await move({ status: "开发中", assignee: "new-developer", sessionWindowName: "new-developer", sessionId: "new-dev-session" },
+    "claim", "developer_ai", "new-developer", "new-dev-session");
+  if (selfTest) {
+    await taskStore.appendTaskEvent("fixture", "A-10", {
+      operationId: "fixture.q04.selftest." + String(sequence++).padStart(8, "0"),
+      eventType: "test_result", actorType: "developer_ai",
+      actorId: "new-developer", sessionId: "new-dev-session",
+      note: "三轮真实自测 PASS 候选" + testSha,
+      metadata: { testResult: "pass", reportPath: "reports/new-dev-pass.md" }
+    });
+  }
+  await move({ status: "待独测", assignee: "", sessionId: "", sessionWindowName: "" },
+    "handoff", "developer_ai", "new-developer", "new-dev-session",
+    { atomicLifecycle: true, completedFromStatus: "开发中", handoffTarget: "待独测" },
+    "新开发正式handoff候选" + candidate);
+  const latestQa = await move({ status: "独测中", assignee: "qa2", sessionWindowName: "qa2", sessionId: "qa2-session" },
+    "claim", "test_ai", "qa2", "qa2-session");
+  if (stop) await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.q04.stop." + String(sequence++).padStart(8, "0"),
+    eventType: "stop_request", actorType: "user", note: "用户明确暂停"
+  });
+  return { cp, taskStore, latestQa, finished };
+}
+
+test("finished Q04 permits a fresh Q01 only after a different formally handed-off candidate", async (t) => {
+  const { cp, latestQa, finished } = await newCandidateAfterQ04(t);
+  const before = await cp.show("fixture", "A-10");
+  await assert.rejects(step(cp, "test_ai", "Q01_ADMISSION", {
+    eventId: latestQa.eventId, actorId: "qa", sessionId: "test_ai.session"
+  }), e => e.code === "CHECKPOINT_SESSION_MISMATCH");
+  assert.equal((await cp.show("fixture", "A-10")).sha256, before.sha256);
+  const resumed = await step(cp, "test_ai", "Q01_ADMISSION", {
+    eventId: latestQa.eventId, actorId: "qa2", sessionId: "qa2-session"
+  });
+  assert.equal(resumed.state.attempts, finished.state.attempts + 1);
+  assert.equal(resumed.state.cursors.test_ai, "Q02_TEST");
+  assert.equal(resumed.state.records.filter(r => r.stepId === "Q04_NEXT" && r.result === "PASS").length, 1);
+  assert.equal(resumed.state.records.filter(r => r.stepId === "Q01_ADMISSION" && r.result === "PASS").length, 2);
+  await assert.rejects(step(cp, "test_ai", "Q01_ADMISSION", {
+    eventId: latestQa.eventId, actorId: "qa2", sessionId: "qa2-session"
+  }), e => e.code === "CHECKPOINT_STEP_ORDER");
+  await step(cp, "test_ai", "Q02_TEST", { actorId: "qa2", sessionId: "qa2-session" });
+});
+
+test("finished Q04 refuses unchanged, unsupported, mismatched or stopped candidate attempts", async (t) => {
+  for (const options of [
+    { candidate: "1".repeat(40) },
+    { selfTest: false },
+    { testSha: "3".repeat(40) },
+    { stop: true }
+  ]) {
+    const { cp, latestQa, finished } = await newCandidateAfterQ04(t, options);
+    const before = await cp.show("fixture", "A-10");
+    await assert.rejects(step(cp, "test_ai", "Q01_ADMISSION", {
+      eventId: latestQa.eventId, actorId: "qa2", sessionId: "qa2-session"
+    }), e => e.code === "CHECKPOINT_STEP_ORDER");
+    const after = await cp.show("fixture", "A-10");
+    assert.equal(after.sha256, before.sha256);
+    assert.equal(after.state.attempts, finished.state.attempts);
+    assert.equal(after.state.cursors.test_ai, null);
+  }
+});
+
 test("one checkpoint per task preserves existing legacy text and enforces controller step order", async (t) => {
   const {f, cp, taskStore} = await fixture(t);
   const legacy = path.join(f.projectRoot, "cp", "A-10.md");
