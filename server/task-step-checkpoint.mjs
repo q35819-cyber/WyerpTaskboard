@@ -160,16 +160,52 @@ export class TaskStepCheckpoint {
         const failed = history[lastFailIndex];
         const latestQAClaim = lastFailIndex >= 0 && [...history.slice(0, lastFailIndex)].reverse().find((entry) =>
           entry.actor_type === "test_ai" && ["claim", "takeover"].includes(entry.event_type));
-        const validFailure = failed && ["独测中", "复测中"].includes(failed.old_status)
+        const validFailure = failed && lastFailIndex === history.findLastIndex((e) =>
+          e.event_type === "test_result" && e.actor_type === "test_ai")
+          && ["独测中", "复测中"].includes(failed.old_status)
           && failed.new_status === "测试失败待修复" && failed.metadata?.reportPath
           && latestQAClaim?.actor_id === failed.actor_id
           && latestQAClaim?.session_id === failed.session_id;
+        const latestQaResultIndex = history.findLastIndex((e) =>
+          e.event_type === "test_result" && e.actor_type === "test_ai");
+        const blockedIndex = history.findLastIndex((e) =>
+          e.event_type === "test_result" && e.actor_type === "test_ai"
+          && e.metadata?.atomicLifecycle === true
+          && e.metadata?.testResult === "blocked"
+          && ["独测中", "复测中"].includes(e.old_status)
+          && e.new_status === "阻断" && Boolean(e.metadata?.reportPath));
+        const blocked = history[blockedIndex];
+        const blockedQaClaim = blockedIndex >= 0
+          && [...history.slice(0, blockedIndex)].reverse().find((e) =>
+            e.actor_type === "test_ai" && ["claim", "takeover"].includes(e.event_type));
+        const afterBlock = history.slice(blockedIndex + 1, currentClaimIndex);
+        const returnOffset = afterBlock.findLastIndex((e) =>
+          e.actor_type === "controller_ai"
+          && /^controller_[a-z0-9_]+$/i.test(e.event_type)
+          && ["阻断", "HOLD", "待复测"].includes(e.old_status)
+          && e.new_status === "测试失败待修复");
+        const hasFreshDispatch = returnOffset >= 0
+          && afterBlock.slice(returnOffset + 1).some((e) =>
+            e.actor_type === "controller_ai"
+            && /^controller_dispatch(?:_[a-z0-9_]+)?$/i.test(e.event_type));
+        const validBlockedReturn = blockedIndex === latestQaResultIndex
+          && blockedIndex >= 0 && currentClaimIndex > blockedIndex
+          && blockedQaClaim?.actor_id === blocked?.actor_id
+          && blockedQaClaim?.session_id === blocked?.session_id
+          && currentClaim?.old_status === "测试失败待修复"
+          && hasFreshDispatch
+          && state.records.some((r) =>
+            r.stepId === "Q02_TEST" && r.result === "BLOCK" && r.attempt === state.attempts);
+        if (currentClaim?.event_id === eventId
+          && (currentClaim.actor_id !== actorId || currentClaim.session_id !== sessionId)) {
+          throw invalid("CHECKPOINT_SESSION_MISMATCH", "旧开发Session不能复用最新正式认领事件", 403);
+        }
         const previouslyStarted = state.records.some((record) =>
           record.stepId === "D01_CLAIM" && record.result === "PASS");
         const alreadyRestarted = state.records.some((record) =>
           record.stepId === "D01_CLAIM" && record.eventId === currentClaim?.event_id);
-        if (validFailure && previouslyStarted && !alreadyRestarted
-          && currentClaimIndex > lastFailIndex && currentClaim?.event_id === eventId
+        if ((validFailure || validBlockedReturn) && previouslyStarted && !alreadyRestarted
+          && currentClaimIndex > (validBlockedReturn ? blockedIndex : lastFailIndex) && currentClaim?.event_id === eventId
           && currentClaim?.actor_id === actorId && currentClaim?.session_id === sessionId
           && task.status === "修复中" && task.sessionId === sessionId
           && !(await this.taskStore.stopState(projectId, taskId)).stopRequested) {
