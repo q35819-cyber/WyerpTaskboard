@@ -12,7 +12,7 @@ import { makeFixture, registryText } from "./helpers.mjs";
 const execFileAsync = promisify(execFile);
 const taskctlPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../cli/taskctl.mjs");
 
-async function startFixture(t, { duplicate = false } = {}) {
+async function startFixture(t, { duplicate = false, probe = fetch } = {}) {
   const fixture = await makeFixture();
   if (duplicate) {
     const project = path.join(fixture.boardRoot, "second-project");
@@ -24,17 +24,66 @@ async function startFixture(t, { duplicate = false } = {}) {
     await fs.writeFile(configFile, JSON.stringify(config));
   }
   const app = await createTaskboardServer({ rootDir: fixture.boardRoot, host: "127.0.0.1", port: 0 });
-  await new Promise((resolve, reject) => {
-    app.server.once("error", reject);
-    app.server.listen(0, "127.0.0.1", resolve);
-  });
-  const port = app.server.address().port;
   t.after(async () => {
-    await new Promise((resolve) => app.server.close(resolve));
+    if (app.server.listening) await new Promise((resolve) => app.server.close(resolve));
     await fs.rm(fixture.boardRoot, { recursive: true, force: true });
   });
-  return { fixture, base: "http://127.0.0.1:" + port };
+  let base;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    await new Promise((resolve, reject) => {
+      app.server.once("error", reject);
+      app.server.listen(0, "127.0.0.1", () => {
+        app.server.off("error", reject);
+        resolve();
+      });
+    });
+    base = "http://127.0.0.1:" + app.server.address().port;
+    try {
+      await probe(base + "/api/auth/session");
+      break;
+    } catch (error) {
+      await new Promise((resolve) => app.server.close(resolve));
+      if (error?.cause?.message !== "bad port" || attempt === 9) throw error;
+    }
+  }
+  return { fixture, base };
 }
+
+test("taskctl fixture retries only fetch-forbidden ports and cleans up failures", async () => {
+  const badPort = () => new TypeError("fetch failed", { cause: new Error("bad port") });
+  const cleanups = [];
+  let attempts = 0;
+  const { fixture, base } = await startFixture({ after: fn => cleanups.push(fn) }, {
+    probe: async url => {
+      if (++attempts === 1) throw badPort();
+      return fetch(url);
+    }
+  });
+  try {
+    assert.equal(attempts, 2);
+    assert.equal((await fetch(base + "/api/auth/session")).status, 200);
+  } finally {
+    await Promise.all(cleanups.map(cleanup => cleanup()));
+  }
+  await assert.rejects(fs.stat(fixture.boardRoot), { code: "ENOENT" });
+
+  for (const [cause, expectedAttempts] of [["ECONNREFUSED", 1], ["bad port", 10]]) {
+    const after = [];
+    let count = 0;
+    try {
+      await assert.rejects(startFixture({ after: cleanup => after.push(cleanup) }, {
+        probe: async () => {
+          count++;
+          throw new TypeError("fetch failed", { cause: new Error(cause) });
+        }
+      }), error => error?.cause?.message === cause);
+      assert.equal(count, expectedAttempts);
+    } finally {
+      assert.equal(after.length, 1, "failure must register socket and temporary-directory cleanup");
+      await Promise.all(after.map(cleanup => cleanup()));
+    }
+  }
+});
 
 async function taskctl(rootDir, base, args) {
   return execFileAsync(process.execPath, [taskctlPath, ...args], {
