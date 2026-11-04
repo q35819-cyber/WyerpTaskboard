@@ -1,6 +1,6 @@
 {
   "name": "wyerp-taskboard",
-  "version": "0.6.63",
+  "version": "0.7.0",
   "private": true,
   "type": "module",
   "description": "Independent local project governance taskboard for AI development/test workflows.",
