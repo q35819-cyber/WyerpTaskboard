@@ -318,6 +318,19 @@ test("new QA Q01 reopens only with a real controller-requeued Q02 BLOCK or finis
       {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
         operationId:"fixture.resume."+label+".qa2",eventType:"claim",
         actorType:"test_ai",actorId:"qa-new",sessionId:"new-qa-session"});
+    // The real legacy ledger contains event_type=true; malformed rows must not crash Q01.
+    const readHistory = taskStore.taskHistory.bind(taskStore);
+    taskStore.taskHistory = async (...args) => {
+      const rows = await readHistory(...args);
+      const claimAt = rows.findIndex((e) => e.event_id === qa2.eventId);
+      assert.ok(claimAt > 0, "official QA claim is visible in returned history");
+      const legacy = [true, null, 17, {}].map((value, i) => ({
+        event_id: i === 0 ? "evt_0843ae860946441ef6fc0020" : "fixture-legacy-" + i,
+        event_type: value, actor_type: "controller_ai", actor_id: "historical",
+        old_status: "其他", new_status: "其他"
+      }));
+      return [...rows.slice(0, claimAt), ...legacy, ...rows.slice(claimAt)];
+    };
     const before=await cp.show("fixture","A-10");
     if(!finished) {
       await taskStore.appendTaskEvent("fixture","A-10",{
