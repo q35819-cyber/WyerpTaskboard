@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "source": "../webcodex-v1",
+  "files": [
+    "AGENTS.md",
+    "WORKFLOW.md",
+    "流程文档/00_统一入口.md",
+    "流程文档/总控/00_角色入口.md",
+    "流程文档/开发/00_角色入口.md",
+    "流程文档/独测/00_角色入口.md",
+    ".agents/skills/ponytail/SKILL.md"
+  ]
+}
