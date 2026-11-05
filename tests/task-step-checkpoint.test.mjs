@@ -123,6 +123,101 @@ async function newCandidateAfterQ04(t, { candidate = "2".repeat(40), selfTest = 
   return { cp, taskStore, latestQa, finished };
 }
 
+async function legacyD09Restart(t, { dispatch = true, newActor = "next-dev",
+  newSession = "next-dev-session" } = {}) {
+  const { cp, taskStore } = await fixture(t);
+  const move = async (patch, eventType, actorType, actorId, sessionId, metadata = {}) =>
+    taskStore.updateTask("fixture", "A-10", patch, {
+      operationId: "fixture.d09." + String(sequence++).padStart(8, "0"),
+      expectedRevision: (await taskStore.snapshot("fixture")).registryRevision,
+      eventType, actorType, actorId, sessionId, metadata
+    });
+  await controllerReady(taskStore, cp);
+  const old = await claimDev(taskStore);
+  await step(cp, "developer_ai", "D01_CLAIM", { eventId: old.eventId });
+  for (const name of ROLE_STAGE_STEPS.developer_ai.slice(1, 7))
+    await step(cp, "developer_ai", name);
+  const handoff = await move({ status: "待独测", assignee: "", sessionId: "" },
+    "handoff", "developer_ai", "developer", "developer_ai.session",
+    { atomicLifecycle: true, completedFromStatus: "开发中", handoffTarget: "待独测" });
+  await step(cp, "developer_ai", "D08_HANDOFF", { eventId: handoff.eventId });
+  const qaClaim = await move({ status: "独测中", assignee: "qa",
+    sessionWindowName: "qa", sessionId: "test_ai.session" },
+    "claim", "test_ai", "qa", "test_ai.session");
+  await step(cp, "test_ai", "Q01_ADMISSION", { eventId: qaClaim.eventId });
+  await step(cp, "test_ai", "Q02_TEST");
+  const qaPass = await move({ status: "待交付", assignee: "", sessionId: "" },
+    "test_result", "test_ai", "qa", "test_ai.session",
+    { atomicLifecycle: true, testResult: "pass", reportPath: "reports/real-qa.md",
+      acceptanceScope: "system", deliveryActions: ["candidate_merge"],
+      commitSha: "1".repeat(40) });
+  await step(cp, "test_ai", "Q03_RESULT", { eventId: qaPass.eventId });
+  await step(cp, "test_ai", "Q04_NEXT");
+  const oldCheckpoint = await cp.show("fixture", "A-10");
+  assert.equal(oldCheckpoint.state.cursors.developer_ai, "D09_MERGE_MAIN");
+  await move({ status: "交付中", assignee: "controller",
+    sessionWindowName: "controller", sessionId: "controller_ai.session" },
+  "claim", "controller_ai", "controller", "controller_ai.session");
+  await move({ status: "阻断", assignee: "", sessionId: "", sessionWindowName: "" },
+    "controller_delivery_blocked", "controller_ai", "controller", "controller_ai.session");
+  await move({ status: "HOLD" }, "controller_hold_for_refactor",
+    "controller_ai", "controller", "controller_ai.session");
+  await move({ status: "待开发" }, "controller_restore_development",
+    "controller_ai", "controller", "controller_ai.session");
+  if (dispatch) await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.d09.dispatch." + String(sequence++).padStart(8, "0"),
+    eventType: "controller_dispatch", actorType: "controller_ai",
+    actorId: "controller", sessionId: "controller_ai.session"
+  });
+  const newClaim = await move({ status: "开发中", assignee: newActor,
+    sessionWindowName: "next-dev", sessionId: newSession },
+    "claim", "developer_ai", newActor, newSession);
+  return { cp, taskStore, oldCheckpoint, newClaim, newActor, newSession };
+}
+
+test("legacy D09 starts a new D01 attempt only after real QA PASS, fresh dispatch and claim", async (t) => {
+  const { cp, oldCheckpoint, newClaim, newActor, newSession } = await legacyD09Restart(t);
+  const fresh = await step(cp, "developer_ai", "D01_CLAIM", {
+    eventId: newClaim.eventId, actorId: newActor, sessionId: newSession
+  });
+  assert.equal(fresh.state.attempts, oldCheckpoint.state.attempts + 1);
+  assert.equal(fresh.state.cursors.developer_ai, "D02_WORKTREE");
+  assert.equal(fresh.state.cursors.test_ai, "Q01_ADMISSION");
+  assert.equal(fresh.state.records.filter(r => r.attempt === oldCheckpoint.state.attempts
+    && r.stepId === "Q03_RESULT" && r.verdict === "pass").length, 1);
+  assert.equal(fresh.state.records.filter(r => r.stepId === "D08_HANDOFF" && r.result === "PASS").length, 1);
+  await assert.rejects(step(cp, "developer_ai", "D01_CLAIM", {
+    eventId: newClaim.eventId, actorId: newActor, sessionId: newSession
+  }), e => e.code === "CHECKPOINT_STEP_ORDER");
+});
+
+test("legacy D09 blocks missing dispatch, replayed actor/Session and STOP without rewriting history", async (t) => {
+  for (const options of [{ dispatch: false }, {}]) {
+    const { cp, taskStore, newClaim, newActor, newSession } = await legacyD09Restart(t, options);
+    const before = await cp.show("fixture", "A-10");
+    const actors = options.dispatch === false
+      ? [[newActor, newSession]]
+      : [["developer", newSession], [newActor, "developer_ai.session"]];
+    for (const [actorId, sessionId] of actors)
+      await assert.rejects(step(cp, "developer_ai", "D01_CLAIM", {
+        eventId: newClaim.eventId, actorId, sessionId
+      }), e => ["CHECKPOINT_STEP_ORDER", "CHECKPOINT_SESSION_MISMATCH"].includes(e.code));
+    if (options.dispatch !== false) {
+      await taskStore.appendTaskEvent("fixture", "A-10", {
+        operationId: "fixture.d09.stop." + String(sequence++).padStart(8, "0"),
+        eventType: "stop_request", actorType: "user", note: "暂停此任务"
+      });
+      await assert.rejects(step(cp, "developer_ai", "D01_CLAIM", {
+        eventId: newClaim.eventId, actorId: newActor, sessionId: newSession
+      }), e => e.code === "CHECKPOINT_STEP_ORDER");
+    }
+    const after = await cp.show("fixture", "A-10");
+    assert.equal(after.sha256, before.sha256);
+    assert.equal(after.state.attempts, before.state.attempts);
+    assert.equal(after.state.cursors.developer_ai, "D09_MERGE_MAIN");
+  }
+});
+
 test("finished Q04 permits a fresh Q01 only after a different formally handed-off candidate", async (t) => {
   const { cp, latestQa, finished } = await newCandidateAfterQ04(t);
   const before = await cp.show("fixture", "A-10");
