@@ -131,3 +131,6 @@
 /* Shared developer/QA queue: show separate counts without adding a seventh column. */
 .column-head .shared-ready-title{min-width:0;line-height:1.4}
 .column-head .shared-ready-count{flex-shrink:0;font-size:11px;white-space:nowrap;padding:2px 5px}
+
+.task-card.bug-card{border-left:4px solid #d92d20;background:#fff8f7}
+.badge.bugfix{background:#b42318;color:#fff;font-weight:800}
