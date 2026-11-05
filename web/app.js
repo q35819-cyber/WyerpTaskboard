@@ -21,7 +21,7 @@ const els=Object.fromEntries([
   "revokeTakeoverBtn","reviewNote","commentBtn","userAcceptanceActions","acceptBtn","rejectReason","rejectBtn","reloadHistoryBtn","historyList"
 ].map(id=>[id,$(id)]));
 
-const TRACK_LABELS={product:"产品业务",infrastructure:"基础设施"};
+const TRACK_LABELS={product:"产品业务",infrastructure:"基础设施",bugfix:"BUG"};
 const PRIORITY_LABELS={P0:"最高优先级",P1:"普通优先级",P2:"较低优先级"};
 const STATUS_LABELS={HOLD:"暂停"};
 const ROLE_LABELS={"开发AI":"开发助手","独立测试AI":"独立测试助手","用户":"用户","—":"—"};
@@ -372,14 +372,14 @@ function documentButton(taskId,doc){
   return button;
 }
 function taskCard(task){
-  const card=document.createElement("article");card.className="task-card";
+  const card=document.createElement("article");card.className="task-card"+(task.track==="bugfix"?" bug-card":"");
   if(task.presentation?.latestUserMessage?.replied){
     const stamp=document.createElement("div");stamp.className="reply-stamp";stamp.textContent="已回复";stamp.title="最新用户留言已有AI回复";card.append(stamp);
   }
   const id=document.createElement("div");id.className="task-id";id.textContent=task.id;
   const h4=document.createElement("h4");h4.textContent=taskTitle(task);
   const badges=document.createElement("div");badges.className="badges";
-  badges.append(badge(trackLabel(task.track)),badge(priorityLabel(task.priority),task.priority?.toLowerCase()),badge(statusLabel(task.status)));
+  badges.append(badge(trackLabel(task.track),task.track==="bugfix"?"bugfix":undefined),badge(priorityLabel(task.priority),task.priority?.toLowerCase()),badge(statusLabel(task.status)));
   if(["待开发","待准备"].includes(task.status)&&task.plannedRole==="开发AI"){const candidate=isReadyTask(task)?developerCandidateFor(task):null;badges.append(badge(candidate?.eligible===true?"待认领":"待处理",candidate?.eligible===true?"claimable":"waiting"));}
   else if(task.status==="待执行"&&task.plannedRole==="开发AI"){const ready=isReadyTask(task);badges.append(badge(ready?"待执行":"待处理",ready?"claimable":"waiting"));}
   const plan=mainPlan(task);const planRow=document.createElement("div");planRow.className="card-plan";
