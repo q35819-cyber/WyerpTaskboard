@@ -200,6 +200,7 @@ test("explicit current chat user authorization can replace browser clicking, sco
     ["chat.denied.negative", { ...valid, quote: "不允许异常接管 B-10" }],
     ["chat.denied.not-permitted", { ...valid, quote: "我不可以异常接管 B-10" }],
     ["chat.denied.not-approved", { ...valid, quote: "我没有允许异常接管 B-10" }],
+    ["chat.denied.not-said", { ...valid, quote: "我没说就按异常接管" }],
     ["chat.denied.not-needed", { ...valid, quote: "不需要异常接管，你自行处理" }],
     ["chat.denied.mixed", { ...valid, quote: "有需要异常接管你自行处理，但不要执行" }],
     ["chat.denied.project", { ...valid, projectId: "another" }]

@@ -170,7 +170,7 @@ function takeoverAuthorizationEvidence(identity, body, params) {
   const sessionId = String(body.sessionId || "").trim();
   const approved = /(?:允许|同意|授权|可以|直接|执行|请).{0,30}(?:异常)?接管|(?:异常)?接管.{0,20}(?:允许|同意|授权|可以|执行)|(?:^|[，,。；;\s])(?:有需要|必要时|需要时).{0,20}(?:异常)?接管.{0,20}(?:你自行处理|自行处理|你来处理|你处理)|^异常接管[！!。.]?$/.test(quote);
   const rejected = /不允许|不同意|不授权|不可以|不需要|没必要|没有必要|不必|无需|不用|没有允许|未允许|不接管|不准|不想|请勿|不要|不得|禁止|不能|拒绝|暂不|先不|别接管|取消接管/.test(quote);
-  const conditionalApproval = /(?:你)?就按(?:异常)?接管/.test(quote);
+  const conditionalApproval = /(?:^|[，,。；;\s])(?:你)?就按(?:异常)?接管/.test(quote);
   if (identity.mode !== "bearer" || proof?.source !== "direct_user_message" ||
       proof?.projectId !== params.projectId || !["task", "project"].includes(scope) ||
       (scope === "task" && proof?.taskId !== params.taskId) ||
