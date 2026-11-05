@@ -161,6 +161,32 @@ export class TaskStepCheckpoint {
     const relativeFile = path.relative(context.rootRealPath, file).split(path.sep).join("/");
     return { file: relativeFile, sha256: SHA(content), exists: Boolean(content), legacy, state };
   }
+  async assertTransitionEvidence(projectId, taskId, { eventType, actorType, actorId, sessionId }) {
+    const stage = {
+      handoff: { role: "developer_ai", prior: "D07_TEST_3", next: "D08_HANDOFF", results: ["PASS"] },
+      test_result: { role: "test_ai", prior: "Q02_TEST", next: "Q03_RESULT",
+        results: ["PASS", "FAIL", "BLOCK"] },
+      delivery_complete: { role: "controller_ai", prior: "C06_CLEANUP", next: "C07_COMPLETE",
+        results: ["PASS"] }
+    }[eventType];
+    if (!stage || actorType !== stage.role) return;
+    const checkpoint = await this.show(projectId, taskId);
+    if (!checkpoint.exists || checkpoint.legacy) return;
+    const { state } = checkpoint;
+    const actorSteps = state.records.filter((item) =>
+      item.actorType === actorType && item.actorId === actorId && item.sessionId === sessionId);
+    // Historical API-only tasks never entered this actor's step chain.
+    if (!actorSteps.length) return;
+    const ownSteps = actorSteps.filter((item) => item.attempt === state.attempts);
+    const prior = [...ownSteps].reverse().find((item) => item.stepId === stage.prior);
+    const cursor = state.cursors[actorType];
+    const cursorReady = cursor === stage.next ||
+      (eventType === "test_result" && cursor === "Q02_TEST"
+        && prior && ["FAIL", "BLOCK"].includes(prior.result));
+    if (!prior || !stage.results.includes(prior.result) || !cursorReady) {
+      throw invalid("CHECKPOINT_STAGE_REQUIRED", "正式任务状态推进缺少本轮当前角色的可信上一步证据");
+    }
+  }
   async record(projectId, taskId, { operationId, expectedSha256, stepId, actorType, actorId,
     sessionId, result = "PASS", evidence, eventId = null, note = "", substepId = null } = {}) {
     if (!ID_PATTERN.test(operationId || "") || !expectedSha256 || !ID_PATTERN.test(actorId || "")
