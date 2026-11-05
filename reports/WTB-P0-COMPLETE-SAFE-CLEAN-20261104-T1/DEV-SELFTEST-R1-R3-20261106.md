@@ -16,8 +16,12 @@
 ## 三轮测试及实际命令
 - R1：`node --test --test-name-pattern "C06 archives" tests/delivery-lifecycle.test.mjs`，**1/1 PASS**，真正创建Git临时仓库/候选分支、合并、归档、清理、读回回执和原交付中状态。
 - R2：`node --test --test-name-pattern "C06 fails closed|C06 refuses" tests/delivery-lifecycle.test.mjs`，**2/2 PASS**，拒绝不明归属、无检查器、活动Job、其它AI、开放PR、脏改、未并main。无强删。
-- R3相关旧功能回归：`node --test tests/delivery-lifecycle.test.mjs`，**15/15 PASS**（含所有原测试）；`npm.cmd run check`、`git diff --check`均PASS。`npm.cmd test` job `471002ed-01a0-462f-b3bd-48f6cd08f9f8` **第一次全仓 60 文件中 1 文件超时失败，exit 1**：tests/task-step-checkpoint.test.mjs 进程因 30秒/文件硬超时 ETIMEDOUT（该文件 33 项用例已实际通过才被脚本杀死）；该文件单独执行 node --test tests/task-step-checkpoint.test.mjs **exit 0**、耗时28秒；整仓第二遍 npm.cmd test job c023dd59-e0d2-4555-a955-8879c3e3d44f **正在运行，尚未有退出码**。第一次失败证据 data/runtime/validation/npm-test.json（随后第二遍会覆盖运行时快照，原报告保留此事实）。
+- R3相关旧功能回归：`node --test tests/delivery-lifecycle.test.mjs`，**15/15 PASS**（含所有原测试）；`npm.cmd run check`、`git diff --check`均PASS。`npm.cmd test` job `471002ed-01a0-462f-b3bd-48f6cd08f9f8` **第一次全仓 60 文件中 1 文件超时失败，exit 1**：tests/task-step-checkpoint.test.mjs 进程因 30秒/文件硬超时 ETIMEDOUT（该文件 33 项用例已实际通过才被脚本杀死）；该文件单独执行 node --test tests/task-step-checkpoint.test.mjs **exit 0**、耗时28秒；整仓第二遍 npm.cmd test job c023dd59-e0d2-4555-a955-8879c3e3d44f **exit 1，60文件中1个 task-step-checkpoint.test.mjs 再次30秒超时 ETIMEDOUT**，其余59文件通过；两次整仓均不满足R3 PASS，禁止交独测。第一次失败证据 data/runtime/validation/npm-test.json（随后第二遍会覆盖运行时快照，原报告保留此事实）。
 - 变更登记 `evt_30374aafd0d415a3aa44f34a`；两份源码/测试旧SHA和新SHA写入本worktree `data/logs/changes/2026-11-06.jsonl`，读回PASS。
+
+## R3根因界限与恢复条件
+- 整仓 runner scripts/run-tests.mjs 将多数测试文件每项限制30秒；独立复测任务步骤文件实际exit0约28秒。两次整仓该文件均因时限触发，属于**待总控独立任务修复/测试运行环境复核**，本C06不能擅改其他文件；修复后必须重新执行全量整仓，不能复用这两次失败为PASS。
+- 此外正式运行端未安装可信inspectCleanupResources检查器时将自动拒绝清理（C06_RESOURCE_UNVERIFIED），总控发布前须核验责任和接入条件。
 
 ## 正式步骤阻断
 - 当前原任务真正 `claim` 成功，状态「开发中」，但 `node cli/stepctl.mjs record ... D01_CLAIM --event-id evt_75b52d5e415b2cacec6fa881` 实际**exit 1 `CHECKPOINT_PREDECESSOR_REQUIRED: 总控未完成可信正式派工`**。总控此前两个事件 `evt_2e9a1c9cfe0238d44d6c6447`、`evt_10c5136a3753248593cc777a` 是规则/顺序批准，不是 `controller_dispatch`。开发者不得冒controller补事件。
