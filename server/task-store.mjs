@@ -270,7 +270,7 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
       hardDependencyBlockers(task, byId).length) return null;
     try {
       await assertDeveloperClaimExclusive(store, projectId, context, { tasks }, task,
-        "task-scan", "auto-unblock", false, true);
+        "task-scan", "auto-unblock", false, !d01Blocked);
     } catch (error) {
       if (["CLAIM_WRITE_CONFLICT", "CLAIM_DEVELOPER_BUSY"].includes(error.code)) return null;
       throw error;

@@ -90,6 +90,32 @@ test("D01 missing-dispatch block recovers only after a new authentic controller 
     "auto restore must not fabricate a retroactive claim");
 });
 
+test("D01 machine restores pending work even when an unrelated QA or delivery task shares source paths", async (t) => {
+  for (const otherStatus of ["待独测", "交付中"]) {
+    const first = row("A-10", "开发中", { owner: "developer", session: "dev-session" });
+    const second = row("B-10", otherStatus, {
+      owner: otherStatus === "交付中" ? "controller" : "—",
+      session: otherStatus === "交付中" ? "controller-session" : "—"
+    });
+    second[14] = first[14];
+    const { store, evaluator } = await setup(t, [first, second]);
+    await change(store, "A-10", { status: "开发中", assignee: "developer",
+      sessionWindowName: "developer", sessionId: "dev-session" },
+    "claim", {}, "developer_ai", "dev-session");
+    await change(store, "A-10", {
+      status: "阻断", assignee: "", sessionId: "", sessionWindowName: ""
+    }, "developer_d01_missing_controller_dispatch_block", {}, "developer_ai", "dev-session");
+    await dispatchD01(store);
+    await evaluator.evaluateProject("fixture");
+    assert.equal(await status(store, "A-10"), "待开发", otherStatus);
+    assert.equal(await status(store, "B-10"), otherStatus,
+      "machine recovery must not change the unrelated task");
+    await evaluator.evaluateProject("fixture");
+    assert.equal((await store.taskHistory("fixture", "A-10", { all: true }))
+      .filter(e => e.event_type === "auto_unblock").length, 1);
+  }
+});
+
 test("D01 block never auto-recovers with fake dispatch, old dispatch or wrong block actor", async (t) => {
   for (const options of [{ earlierDispatch: true }, { fakeActor: true }, {}]) {
     const { store, evaluator } = await blockedD01(t, options);
