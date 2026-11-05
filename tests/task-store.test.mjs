@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import { TaskStore } from "../server/task-store.mjs";
+import { TaskStepCheckpoint } from "../server/task-step-checkpoint.mjs";
 import { makeFixture, registryText } from "./helpers.mjs";
 
 test("snapshot sorts product/P0 before infrastructure/P0", async (t) => {
@@ -399,4 +400,87 @@ test("an explicit user urgent priority event can override BUG-first for that ord
   assert.equal((await claim("URGENT-10", "dev-urgent")).after.status, "开发中");
   await assert.rejects(claim("REGULAR-10", "dev-regular"), (error) =>
     error.code === "BUGFIX_PRIORITY_REQUIRED" && error.details.bugTaskId === "BUG-10");
+});
+
+test("modern tracked handoff requires current developer D07 PASS before the registry transaction", async (t) => {
+  const f = await makeFixture();
+  t.after(() => fs.rm(f.boardRoot, { recursive: true, force: true }));
+  const store = await new TaskStore(f.boardRoot).init();
+  const cp = await new TaskStepCheckpoint(f.boardRoot, { taskStore: store }).init();
+  const revision = (await store.snapshot("fixture")).registryRevision;
+  await store.updateTask("fixture", "A-10", {
+    status: "开发中", assignee: "developer", sessionWindowName: "dev", sessionId: "dev-session"
+  }, { expectedRevision: revision, operationId: "gate.claim.0001", eventType: "claim",
+    actorType: "developer_ai", actorId: "developer", sessionId: "dev-session" });
+
+  const file = await cp.location("fixture", "A-10");
+  const proof = (stepId, result = "PASS", attempt = 1) => ({
+    stepId, result, attempt, actorType: "developer_ai",
+    actorId: "developer", sessionId: "dev-session", evidence: "actual fixture trace",
+    operationId: "gate." + stepId
+  });
+  const checkpoint = async (records, cursor, attempt = 1) => {
+    const state = {
+      version: 1, projectId: "fixture", taskId: "A-10", flowVersion: "role-steps-v2",
+      attempts: attempt, records, cursors: {
+        controller_ai: "C00_A_REQUIREMENTS", developer_ai: cursor, test_ai: "Q01_ADMISSION"
+      }, lastAction: records.at(-1)
+    };
+    await fs.writeFile(file, "<!-- TASK_STEP_CHECKPOINT_START v1 -->\n" +
+      JSON.stringify(state) + "\n<!-- TASK_STEP_CHECKPOINT_END -->\n");
+  };
+  const handoff = async (operationId) => store.updateTask("fixture", "A-10", {
+    status: "待独测", assignee: "", sessionId: "", sessionWindowName: ""
+  }, { expectedRevision: (await store.snapshot("fixture")).registryRevision,
+    operationId, eventType: "handoff", actorType: "developer_ai",
+    actorId: "developer", sessionId: "dev-session",
+    metadata: { atomicLifecycle: true, completedFromStatus: "开发中", handoffTarget: "待独测" } });
+
+  await checkpoint([proof("D04_IMPLEMENT")], "D05_TEST_1");
+  await assert.rejects(handoff("gate.handoff.0001"), (error) => error.code === "CHECKPOINT_STAGE_REQUIRED");
+  assert.equal((await store.getTask("fixture", "A-10")).task.status, "开发中");
+  assert.equal(await store.transactions.read("gate.handoff.0001"), null);
+  await checkpoint([proof("D07_TEST_3", "PASS", 1)], "D08_HANDOFF", 2);
+  await assert.rejects(handoff("gate.handoff.0002"), (error) => error.code === "CHECKPOINT_STAGE_REQUIRED");
+  await checkpoint([proof("D07_TEST_3")], "D08_HANDOFF");
+  const passed = await handoff("gate.handoff.0003");
+  assert.equal(passed.after.status, "待独测");
+  assert.ok(passed.eventId);
+});
+
+test("modern QA and controller evidence rejects skipped steps and accepts valid stage proofs", async (t) => {
+  const f = await makeFixture();
+  t.after(() => fs.rm(f.boardRoot, { recursive: true, force: true }));
+  const store = await new TaskStore(f.boardRoot).init();
+  const cp = await new TaskStepCheckpoint(f.boardRoot, { taskStore: store }).init();
+  const file = await cp.location("fixture", "A-10");
+  const save = async (role, stepId, cursor, result = "PASS") => {
+    const record = { stepId, result, actorType: role, actorId: "qa",
+      sessionId: "qa-session", attempt: 1, evidence: "fixture checked" };
+    const state = {
+      version: 1, projectId: "fixture", taskId: "A-10", flowVersion: "role-steps-v2",
+      attempts: 1, records: [record], cursors: {
+        controller_ai: role === "controller_ai" ? cursor : "C00_A_REQUIREMENTS",
+        developer_ai: "D01_CLAIM", test_ai: role === "test_ai" ? cursor : "Q01_ADMISSION"
+      }, lastAction: record
+    };
+    await fs.writeFile(file, "<!-- TASK_STEP_CHECKPOINT_START v1 -->\n" +
+      JSON.stringify(state) + "\n<!-- TASK_STEP_CHECKPOINT_END -->\n");
+  };
+  const args = { eventType: "test_result", actorType: "test_ai",
+    actorId: "qa", sessionId: "qa-session" };
+  await save("test_ai", "Q01_ADMISSION", "Q02_TEST");
+  await assert.rejects(cp.assertTransitionEvidence("fixture", "A-10", args),
+    (error) => error.code === "CHECKPOINT_STAGE_REQUIRED");
+  await save("test_ai", "Q02_TEST", "Q03_RESULT");
+  await cp.assertTransitionEvidence("fixture", "A-10", args);
+  await save("test_ai", "Q02_TEST", "Q02_TEST", "FAIL");
+  await cp.assertTransitionEvidence("fixture", "A-10", args);
+  const controller = { eventType: "delivery_complete", actorType: "controller_ai",
+    actorId: "qa", sessionId: "qa-session" };
+  await save("controller_ai", "C05_POSTMERGE", "C06_CLEANUP");
+  await assert.rejects(cp.assertTransitionEvidence("fixture", "A-10", controller),
+    (error) => error.code === "CHECKPOINT_STAGE_REQUIRED");
+  await save("controller_ai", "C06_CLEANUP", "C07_COMPLETE");
+  await cp.assertTransitionEvidence("fixture", "A-10", controller);
 });

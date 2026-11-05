@@ -896,6 +896,11 @@ export class TaskStore {
       const effectivePatch = context.workflow.normalizeTaskPatch(currentTask, effectivePatchInput, {
         eventType, actorType, actorId, sessionId, metadata: effectiveMetadata
       });
+      if (["handoff", "test_result", "delivery_complete"].includes(eventType)) {
+        const { TaskStepCheckpoint } = await import("./task-step-checkpoint.mjs");
+        await new TaskStepCheckpoint(this.rootDir, { taskStore: this })
+          .assertTransitionEvidence(projectId, taskId, { eventType, actorType, actorId, sessionId });
+      }
       if (parsed.indexes.updatedAt >= 0 && !("updatedAt" in effectivePatch)) {
         effectivePatch.updatedAt = new Date().toISOString();
       }
