@@ -10,6 +10,8 @@
 .task-responsibility{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
 .task-progress{color:#344054}
 .task-user-assistance{padding:8px 9px;border-radius:7px;background:#fffaeb;border:1px solid #fedf89;color:#7a2e0e}
+.blocker-evidence-summary{margin-top:8px;padding:8px;background:#fff8f6;border-left:3px solid #b42318;border-radius:5px;color:#8b1e17;font-size:12px;line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.blocker-evidence-panel{border-color:#f6c0b9;background:#fff8f6}.blocker-evidence-panel p{white-space:pre-wrap;overflow-wrap:anywhere}
 .task-user-message{margin-top:9px;padding:9px 10px;border:1px solid #fda29b;border-left:4px solid #d92d20;border-radius:7px;background:#fff1f0;color:#b42318;font-size:12px;font-weight:700;line-height:1.45}
 .message-summary{border-color:#fda29b;background:#fff1f0}.message-summary span,.message-summary strong{color:#b42318}
 .user-message-panel{border-color:#fda29b;background:#fff8f7}

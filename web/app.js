@@ -15,7 +15,7 @@ const els=Object.fromEntries([
   "projectRegistryInput","refreshBtn","aiSettingsBtn","aiSettingsDialog","aiSettingsForm","closeAiSettingsBtn","cancelAiSettingsBtn","developerModel","developerReasoning","testModel","testReasoning","scanIntervalMinutes","maxRequestsPerChat","contextWarningAt","timeoutRetryLimit","anomalyWindowMinutes","anomalyLimit","roleSwitchLimit","appVersion","projectHealth","projectService","projectServiceStatus","projectStartRestartBtn","projectStopServiceBtn","scanStatus","summary","searchInput","planFilter","trackFilter",
   "priorityFilter","statusFilter","archiveFilter","boardViewBtn","listViewBtn","boardView","listView","taskTableBody",
   "planDialog","planDialogTitle","planDialogPath","planNavigator","planLocationStatus","planIndexList","planDocumentContent","closePlanDialogBtn",
-  "taskDialog","closeDialogBtn","detailTaskId","detailTitle","userMessagePanel","userMessageCount","userMessageList",
+  "taskDialog","closeDialogBtn","detailTaskId","detailTitle","blockerEvidencePanel","blockerEvidenceText","userMessagePanel","userMessageCount","userMessageList",
   "taskPlanList","responsibilityText","currentProgressText","userAssistanceText","traceabilityText","readDependenciesText","writeTargetsText","relatedArtifactsText","detailMeta",
   "sessionInfo","testResourceSummary","testResourceList","prioritySelect","savePriorityBtn","stopBtn","resumeBtn","suspectDisconnectBtn","allowTakeoverBtn",
   "revokeTakeoverBtn","reviewNote","commentBtn","userAcceptanceActions","acceptBtn","rejectReason","rejectBtn","reloadHistoryBtn","historyList"
@@ -401,6 +401,7 @@ function taskCard(task){
   const responsibility=document.createElement("div");responsibility.className="task-responsibility";responsibility.textContent="本任务负责："+(task.presentation?.responsibility||task.boundary||"未填写");
   const progress=document.createElement("div");progress.className="task-progress";progress.textContent="当前进展："+(task.presentation?.currentProgress||statusLabel(task.status));
   card.append(id,h4,badges,planRow,responsibility,progress);
+  if(task.blockerEvidence){const evidence=document.createElement("div");evidence.className="blocker-evidence-summary";evidence.textContent="阻断依据："+task.blockerEvidence.summary;card.append(evidence)}
   const candidate=developerCandidateFor(task);
   if(candidate?.blockers?.length||(task.status==="待执行"&&!isReadyTask(task))){const why=document.createElement("div");why.className="task-user-assistance";why.textContent="暂不能执行："+(candidate?.blockers?.length?candidate.blockers.join("；"):"缺少有效的最新准入扫描结果");card.append(why);}
   const assistanceText=task.presentation?.userAssistance||"";
@@ -664,6 +665,19 @@ async function openTask(taskId){
     if(!(p.plans||[]).length)els.taskPlanList.textContent="未绑定主计划";
     els.responsibilityText.textContent=p.responsibility||data.boundary||"未填写";
     els.currentProgressText.textContent=p.currentProgress||statusLabel(data.status);
+    const evidence=data.blockerEvidence;
+    els.blockerEvidencePanel.hidden=!evidence;
+    if(evidence)els.blockerEvidenceText.textContent=[
+      evidence.summary,
+      "来源："+(evidence.source==="lifecycle_event"?"真实状态事件":"待核验"),
+      "事件ID："+(evidence.eventId||"未取得"),
+      "时间："+formatTime(evidence.eventAt),
+      "事件类型："+(evidence.eventType||"未知"),
+      "事件记录："+(evidence.originalNote||"无公开备注"),
+      "恢复条件："+evidence.recovery,
+      evidence.qualification
+    ].join("\n");
+    else els.blockerEvidenceText.textContent="";
     els.userAssistanceText.textContent=p.userAssistance||"当前无需你操作";
     els.traceabilityText.textContent=p.traceability||data.traceability||"—";
     els.readDependenciesText.textContent=data.readDependencies||"—";

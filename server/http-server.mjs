@@ -18,6 +18,7 @@ import { TaskboardRuntimeStatus } from "./runtime-status.mjs";
 import { AutomationControlStore } from "./automation-control.mjs";
 import { ChatgptMcpExecutor } from "./chatgpt-mcp-executor.mjs";
 import { SystemEventLog } from "./system-event-log.mjs";
+import { blockerEvidence } from "./blocker-evidence.mjs";
 
 // A mention of a historical PASS is not an independent QA verdict.
 // Preserve delivery authority only with an explicit affirmative conclusion and
@@ -1028,7 +1029,15 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         });
       }
       let params = routeMatch(url.pathname, "/api/projects/:projectId/tasks");
-      if (req.method === "GET" && params) return send(res, 200, await taskStore.snapshot(params.projectId));
+      if (req.method === "GET" && params) {
+        const snapshot = await taskStore.snapshot(params.projectId);
+        const tasks = await Promise.all(snapshot.tasks.map(async task => {
+          if (!["阻断", "HOLD", "测试失败待修复"].includes(task.status)) return task;
+          const history = await taskStore.taskHistory(params.projectId, task.id, { all: true });
+          return { ...task, blockerEvidence: blockerEvidence(task, history, snapshot.tasks) };
+        }));
+        return send(res, 200, { ...snapshot, tasks });
+      }
       if (req.method === "POST" && params) {
         const body = await readJson(req);
         requireOperation(body);
@@ -1085,6 +1094,11 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         const pair = await taskStore.getTask(params.projectId, params.taskId);
         return send(res, 200, {
           ...pair.task, registryRevision: pair.snapshot.registryRevision,
+          blockerEvidence: ["阻断", "HOLD", "测试失败待修复"].includes(pair.task.status)
+            ? blockerEvidence(pair.task,
+                await taskStore.taskHistory(params.projectId, params.taskId, { all: true }),
+                pair.snapshot.tasks)
+            : null,
           stop: await taskStore.stopState(params.projectId, params.taskId),
           takeover: await taskStore.takeoverState(params.projectId, params.taskId),
 
