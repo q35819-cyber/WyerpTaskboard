@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import http from "node:http";
+import { createTaskboardServer } from "../server/http-server.mjs";
+import { makeFixture } from "./helpers.mjs";
 import { TaskboardRuntimeStatus } from "../server/runtime-status.mjs";
 
 async function fixture(t) {
@@ -47,6 +50,65 @@ async function fixture(t) {
   }));
   return {root,now};
 }
+
+test("R1: missing health config keeps runtime status available without creating config", async (t) => {
+  const { root, now } = await fixture(t);
+  const config = path.join(root, "config/chatgpt-health.json");
+  await fs.rm(config);
+  const result = await new TaskboardRuntimeStatus(root, { clock: () => now }).snapshot({ liveProbes: false });
+  assert.deepEqual(result.chatgpt_health, {
+    version: 1, state: "not_configured", healthy: false, checked_at: null
+  });
+  assert.equal(result.schedulers.task_scan.state, "installed");
+  assert.equal(result.validation.npm_test.state, "failed");
+  await assert.rejects(fs.stat(config), { code: "ENOENT" });
+});
+
+test("R2: malformed health config is rejected rather than disguised as unconfigured", async (t) => {
+  const { root, now } = await fixture(t);
+  const config = path.join(root, "config/chatgpt-health.json");
+  await fs.writeFile(config, "{ invalid JSON");
+  await assert.rejects(new TaskboardRuntimeStatus(root, { clock: () => now }).snapshot({ liveProbes: false }), SyntaxError);
+  assert.equal(await fs.readFile(config, "utf8"), "{ invalid JSON");
+  await fs.writeFile(config, JSON.stringify({ version: 99 }));
+  await assert.rejects(new TaskboardRuntimeStatus(root, { clock: () => now }).snapshot({ liveProbes: false }), /unsupported chatgpt-health config version/);
+});
+
+test("R1/R2: real HTTP status survives missing health config but reports corrupt config", async (t) => {
+  const { boardRoot } = await makeFixture();
+  const config = path.join(boardRoot, "config/chatgpt-health.json");
+  await fs.rm(config, { force: true });
+  const app = await createTaskboardServer({ rootDir: boardRoot, host: "127.0.0.1", port: 0 });
+  t.after(async () => {
+    if (app.server.listening) await new Promise(resolve => app.server.close(resolve));
+    await fs.rm(boardRoot, { recursive: true, force: true });
+  });
+  await new Promise((resolve, reject) => {
+    app.server.once("error", reject);
+    app.server.listen(0, "127.0.0.1", () => { app.server.off("error", reject); resolve(); });
+  });
+  const port = app.server.address().port;
+  const request = (route) => new Promise((resolve, reject) => {
+    http.get({ hostname: "127.0.0.1", port, path: route }, res => {
+      let content = "";
+      res.setEncoding("utf8");
+      res.on("data", chunk => { content += chunk; });
+      res.on("error", reject);
+      res.on("end", () => {
+        try { resolve({ status: res.statusCode, body: JSON.parse(content) }); } catch (error) { reject(error); }
+      });
+    }).on("error", reject);
+  });
+  const status = await request("/api/runtime/status");
+  assert.equal(status.status, 200);
+  assert.equal(status.body.chatgpt_health.state, "not_configured");
+  assert.equal(status.body.chatgpt_health.healthy, false);
+  assert.equal((await request("/healthz")).status, 200);
+  await assert.rejects(fs.stat(config), { code: "ENOENT" });
+  await fs.writeFile(config, "{ broken config");
+  assert.equal((await request("/api/runtime/status")).status, 500);
+  assert.equal(await fs.readFile(config, "utf8"), "{ broken config");
+});
 
 test("runtime status light snapshot skips live scheduler probes and uses recorded scheduler truth", async (t) => {
   const {root,now}=await fixture(t);
