@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { detectProjectStack } from "../server/project-onboarding.mjs";
+import { detectProjectStack, linkRegisteredProjectWorkflow } from "../server/project-onboarding.mjs";
 
 async function sample(t, names) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "wtb-stack-"));
@@ -61,4 +61,49 @@ test("R3: folders and unrelated JavaScript assets do not imply a backend stack",
   const result = await detectProjectStack(root);
   assert.equal(result.stack, "dotnet");
   assert.deepEqual(result.markers, ["PROJECT.CSPROJ"]);
+});
+
+test("R1: registered project receives existing versioned three-role entry files", async (t) => {
+  const root = await sample(t, ["package.json"]);
+  const registry = { get: (id) => {
+    assert.equal(id, "registered-project");
+    return { root };
+  } };
+  const result = await linkRegisteredProjectWorkflow(registry, "registered-project");
+  assert.equal(result.templateVersion, "software-project-v1");
+  assert.equal(result.created.length, 7);
+  assert.deepEqual(result.preserved, []);
+  const sourceRoot = path.resolve("templates/webcodex-v1");
+  for (const relative of result.created) {
+    assert.equal(await fs.readFile(path.join(root, relative), "utf8"),
+      await fs.readFile(path.join(sourceRoot, relative), "utf8"));
+  }
+  assert.match(await fs.readFile(path.join(root, "流程文档/00_统一入口.md"), "utf8"), /统一入口/);
+});
+
+test("R2: existing business rules are never overwritten; repeating preserves all files", async (t) => {
+  const root = await sample(t, ["package.json", "AGENTS.md"]);
+  await fs.writeFile(path.join(root, "AGENTS.md"), "original business rules", "utf8");
+  await fs.mkdir(path.join(root, "流程文档"));
+  await fs.writeFile(path.join(root, "流程文档/00_统一入口.md"), "project-specific workflow", "utf8");
+  const registry = { get: () => ({ root }) };
+  const first = await linkRegisteredProjectWorkflow(registry, "registered");
+  assert.ok(first.preserved.includes("AGENTS.md"));
+  assert.ok(first.preserved.includes("流程文档/00_统一入口.md"));
+  assert.equal(first.created.length, 5);
+  assert.equal(await fs.readFile(path.join(root, "AGENTS.md"), "utf8"), "original business rules");
+  assert.equal(await fs.readFile(path.join(root, "流程文档/00_统一入口.md"), "utf8"), "project-specific workflow");
+  const second = await linkRegisteredProjectWorkflow(registry, "registered");
+  assert.equal(second.created.length, 0);
+  assert.equal(second.preserved.length, 7);
+  assert.equal(await fs.readFile(path.join(root, "AGENTS.md"), "utf8"), "original business rules");
+  assert.equal(await fs.readFile(path.join(root, "流程文档/00_统一入口.md"), "utf8"), "project-specific workflow");
+});
+
+test("R2: an unknown registration cannot create or change a project", async (t) => {
+  const root = await sample(t, ["package.json"]);
+  const registry = { get: () => { throw new Error("PROJECT_NOT_REGISTERED"); } };
+  const before = await fs.readdir(root);
+  await assert.rejects(linkRegisteredProjectWorkflow(registry, "missing"), /PROJECT_NOT_REGISTERED/);
+  assert.deepEqual(await fs.readdir(root), before);
 });
