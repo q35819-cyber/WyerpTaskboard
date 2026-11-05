@@ -162,14 +162,16 @@ test("candidate prompt keeps role/model/version handoff contract", () => {
 });
 
 test("WyerpTaskboard role governance docs referenced by wake prompt exist", async () => {
-  const [developer, tester] = await Promise.all([
+  const [developer, tester, developerRole, testerRole] = await Promise.all([
     readFile(new URL("../docs/governance/开发AI工作规范.md", import.meta.url), "utf8"),
-    readFile(new URL("../docs/governance/测试AI工作规范.md", import.meta.url), "utf8")
+    readFile(new URL("../docs/governance/测试AI工作规范.md", import.meta.url), "utf8"),
+    readFile(new URL("../流程文档/开发/00_角色入口.md", import.meta.url), "utf8"),
+    readFile(new URL("../流程文档/独测/00_角色入口.md", import.meta.url), "utf8")
   ]);
-  assert.match(developer, /delivery-failed/);
-  assert.match(developer, /原开发actor-id/);
-  assert.match(tester, /独立测试 AI/);
-  assert.match(tester, /不得修改业务实现/);
+  assert.match(developer, /流程文档\/开发\/00_角色入口\.md/);
+  assert.match(tester, /流程文档\/独测\/00_角色入口\.md/);
+  assert.match(developerRole, /开发角色入口/);
+  assert.match(testerRole, /独测角色入口/);
 });
 
 test("WyerpTaskboard developer candidate prompt hard-requires role doc and self-test after code changes", () => {

@@ -16,7 +16,7 @@ A local Windows-based multiproject taskboard for AI development and independent 
 - **本机访问规则（P0 任务已完成，具体运行状态以当前服务为准）**：本机免登录浏览器写请求要求严格匹配的 Origin，并在浏览器提供时校验 Sec-Fetch-Site=same-origin；不要求浏览器 CSRF token。服务必须仅监听 127.0.0.1，不允许暴露到局域网或公网。部署版本实际行为以通过独立测试的代码为准，修复任务为 WTB-P0-USER-ACCEPTANCE-SYSTEM-GATES-20261031-T1。
 - config/admin-secret.json 仅保留给受信任的 AI/CLI Bearer API 调用，不是网页登录密码；不要删除、分享或提交到 GitHub，否则会破坏已有 AI/CLI 自动化接入。
 - 如需查看本机 API Bearer 令牌，可在自己的终端运行 node cli/service.mjs secret；不要截图、分享或提交到 GitHub。
-- **部署路径**：如果克隆位置不是 D:\WyerpTaskboard，先在 PowerShell 设置 $env:WYERP_TASKBOARD_ROOT = (Get-Location).Path。
+- **部署路径**：在实际项目根目录按需设置 WYERP_TASKBOARD_ROOT，不能依赖固定盘符。
 
 ## 中文说明
 
@@ -31,15 +31,15 @@ A local Windows-based multiproject taskboard for AI development and independent 
 - Example paths in configuration must be replaced for each installation; the code includes Windows-specific service tooling.
 
 ## AI workflow governance
-- Start here: root `AGENTS.md` and `WORKFLOW.md`. The complete authoritative role rules are directly in root `总控AI.md`, `开发AI.md`, and `独立测试AI.md`; do not maintain a second conflicting role manual.
+- Start here: first read 流程文档/00_流程与重大更新日志.md, then 流程文档/00_统一入口.md and the current role entry under 流程文档. Root AGENTS/WORKFLOW are entry pointers; retired root role manuals are invalid.
 
 
 - Private/local product requirement records (if present under `docs/产品需求/`) are **not included in the published repository**. The published workflow entry points, role rules and Git delivery standard below are self-contained; do not block a fresh clone on private documents.
-- Root `WORKFLOW.md` is the entry for the minimal three-role flow. `docs/流程标准/开发独测Git合并闭环.md` retains detailed Git/delivery compatibility notes; do not duplicate or override the current root rules.
-- The three root role files are the sole authoritative responsibility manuals. `docs/governance/` retains short legacy-path compatibility pointers. `templates/webcodex-v1/` provides supporting prompts, not another role authority. There are only three standing AI roles.
+- The only active workflow authority is 流程文档/. The old docs/流程标准/ rules were retired. Independent QA PASS must be delivered by the controller, not by the original developer.
+- The current three roles are defined under 流程文档/总控, 流程文档/开发 and 流程文档/独测. docs/governance only provides legacy navigation; template copies mirror the current rules.
 - Historical audit reports (including older NO-GO findings) are not live task statuses. Use the taskboard's current task events, accepted candidate and independent QA outcome; writing a rule is not proof that a production gate is implemented.
-- Legacy scripts may resolve `docs/governance/` pointers, but must read the full corresponding root role file before executing.
-- `templates/webcodex-v1/` is the portable **manual** onboarding baseline: three root role files, `AGENTS.md`, `WORKFLOW.md`, `.agents/skills/ponytail/SKILL.md`, project configuration, Node/Python runnable examples and prompt templates. Ponytail full is mandatory for code changes. Auto onboarding is **not yet implemented**.
+- Legacy scripts must follow docs/governance pointers to current 流程文档 role entries, never to the retired root role files.
+- templates/webcodex-v1 is a manual onboarding baseline with the current 流程文档, AGENTS/WORKFLOW and Ponytail. Automatic onboarding is planned but not yet implemented.
 
 ## Quality checks
 

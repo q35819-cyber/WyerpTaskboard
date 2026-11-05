@@ -5,7 +5,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 
 const templateRoot = path.resolve("templates/webcodex-v1");
-const coreFiles = ["AGENTS.md", "WORKFLOW.md", "总控AI.md", "开发AI.md", "独立测试AI.md"];
+const coreFiles = ["AGENTS.md", "WORKFLOW.md"];
 const ponytailPath = path.join(".agents", "skills", "ponytail", "SKILL.md");
 test("universal template has a complete portable Ponytail-based three-role entry", async () => {
   const skill = await fs.readFile(path.join(templateRoot, ponytailPath), "utf8");
@@ -17,8 +17,48 @@ test("universal template has a complete portable Ponytail-based three-role entry
     assert.ok(body.includes("ponytail/SKILL.md"), `${file} must mandate Ponytail`);
     assert.doesNotMatch(body, /docs\/governance\/|docs\/产品需求\//, `${file} must not depend on Wyerp private files`);
   }
+  for (const role of ["总控", "开发", "独测"]) {
+    const file = "流程文档/" + role + "/00_角色入口.md";
+    const body = await fs.readFile(path.join(templateRoot, file), "utf8");
+    assert.match(body, /2026\.11\.03-r1/, file + " must use the current workflow version");
+  }
+  for (const file of ["总控AI.md", "开发AI.md", "独立测试AI.md"]) {
+    await assert.rejects(fs.access(path.join(templateRoot, file)), { code: "ENOENT" });
+  }
   const controller = await fs.readFile(path.join(templateRoot, "CONTROLLER_PROMPT.md"), "utf8");
   assert.doesNotMatch(controller, /20261101_WyerpTaskboard全流程角色任务审计_NO_GO|00_WyerpTaskboard核心产品需求|docs\/流程标准\//);
+});
+
+test("retired root role manuals cannot become a second workflow authority", async () => {
+  const retired = ["总控AI.md", "开发AI.md", "独立测试AI.md"];
+  for (const file of retired) {
+    await assert.rejects(fs.access(path.resolve(file)), { code: "ENOENT" });
+    await assert.rejects(fs.access(path.join(templateRoot, file)), { code: "ENOENT" });
+  }
+  for (const file of ["AGENTS.md", "WORKFLOW.md", "README.md"]) {
+    const body = await fs.readFile(path.resolve(file), "utf8");
+    assert.match(body, /流程文档\/00_统一入口\.md/, file);
+    assert.doesNotMatch(body, /\]\((?:\.\/)?(?:总控AI|开发AI|独立测试AI)\.md\)/, file);
+  }
+  for (const [role, legacy] of [
+    ["总控", "总控AI工作规范.md"],
+    ["开发", "开发AI工作规范.md"],
+    ["独测", "测试AI工作规范.md"]
+  ]) {
+    const pointer = await fs.readFile(path.resolve("docs/governance", legacy), "utf8");
+    assert.ok(pointer.includes("流程文档/" + role + "/00_角色入口.md"), legacy);
+    assert.doesNotMatch(pointer, /\]\((?:\.\/)?(?:总控AI|开发AI|独立测试AI)\.md\)/);
+  }
+});
+
+test("published workflow entry avoids machine-specific installation paths", async () => {
+  const files = ["AGENTS.md", "README.md", "WORKFLOW.md",
+    "templates/webcodex-v1/AGENTS.md", "templates/webcodex-v1/WORKFLOW.md",
+    "templates/webcodex-v1/README.md", "templates/webcodex-v1/SOFTWARE_PROJECT_CONTRACT.md"];
+  for (const file of files) {
+    const body = await fs.readFile(path.resolve(file), "utf8");
+    assert.doesNotMatch(body, /\b[A-Za-z]:[\\/]|\\\\[^\\\s]+\\[^\\\s]+/, file);
+  }
 });
 
 const schema = JSON.parse(await fs.readFile(path.join(templateRoot, "software-project-config.schema.json"), "utf8"));
