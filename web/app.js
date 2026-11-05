@@ -1,5 +1,5 @@
 import { buildPlanIndex } from "./plan-index.mjs";
-import { paginateColumn, resolveProjectId, tasksForColumn } from "./board-state.mjs";
+import { countReadyColumnBugs, paginateColumn, resolveProjectId, tasksForColumn } from "./board-state.mjs";
 const PROJECT_SELECTION_KEY="wyerp-taskboard:selected-project";
 const PAGE_SIZE=3;
 const USER_MESSAGE_PAGE_SIZE=3;
@@ -426,7 +426,8 @@ function renderBoard(){
     const columnCount=document.createElement("span");columnCount.className="count";columnCount.textContent=tasks.length+"项";
     if(column.id==="qa_pending"){
       const developers=tasks.filter(isReadyTask).length;
-      columnCount.textContent="开发 "+developers+" 项 · 测试 "+(tasks.length-developers)+" 项";
+      columnTitle.textContent="待执行";
+      columnCount.textContent="开发 "+developers+" 项 · 测试 "+(tasks.length-developers)+" 项 · BUG "+countReadyColumnBugs(tasks)+" 项";
       columnCount.classList.add("shared-ready-count");columnTitle.classList.add("shared-ready-title");
     }
     head.append(columnTitle,columnCount);col.append(head);

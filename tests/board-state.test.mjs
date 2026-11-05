@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { paginateColumn, resolveProjectId, tasksForColumn } from "../web/board-state.mjs";
+import { countReadyColumnBugs, paginateColumn, resolveProjectId, tasksForColumn } from "../web/board-state.mjs";
 
 test("restores the last selected registered project instead of silently returning to the first project",()=>{
   const projects=[{id:"wyerp-taskboard"},{id:"erp-x20"}];
@@ -24,4 +24,37 @@ test("first column with two tasks renders both on page one and clamps invalid pa
   assert.deepEqual(paginateColumn(tasks,1,3),{page:1,totalPages:1,visible:tasks});
   assert.deepEqual(paginateColumn(tasks,99,3),{page:1,totalPages:1,visible:tasks});
   assert.deepEqual(paginateColumn(tasks,Number.NaN,3),{page:1,totalPages:1,visible:tasks});
+});
+
+test("shared ready BUG counter includes visible QA bugfix once and ignores pagination",()=>{
+  const list=[
+    {id:"B-01",track:"bugfix",status:"待开发"},
+    {id:"B-02",track:"bugfix",status:"待独测"},
+    {id:"B-03",track:"bugfix",status:"待复测"},
+    {id:"P-01",track:"product",status:"待开发"},
+    {id:"P-02",track:"product",status:"待独测"},
+    {id:"B-02",track:"bugfix",status:"待独测"}
+  ];
+  assert.equal(countReadyColumnBugs([]),0);
+  assert.equal(countReadyColumnBugs(list),3);
+  assert.equal(countReadyColumnBugs(paginateColumn(list,1,3).visible),3);
+  assert.equal(countReadyColumnBugs(paginateColumn(list,2,3).visible),1);
+  assert.equal(countReadyColumnBugs(list),3,"column count must use unpaginated tasks");
+  assert.equal(countReadyColumnBugs([list[3],list[4]]),0);
+  assert.equal(countReadyColumnBugs([list[0]]),1);
+});
+
+test("shared ready counter excludes blocked, HOLD, other project and filtered-out tasks via column membership",()=>{
+  const all=[
+    {id:"B-01",track:"bugfix",status:"待独测",projectId:"A"},
+    {id:"B-02",track:"bugfix",status:"阻断",projectId:"A"},
+    {id:"B-03",track:"bugfix",status:"HOLD",projectId:"A"},
+    {id:"B-04",track:"bugfix",status:"待独测",projectId:"B"},
+    {id:"B-05",track:"bugfix",status:"已完成",projectId:"A"},
+    {id:"P-01",track:"product",status:"待复测",projectId:"A"}
+  ];
+  const filtered=all.filter(t=>t.projectId==="A");
+  const shared=tasksForColumn(filtered,["待独测","待复测"]);
+  assert.equal(countReadyColumnBugs(shared),1);
+  assert.equal(countReadyColumnBugs(tasksForColumn(filtered.filter(t=>t.id!=="B-01"),["待独测","待复测"])),0);
 });

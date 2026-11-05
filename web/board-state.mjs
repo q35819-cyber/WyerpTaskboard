@@ -11,6 +11,12 @@ export function tasksForColumn(tasks, statuses) {
   return (Array.isArray(tasks)?tasks:[]).filter(task=>allowed.has(task?.status));
 }
 
+export function countReadyColumnBugs(tasks) {
+  return new Set((Array.isArray(tasks)?tasks:[])
+    .filter(task=>task?.track==="bugfix"&&task.id)
+    .map(task=>task.id)).size;
+}
+
 export function paginateColumn(tasks, requestedPage, pageSize=3) {
   const items=Array.isArray(tasks)?tasks:[];
   const size=Number.isInteger(pageSize)&&pageSize>0?pageSize:3;

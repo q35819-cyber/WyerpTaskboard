@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { ScanStore } from "../server/scan-store.mjs";
 import { TaskScanner } from "../server/task-scanner.mjs";
+import { countReadyColumnBugs } from "../web/board-state.mjs";
 
 async function root(t) {
   const value = await fs.mkdtemp(path.join(os.tmpdir(), "wyerp-adaptive-scan-"));
@@ -67,17 +68,17 @@ test("one shared ready column derives developer eligibility and keeps QA and del
   const els={boardView:node("main")};
   state.workflow=flow;state.columnPages={};
   const renderBoard=new Function("state","els","boardTasksForColumn","isReadyTask","paginateColumn","PAGE_SIZE",
-    "document","taskCard","renderPagination",renderSource+"\nreturn renderBoard;")(
+    "document","taskCard","renderPagination","countReadyColumnBugs",renderSource+"\nreturn renderBoard;")(
       state,els,board,ready,(items,page,size)=>{
         const pages=Math.max(1,Math.ceil(items.length/size));
         const current=Math.min(Math.max(1,page||1),pages);
         return {page:current,totalPages:pages,visible:items.slice((current-1)*size,current*size)};
-      },3,{createElement:node},task=>Object.assign(node("article"),{taskId:task.id}),()=>node("nav"));
+      },3,{createElement:node},task=>Object.assign(node("article"),{taskId:task.id}),()=>node("nav"),countReadyColumnBugs);
   const renderedCount=()=>{
     renderBoard();
     assert.equal(els.boardView.children.length,6,"six actual DOM columns");
     const shared=els.boardView.children.find(col=>
-      col.children[0]?.children[0]?.textContent===flow.boardColumns.find(c=>c.id==="qa_pending").title);
+      col.children[0]?.children[0]?.textContent==="待执行");
     assert.ok(shared);
     assert.equal(shared.children.filter(child=>child.tag==="article").length,
       Math.min(3,get("qa_pending").length),"pagination never changes full role counts");
@@ -90,11 +91,13 @@ test("one shared ready column derives developer eligibility and keeps QA and del
     {projectId:"fixture",taskId:"B",status:"待开发",eligible:false,blockers:["前置未完成"]},
     {projectId:"fixture",taskId:"C",status:"待准备",eligible:true,blockers:[]}
   ];
-  assert.equal(renderedCount(),"开发 2 项 · 测试 2 项");
+  assert.equal(renderedCount(),"开发 2 项 · 测试 2 项 · BUG 0 项");
+  QA.track="bugfix";A.track="bugfix";
+  assert.equal(renderedCount(),"开发 2 项 · 测试 2 项 · BUG 2 项","QA BUG and eligible developer BUG both count before paging");
   state.filtered=state.filtered.filter(t=>["A","QA"].includes(t.id));
-  assert.equal(renderedCount(),"开发 1 项 · 测试 1 项","count tracks current filter");
+  assert.equal(renderedCount(),"开发 1 项 · 测试 1 项 · BUG 2 项","count tracks current filter");
   state.scanStatus.scan.last_scan_at=new Date(Date.now()-31*60*1000).toISOString();
-  assert.equal(renderedCount(),"开发 0 项 · 测试 1 项","stale scan returns developer to todo");
+  assert.equal(renderedCount(),"开发 0 项 · 测试 1 项 · BUG 1 项","stale scan returns developer to todo");
 });
 
 test("scheduled dispatcher scans busy or idle mode only when due", async (t) => {
