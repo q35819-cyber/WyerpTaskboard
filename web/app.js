@@ -15,7 +15,7 @@ const els=Object.fromEntries([
   "projectRegistryInput","refreshBtn","aiSettingsBtn","aiSettingsDialog","aiSettingsForm","closeAiSettingsBtn","cancelAiSettingsBtn","developerModel","developerReasoning","testModel","testReasoning","scanIntervalMinutes","maxRequestsPerChat","contextWarningAt","timeoutRetryLimit","anomalyWindowMinutes","anomalyLimit","roleSwitchLimit","appVersion","projectHealth","projectService","projectServiceStatus","projectStartRestartBtn","projectStopServiceBtn","scanStatus","summary","searchInput","planFilter","trackFilter",
   "priorityFilter","statusFilter","archiveFilter","boardViewBtn","listViewBtn","boardView","listView","taskTableBody",
   "planDialog","planDialogTitle","planDialogPath","planNavigator","planLocationStatus","planIndexList","planDocumentContent","closePlanDialogBtn",
-  "taskDialog","closeDialogBtn","detailTaskId","detailTitle","userMessagePanel","userMessageCount","userMessageList",
+  "taskDialog","closeDialogBtn","detailTaskId","copyDetailTaskIdBtn","detailTitle","userMessagePanel","userMessageCount","userMessageList",
   "taskPlanList","responsibilityText","currentProgressText","userAssistanceText","traceabilityText","readDependenciesText","writeTargetsText","relatedArtifactsText","detailMeta",
   "sessionInfo","testResourceSummary","testResourceList","prioritySelect","savePriorityBtn","stopBtn","resumeBtn","suspectDisconnectBtn","allowTakeoverBtn",
   "revokeTakeoverBtn","reviewNote","commentBtn","userAcceptanceActions","acceptBtn","rejectReason","rejectBtn","reloadHistoryBtn","historyList"
@@ -385,12 +385,46 @@ function documentButton(taskId,doc){
   button.addEventListener("click",event=>{event.stopPropagation();if(sameProject(projectId,epoch))openDocument(taskId,doc.index)});
   return button;
 }
+async function copyTaskId(taskId,button,projectId,epoch){
+  if(!sameProject(projectId,epoch)||button.disabled)return false;
+  button.disabled=true;
+  try{
+    if(!navigator.clipboard?.writeText)throw new Error("剪贴板不可用");
+    await navigator.clipboard.writeText(taskId);
+    if(sameProject(projectId,epoch))toast("任务编号已复制");
+    return true;
+  }catch{
+    if(!sameProject(projectId,epoch))return false;
+    const row=button.parentElement;
+    let input=row?.querySelector(".copy-task-id-fallback");
+    if(!input&&row){
+      input=document.createElement("input");input.type="text";input.readOnly=true;
+      input.className="copy-task-id-fallback";input.ariaLabel="手动复制任务编号";
+      row.append(input);
+    }
+    if(input){input.value=taskId;input.focus();input.select()}
+    toast("自动复制失败，请手动复制已选中的任务编号",true);
+    return false;
+  }finally{button.disabled=false}
+}
+function copyTaskIdButton(taskId,projectId,epoch){
+  const button=document.createElement("button");
+  button.type="button";button.className="copy-task-id";button.textContent="⧉";
+  button.title="复制任务编号";button.ariaLabel="复制任务编号："+taskId;
+  button.addEventListener("click",event=>{
+    event.stopPropagation();
+    void copyTaskId(taskId,button,projectId,epoch);
+  });
+  return button;
+}
 function taskCard(task){
   const card=document.createElement("article");card.className="task-card"+(task.track==="bugfix"?" bug-card":"");
   if(task.presentation?.latestUserMessage?.replied){
     const stamp=document.createElement("div");stamp.className="reply-stamp";stamp.textContent="已回复";stamp.title="最新用户留言已有AI回复";card.append(stamp);
   }
+  const idRow=document.createElement("div");idRow.className="task-id-row";
   const id=document.createElement("div");id.className="task-id";id.textContent=task.id;
+  idRow.append(id,copyTaskIdButton(task.id,state.projectId,state.projectEpoch));
   const h4=document.createElement("h4");h4.textContent=taskTitle(task);
   const badges=document.createElement("div");badges.className="badges";
   badges.append(badge(trackLabel(task.track),task.track==="bugfix"?"bugfix":undefined),badge(priorityLabel(task.priority),task.priority?.toLowerCase()),badge(statusLabel(task.status)));
@@ -400,7 +434,7 @@ function taskCard(task){
   if(plan)planRow.append(planButton(task.id,plan,true));else planRow.textContent="主计划：未绑定";
   const responsibility=document.createElement("div");responsibility.className="task-responsibility";responsibility.textContent="本任务负责："+(task.presentation?.responsibility||task.boundary||"未填写");
   const progress=document.createElement("div");progress.className="task-progress";progress.textContent="当前进展："+(task.presentation?.currentProgress||statusLabel(task.status));
-  card.append(id,h4,badges,planRow,responsibility,progress);
+  card.append(idRow,h4,badges,planRow,responsibility,progress);
   const candidate=developerCandidateFor(task);
   if(candidate?.blockers?.length||(task.status==="待执行"&&!isReadyTask(task))){const why=document.createElement("div");why.className="task-user-assistance";why.textContent="暂不能执行："+(candidate?.blockers?.length?candidate.blockers.join("；"):"缺少有效的最新准入扫描结果");card.append(why);}
   const assistanceText=task.presentation?.userAssistance||"";
@@ -860,6 +894,11 @@ els.boardViewBtn.addEventListener("click",()=>{state.view="board";render()});
 els.listViewBtn.addEventListener("click",()=>{state.view="list";render()});
 els.closePlanDialogBtn.addEventListener("click",()=>els.planDialog.close());
 els.closeDialogBtn.addEventListener("click",()=>els.taskDialog.close());
+els.copyDetailTaskIdBtn.addEventListener("click",event=>{
+  event.stopPropagation();
+  const task=state.selectedTask,projectId=state.selectedTaskProjectId,epoch=state.projectEpoch;
+  if(task&&projectId===state.projectId)void copyTaskId(task.id,els.copyDetailTaskIdBtn,projectId,epoch);
+});
 els.reloadHistoryBtn.addEventListener("click",loadHistory);
 els.suspectDisconnectBtn.addEventListener("click",()=>mutateTask("/takeover/suspect",{operationId:opId("suspected_disconnect"),note:els.reviewNote.value.trim()||"用户标记疑似失联；尚未授权异常接管"},"已标记疑似失联（尚未授权接管）"));
 els.allowTakeoverBtn.addEventListener("click",()=>{

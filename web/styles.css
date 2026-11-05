@@ -134,3 +134,11 @@
 
 .task-card.bug-card{border-left:4px solid #d92d20;background:#fff8f7}
 .badge.bugfix{background:#b42318;color:#fff;font-weight:800}
+
+/* Copy ID stays touch-friendly without hiding selectable long IDs. */
+.task-id-row{display:flex;align-items:center;gap:7px;flex-wrap:wrap;min-width:0}
+.task-id-row .task-id,.task-id-row #detailTaskId{min-width:0;overflow-wrap:anywhere;user-select:text}
+.copy-task-id{display:inline-flex;align-items:center;justify-content:center;flex:0 0 40px;width:40px;min-width:40px;height:40px;min-height:40px;padding:0;border:1px solid #cbd5e1;border-radius:8px;background:#fff;color:#175cd3;font:700 19px/1 sans-serif;cursor:pointer;touch-action:manipulation}
+.copy-task-id:focus-visible{outline:3px solid #84adff;outline-offset:2px}
+.copy-task-id:disabled{opacity:.55;cursor:progress}
+.copy-task-id-fallback{flex:1 1 100%;min-width:0;width:100%;padding:9px;border:1px solid #98a2b3;border-radius:6px;font:12px/1.4 Consolas,monospace;user-select:text}
