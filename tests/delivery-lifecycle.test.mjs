@@ -301,6 +301,90 @@ async function isolatedDeliveryWorktree(x) {
   return worktree;
 }
 
+test("C06 archives C05 proof then safely cleans the merged task's own worktree before C07", async (t) => {
+  const x = await deliveryFixture(t, { acceptanceScope: "system" });
+  const worktree = await isolatedDeliveryWorktree(x);
+  const sourceReport = await fs.readFile(path.join(worktree, x.reportPath), "utf8");
+  x.store.inspectCleanupResources = async ({ projectId, taskId, worktree: inspected, branch }) => {
+    assert.equal(projectId, "fixture");
+    assert.equal(taskId, x.taskId);
+    assert.equal(inspected, await fs.realpath(worktree));
+    assert.equal(branch, "feature/delivery");
+    return { ownerTaskId: taskId, activeJobs: 0, otherOwners: 0, openPullRequests: 0 };
+  };
+  const result = await x.store.cleanupMergedDelivery("fixture", x.taskId, {
+    operationId: "delivery.cleanup.verified.0001",
+    actorType: "controller_ai", actorId: "controller", sessionId: "ctrl-session",
+    deliveryWorktreePath: worktree, postMergeReportPath: x.reportPath
+  });
+  assert.equal(result.receipt.mainSha, x.mergeSha);
+  assert.equal(result.receipt.candidateCommitSha, x.candidateSha);
+  assert.equal(result.receipt.worktreeRemoveExitCode, 0);
+  assert.equal(result.receipt.branchDeleteExitCode, 0);
+  await assert.rejects(fs.stat(worktree), { code: "ENOENT" });
+  await assert.rejects(git(x.fixture.projectRoot, "rev-parse", "--verify", "refs/heads/feature/delivery"));
+  const archive = path.join(x.fixture.boardRoot, result.receipt.archivedReport);
+  assert.equal(await fs.readFile(archive, "utf8"), sourceReport);
+  const events = await x.store.taskHistory("fixture", x.taskId, { all: true });
+  const audit = events.at(-1);
+  assert.equal(audit.event_type, "delivery_cleanup_verified");
+  assert.equal(audit.metadata.receiptSha256.length, 64);
+  assert.equal((await x.store.getTask("fixture", x.taskId)).task.status, "交付中");
+  assert.equal((await git(x.fixture.projectRoot, "ls-remote", "origin", "refs/heads/main")).slice(0, 40), x.mergeSha);
+});
+
+test("C06 fails closed when a workspace has uncertain ownership, active jobs, or shared PRs", async (t) => {
+  const x = await deliveryFixture(t);
+  const worktree = await isolatedDeliveryWorktree(x);
+  const attempt = (op) => x.store.cleanupMergedDelivery("fixture", x.taskId, {
+    operationId: "delivery.cleanup.blocked." + op,
+    actorType: "controller_ai", actorId: "controller", sessionId: "ctrl-session",
+    deliveryWorktreePath: worktree, postMergeReportPath: x.reportPath
+  });
+  await assert.rejects(() => attempt("unknown"), (error) => error.code === "C06_RESOURCE_UNVERIFIED");
+  for (const inspection of [
+    { ownerTaskId: "OTHER-TASK", activeJobs: 0, otherOwners: 0, openPullRequests: 0 },
+    { ownerTaskId: x.taskId, activeJobs: 1, otherOwners: 0, openPullRequests: 0 },
+    { ownerTaskId: x.taskId, activeJobs: 0, otherOwners: 1, openPullRequests: 0 },
+    { ownerTaskId: x.taskId, activeJobs: 0, otherOwners: 0, openPullRequests: 1 }
+  ]) {
+    x.store.inspectCleanupResources = async () => inspection;
+    await assert.rejects(() => attempt("shared"), (error) => error.code === "C06_RESOURCE_UNVERIFIED");
+  }
+  assert.equal(await fs.readFile(path.join(worktree, x.reportPath), "utf8"),
+    "结论：PASS\n候选SHA：" + x.candidateSha + "\nmain SHA：" + x.mergeSha + "\n");
+  assert.equal(await git(x.fixture.projectRoot, "rev-parse", "refs/heads/feature/delivery"), x.candidateSha);
+  assert.ok(await fs.stat(worktree));
+  assert.equal((await x.store.taskHistory("fixture", x.taskId, { all: true }))
+    .some(e => e.event_type === "delivery_cleanup_verified"), false);
+});
+
+test("C06 refuses dirty or unmerged worktrees and leaves other AI's source untouched", async (t) => {
+  const x = await deliveryFixture(t);
+  const worktree = await isolatedDeliveryWorktree(x);
+  x.store.inspectCleanupResources = async () => ({
+    ownerTaskId: x.taskId, activeJobs: 0, otherOwners: 0, openPullRequests: 0
+  });
+  const dirty = path.join(worktree, "unsaved-other-ai.txt");
+  await fs.writeFile(dirty, "do not remove");
+  await assert.rejects(() => x.store.cleanupMergedDelivery("fixture", x.taskId, {
+    operationId: "delivery.cleanup.dirty.0001", actorType: "controller_ai",
+    actorId: "controller", sessionId: "ctrl-session",
+    deliveryWorktreePath: worktree, postMergeReportPath: x.reportPath
+  }), (error) => error.code === "DELIVERY_WORKTREE_DIRTY");
+  assert.equal(await fs.readFile(dirty, "utf8"), "do not remove");
+  const unmerged = await deliveryFixture(t, { merged: false });
+  const unmergedWorktree = await isolatedDeliveryWorktree(unmerged);
+  unmerged.store.inspectCleanupResources = async () => ({
+    ownerTaskId: unmerged.taskId, activeJobs: 0, otherOwners: 0, openPullRequests: 0
+  });
+  await assert.rejects(() => unmerged.store.cleanupMergedDelivery("fixture", unmerged.taskId, {
+    operationId: "delivery.cleanup.unmerged.0001", actorType: "controller_ai",
+    actorId: "controller", sessionId: "ctrl-session",
+    deliveryWorktreePath: unmergedWorktree, postMergeReportPath: unmerged.reportPath
+  }), (error) => error.code === "DELIVERY_CANDIDATE_NOT_MERGED");
+});
+
 test("registered clean isolated delivery succeeds while another AI's root worktree remains dirty", async (t) => {
   const x = await deliveryFixture(t, { acceptanceScope: "system" });
   const dirtyPath = path.join(x.fixture.projectRoot, "other-ai-uncommitted.js");

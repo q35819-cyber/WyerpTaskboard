@@ -661,13 +661,14 @@ function messageScope({ actorType = "developer_ai", actorId = "taskctl", session
 }
 
 export class TaskStore {
-  constructor(rootDir, { faultAfter = null } = {}) {
+  constructor(rootDir, { faultAfter = null, inspectCleanupResources = null } = {}) {
     this.rootDir = rootDir;
     this.projects = new ProjectRegistry(rootDir);
     this.events = new EventStore(rootDir);
     this.transactions = new TransactionStore(rootDir);
     this.scanStore = new ScanStore(rootDir);
     this.faultAfter = faultAfter;
+    this.inspectCleanupResources = inspectCleanupResources;
   }
 
   async init() {
@@ -684,6 +685,104 @@ export class TaskStore {
     catch (error) {
       await this.scanStore.appendEvent({ type: "task_rearm_failed", reason, metadata, error: String(error?.message || error).slice(0, 500) }).catch(logError => console.error("task rearm log failed:", logError?.message || logError));
     }
+  }
+
+  // C06 runs after C05, before C07. A separate task will gate C07 on this receipt.
+  async cleanupMergedDelivery(projectId, taskId, {
+    operationId, actorType, actorId, sessionId, deliveryWorktreePath, postMergeReportPath
+  } = {}) {
+    assertOperationId(operationId);
+    const { task } = await this.getTask(projectId, taskId);
+    const context = await this.projects.context(projectId);
+    const history = await this.events.listTaskEvents(projectId, taskId, { all: true });
+    const verified = await verifyDeliveryCompletion(context, task, history, { status: "已完成" }, {
+      actorType, actorId, sessionId,
+      metadata: { deliveryWorktreePath, postMergeReportPath, postMergeRegressionResult: "PASS" }
+    });
+    if (!deliveryWorktreePath || !/^[A-Za-z0-9._-]+$/.test(taskId)) throw new TaskboardError(
+      "C06必须提供合法任务的临时工作区", { code: "C06_WORKTREE_REQUIRED", status: 409 });
+    const worktree = await deliveryGitRoot(context, { deliveryWorktreePath });
+    const canonical = v => process.platform === "win32" ? path.resolve(v).toLowerCase() : path.resolve(v);
+    if (canonical(worktree) === canonical(context.rootRealPath)) throw new TaskboardError(
+      "禁止清理主目录", { code: "C06_MAIN_PROTECTED", status: 409 });
+
+    // Caller-provided booleans are NOT sufficient: only trusted runtime inspection is accepted.
+    const check = typeof this.inspectCleanupResources === "function"
+      ? await this.inspectCleanupResources({ projectId, taskId, worktree, branch: verified.candidateBranch })
+      : null;
+    if (!check || check.ownerTaskId !== taskId || check.activeJobs !== 0
+      || check.otherOwners !== 0 || check.openPullRequests !== 0) throw new TaskboardError(
+      "Job/归属/PR共享资源未获得可信清零证据", { code: "C06_RESOURCE_UNVERIFIED", status: 409 });
+
+    const branch = verified.candidateBranch;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,190}$/.test(branch)
+      || branch.includes("..") || branch.includes("//") || branch.endsWith("/")) throw new TaskboardError(
+      "候选分支名无效", { code: "C06_BRANCH_INVALID", status: 409 });
+    const sha = (await gitOutput(context.rootRealPath, ["rev-parse", "refs/heads/" + branch],
+      "C06_BRANCH_UNAVAILABLE")).toLowerCase();
+    if (sha !== verified.candidateCommitSha || !(await gitIsAncestor(context.rootRealPath,
+      sha, verified.remoteMainSha))) throw new TaskboardError(
+      "候选分支不对应已独测合并SHA", { code: "C06_CANDIDATE_UNMERGED", status: 409 });
+
+    const report = await resolveProjectPath(worktree, postMergeReportPath, { mustExist: true, rejectReparse: true });
+    const bytes = await fs.readFile(report);
+    const reportSha = crypto.createHash("sha256").update(bytes).digest("hex");
+    if (reportSha !== verified.postMergeReportSha256) throw new TaskboardError(
+      "归档前C05报告摘要不符", { code: "C06_REPORT_MISMATCH", status: 409 });
+    const entries = (await gitOutput(worktree, ["status", "--porcelain", "-z", "--untracked-files=all"],
+      "C06_WORKTREE_UNAVAILABLE")).split("\0").filter(Boolean);
+    if (entries.length !== 1 || entries[0].slice(0, 2) !== "??"
+      || entries[0].slice(3).replace(/\\/g, "/").toLowerCase() !==
+         String(postMergeReportPath).replace(/\\/g, "/").toLowerCase()) throw new TaskboardError(
+      "临时工作区含未知修改或未跟踪文件", { code: "C06_DIRTY_WORKTREE", status: 409 });
+
+    const archive = path.join(this.rootDir, "data", "taskboard", "archives", "delivery-cleanup",
+      taskId, verified.mergeCommitSha);
+    if (isPathInside(archive, worktree) || canonical(archive) === canonical(worktree)) throw new TaskboardError(
+      "归档不能位于待删除工作区", { code: "C06_ARCHIVE_UNSAFE", status: 409 });
+    await fs.mkdir(archive, { recursive: true });
+    const archivedFile = path.join(archive, "post-merge.md");
+    try { await fs.writeFile(archivedFile, bytes, { flag: "wx" }); }
+    catch (error) {
+      if (error.code !== "EEXIST" || !(await fs.readFile(archivedFile)).equals(bytes)) throw error;
+    }
+    if (crypto.createHash("sha256").update(await fs.readFile(archivedFile)).digest("hex") !== reportSha) {
+      throw new TaskboardError("C05归档读回不匹配", { code: "C06_ARCHIVE_INVALID", status: 409 });
+    }
+    await fs.unlink(report); // Only this archived+verified C05 temporary report is removed.
+    const clean = await runGit(worktree, ["status", "--porcelain"]);
+    if (clean.code !== 0 || clean.stdout.trim()) throw new TaskboardError(
+      "清理前Git工作区不干净", { code: "C06_DIRTY_WORKTREE", status: 409 });
+    const removed = await runGit(context.rootRealPath, ["worktree", "remove", worktree]);
+    if (removed.code !== 0) throw new TaskboardError("非强制worktree清理失败", {
+      code: "C06_WORKTREE_REMOVE_FAILED", status: 409, details: { exitCode: removed.code }
+    });
+    const deleted = await runGit(context.rootRealPath, ["branch", "-d", branch]);
+    if (deleted.code !== 0) throw new TaskboardError("非强制分支清理失败", {
+      code: "C06_BRANCH_DELETE_FAILED", status: 409, details: { exitCode: deleted.code }
+    });
+    const branchCheck = await runGit(context.rootRealPath, ["show-ref", "--verify", "--quiet", "refs/heads/" + branch]);
+    const worktreeGone = await fs.stat(worktree).then(() => false, () => true);
+    if (!worktreeGone || branchCheck.code !== 1) throw new TaskboardError(
+      "清理后检查未通过", { code: "C06_READBACK_FAILED", status: 409 });
+    const receipt = {
+      projectId, taskId, operationId, actorType, actorId, sessionId,
+      candidateCommitSha: sha, mainSha: verified.mergeCommitSha, reportSha256: reportSha,
+      archivedReport: path.relative(this.rootDir, archivedFile).replace(/\\/g, "/"),
+      worktreeRemoveExitCode: removed.code, branchDeleteExitCode: deleted.code,
+      worktreeGone, branchGone: branchCheck.code === 1
+    };
+    const receiptPath = path.join(archive, "cleanup-receipt.json");
+    await fs.writeFile(receiptPath, JSON.stringify(receipt, null, 2) + "\n", { flag: "wx" });
+    const fileSha256 = crypto.createHash("sha256").update(await fs.readFile(receiptPath)).digest("hex");
+    const { event } = await this.appendTaskEvent(projectId, taskId, {
+      operationId, eventType: "delivery_cleanup_verified", actorType, actorId, sessionId,
+      metadata: {
+        ...receipt, receiptPath: path.relative(this.rootDir, receiptPath).replace(/\\/g, "/"),
+        receiptSha256: fileSha256
+      }
+    });
+    return { receipt, event };
   }
 
   async snapshot(projectId) {
