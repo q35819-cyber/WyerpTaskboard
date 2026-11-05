@@ -757,9 +757,57 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
 
       if (req.method === "GET" && url.pathname === "/api/task-scan/status") {
         const candidates = await scanStore.list();
-        const eligible = candidates.filter((item) => item.eligible);
         const developerCandidates = candidates.filter((item) => item.eligible_role === "developer_ai" && ["待开发", "待执行", "测试失败待修复", "待准备"].includes(item.status));
-        const highest = candidates[0] || null;
+        const qaCandidates = await Promise.all(candidates.filter((item) =>
+          item.eligible_role === "test_ai" && ["待独测", "待复测"].includes(item.status)).map(async (item) => {
+          let evidenceVerified = false, candidateSha = null;
+          if (item.eligible && !item.blockers?.length && !item.stale_at && !item.consumed_at
+            && Date.parse(item.expires_at || "") > Date.now()) {
+            try {
+              const { task, snapshot } = await taskStore.getTask(item.project_id, item.task_id);
+              const history = await taskStore.taskHistory(item.project_id, item.task_id, { all: true });
+              const handoff = [...history].reverse().find((event) =>
+                event.event_type === "handoff" && event.actor_type === "developer_ai"
+                && event.new_status === item.status && event.metadata?.atomicLifecycle === true);
+              const index = history.indexOf(handoff), beforeHandoff = history.slice(0, index);
+              const devTest = [...beforeHandoff].reverse().find((event) =>
+                event.event_type === "test_result" && event.actor_type === "developer_ai"
+                && event.actor_id === handoff?.actor_id && event.session_id === handoff?.session_id);
+              const published = [...beforeHandoff].reverse().find((event) =>
+                event.event_type === "code_published" && event.actor_type === "developer_ai"
+                && event.actor_id === handoff?.actor_id && event.session_id === handoff?.session_id
+                && event.metadata?.remoteVerified === true);
+              const sha = handoff?.metadata?.commitSha || published?.metadata?.commitSha;
+              const branch = handoff?.metadata?.headBranch || published?.metadata?.branch;
+              const resources = await taskStore.testResourceState(item.project_id, item.task_id);
+              const stop = await taskStore.stopState(item.project_id, item.task_id);
+              evidenceVerified = Boolean(index >= 0 && task.status === item.status
+                && task.updatedAt === item.task_updated_at && snapshot.registryRevision === item.registry_revision
+                && !task.assignee && !task.sessionId && resources.activeCount === 0 && !stop.stopRequested
+                && devTest?.metadata?.testResult === "pass" && devTest?.metadata?.reportPath
+                && /^[a-f0-9]{40}$/i.test(String(sha || ""))
+                && /^[A-Za-z0-9][A-Za-z0-9._/-]{0,190}$/.test(String(branch || ""))
+                && !String(branch).includes("..") && !String(branch).includes("//")
+                && published?.metadata?.commitSha === sha
+                && /^[a-f0-9]{64}$/i.test(String(published?.metadata?.reportSha256 || ""))
+                && published?.metadata?.reportPath
+                && (!handoff?.metadata?.commitSha || handoff.metadata.commitSha === sha)
+                && !history.slice(index + 1).some((event) =>
+                  event.event_type === "code_change" || event.metadata?.invalidatesTestEvidence === true));
+              if (evidenceVerified) candidateSha = sha;
+            } catch { evidenceVerified = false; }
+          }
+          return { projectId: item.project_id, taskId: item.task_id, status: item.status,
+            taskUpdatedAt: item.task_updated_at, candidateSha,
+            eligible: Boolean(item.eligible && evidenceVerified), evidenceVerified,
+            blockers: evidenceVerified ? [] : [...(item.blockers || []), "独测候选证据或实时准入未通过"] };
+        }));
+        const verifiedCandidates = candidates.map((item) => item.eligible_role === "test_ai"
+          ? { ...item, eligible: qaCandidates.find((candidate) =>
+              candidate.projectId === item.project_id && candidate.taskId === item.task_id)?.eligible === true }
+          : item);
+        const eligible = verifiedCandidates.filter((item) => item.eligible);
+        const highest = eligible[0] || null;
         const scheduler = await scanStore.schedulerStatus();
         const scan = await scanStore.status();
         const executionSettings = await aiExecutionSettings.get();
@@ -794,6 +842,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           lastConsumption,
           candidateCount: candidates.length,
           eligibleCount: eligible.length,
+          qaCandidates,
           developerCandidates: developerCandidates.map((item) => ({
             detectionId: item.detection_id,
             projectId: item.project_id,
@@ -803,6 +852,8 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
             eligible: item.eligible,
             reason: item.reason,
             blockers: item.blockers || [],
+            taskUpdatedAt: item.task_updated_at,
+            expiresAt: item.expires_at,
             originalDeveloperActorId: item.original_developer_actor_id || null,
             readDependencies: item.read_dependencies || [],
             writeTargets: item.write_targets || []

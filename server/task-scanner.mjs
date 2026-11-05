@@ -53,7 +53,38 @@ export class TaskScanner {
         try {
           const splitParents = this.splitParentReconciler
             ? await this.splitParentReconciler.reconcile(project.id) : [];
-          const evaluation = await this.evaluator.evaluateProject(project.id);
+          let evaluation = await this.evaluator.evaluateProject(project.id);
+          let promoted = false;
+          for (const candidate of evaluation.candidates.filter((item) =>
+            item.status === "待准备" && item.eligible_role === "developer_ai"
+            && item.eligible && !item.provisional && !item.blockers?.length)) {
+            const history = await this.taskStore.taskHistory(project.id, candidate.task_id, { all: true });
+            const dispatchIndex = history.findLastIndex((event) =>
+              event.event_type === "controller_dispatch" && event.actor_type === "controller_ai"
+              && event.old_status === "待准备" && event.new_status === "待准备");
+            const lastPreparation = history.findLastIndex((event) =>
+              event.old_status !== event.new_status && event.new_status === "待准备");
+            if (dispatchIndex < 0 || dispatchIndex < lastPreparation) continue;
+            const { task, snapshot } = await this.taskStore.getTask(project.id, candidate.task_id);
+            if (task.status !== "待准备" || task.assignee || task.sessionId
+              || task.updatedAt !== candidate.task_updated_at ||
+              (await this.taskStore.stopState(project.id, task.id)).stopRequested) continue;
+            const dispatch = history[dispatchIndex];
+            const operationId = "auto_preparation_ready." + crypto.createHash("sha256")
+              .update(project.id + "|" + task.id + "|" + dispatch.event_id).digest("hex");
+            try {
+              const result = await this.taskStore.updateTask(project.id, task.id, { status: "待开发" }, {
+                expectedRevision: snapshot.registryRevision, operationId,
+                eventType: "auto_preparation_ready", actorType: "system", actorId: "task-scan",
+                note: "正式总控派工与当前准入条件已核验，准备任务进入待开发",
+                metadata: { controllerDispatchEventId: dispatch.event_id }
+              });
+              if (!result.idempotentReplay) promoted = true;
+            } catch (error) {
+              if (!["REVISION_CONFLICT", "PROJECT_LOCKED"].includes(error.code)) throw error;
+            }
+          }
+          if (promoted) evaluation = await this.evaluator.evaluateProject(project.id);
           projectResults.push({ ...evaluation, split_parents: splitParents });
         } catch (error) {
           projectResults.push({
