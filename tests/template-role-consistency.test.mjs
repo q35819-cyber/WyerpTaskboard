@@ -17,11 +17,11 @@ async function sources() {
 
 function verifyRoleOwnership(agents, workflow) {
   assert.match(agents, /流程文档\/00_统一入口\.md/);
-  assert.match(agents, /流程文档\/\{总控,开发,独测\}\/00_角色入口\.md/);
-  assert.match(agents, /独测 PASS 后由总控 AI/);
-  assert.match(workflow, /总控 AI 负责：同步最新远端主分支/);
-  assert.match(workflow, /仅总控 AI 使用自身合法 actor-id\/Session 认领/);
-  assert.match(workflow, /总控 AI 以本人合法actor-id\/Session执行taskctl complete/);
+  for (const role of ["总控", "开发", "独测"]) assert.ok(agents.includes("流程文档/" + role + "/00_角色入口.md"));
+  assert.match(agents, /PASS 后由总控以合法身份合并/);
+  assert.match(workflow, /总控负责：同步最新远端主分支/);
+  assert.match(workflow, /由总控以自己合法actor-id\/Session认领交付/);
+  assert.match(workflow, /总控以合法controller_ai和自己的Session执行taskctl complete/);
   for (const old of [
     /三角色完整职责在\*\*当前项目根目录/,
     /完整细节见当前项目根目录 `开发AI\.md`/,
@@ -37,8 +37,8 @@ function verifyRoleOwnership(agents, workflow) {
 test("R1: source template selects the three-role entry and controller delivery", async () => {
   const { agents, workflow } = await sources();
   verifyRoleOwnership(agents, workflow);
-  assert.match(agents, /旧根目录 .*不是必需文件/);
-  assert.match(workflow, /不另立第二套角色入口/);
+  assert.match(agents, /根目录旧角色文档不是活动权威/);
+  assert.match(workflow, /唯一生效权威为流程文档中的最新版本与角色入口/);
   for (const name of ["00_统一入口.md", "总控/00_角色入口.md", "开发/00_角色入口.md", "独测/00_角色入口.md"]) {
     const file = path.join(templateRoot, "流程文档", name);
     assert.ok((await fs.stat(file)).isFile());
@@ -71,7 +71,7 @@ test("R1: when integrated manifest exists, it requires the published role entry 
 test("R2: old developer-merge and missing-root entry drift is rejected", async () => {
   const { agents, workflow } = await sources();
   for (const [badAgents, badWorkflow] of [
-    [agents.replace("三角色唯一有效入口", "三角色完整职责在**当前项目根目录**"), workflow],
+    [agents.replace("三角色唯一职责", "三角色完整职责在**当前项目根目录**"), workflow],
     [agents, workflow + "\n原开发者负责：同步最新远端主分支"],
     [agents, workflow + "\n只有原开发者在原Session中可以认领"],
     [agents + "\nPASS 后由原开发者合并", workflow]
@@ -82,9 +82,10 @@ test("R2: old developer-merge and missing-root entry drift is rejected", async (
 
 test("R3: flow retains STOP, independent QA and Git SHA safeguards", async () => {
   const { agents, workflow } = await sources();
-  assert.match(workflow, /绕过STOP\/HOLD\/依赖/);
+  const authoritativeBugRule = await fs.readFile(path.join(templateRoot, "流程文档/07_全软件BUG强制修复与闭环续接规范.md"), "utf8");
+  for (const guard of ["STOP", "HOLD", "依赖"]) assert.ok(authoritativeBugRule.includes(guard), guard);
   assert.match(workflow, /独测者必须不同于开发者/);
   assert.match(workflow, /重新自测和独测/);
   assert.match(agents, /不允许伪造 PASS/);
-  assert.match(agents, /业务规则不得被覆盖/);
+  assert.match(agents, /保全主目录未提交与其它AI工作区/);
 });

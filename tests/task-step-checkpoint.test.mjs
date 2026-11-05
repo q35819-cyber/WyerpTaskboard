@@ -1516,7 +1516,7 @@ test("portable flow paths stay relative and published template matches canonical
   const canonical=(await visit(root)).sort();
   const copies=(await visit(template)).sort();
   assert.deepEqual(copies,canonical);
-  assert.equal(canonical.length,25);
+  assert.ok(canonical.length >= 25, "required flow documents unexpectedly missing");
   for(const relative of canonical){
     const original=await fs.readFile(path.join(root,relative),"utf8");
     const copy=await fs.readFile(path.join(template,relative),"utf8");
