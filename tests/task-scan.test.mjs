@@ -287,6 +287,77 @@ test("delivery candidates require a recorded non-empty real delivery action", as
   assert.match(real.reason, /真实交付动作/);
 });
 
+test("authorized QA takeover restores delivery eligibility but forged and stale proofs fail", async (t) => {
+  const fixture = await fixtureWithLedger(t);
+  const ids = ["Q-VALID", "Q-NOAUTH", "Q-BADSHA", "Q-BADSESSION", "Q-REVOKED", "Q-INVALIDATED", "Q-STALE-REV"];
+  const rows = ids.map((id) => [id, "F-QA", "bugfix", "P0", "待交付", "开发AI",
+    "—", "—", "—", "2026-10-01T00:00:00Z", "合法独测接管证据", "测试计划.md",
+    "cp/" + id + ".md", "read/" + id + ".md", "src/" + id + ".mjs", "cp/" + id + ".md"]);
+  await fs.writeFile(fixture.registryPath, registryText(rows), "utf8");
+  const store = await new TaskStore(fixture.boardRoot).init();
+  const commit = "a".repeat(40), branch = "feat/qa-takeover-fixture";
+  for (const id of ids) {
+    const allowId = "qa." + id + ".allowed";
+    const events = [
+      { operation_id: "qa." + id + ".handoff", event_type: "handoff",
+        actor_type: "developer_ai", actor_id: "dev", session_id: "dev-session",
+        old_status: "开发中", new_status: "待独测",
+        metadata: { atomicLifecycle: true, completedFromStatus: "开发中",
+          handoffTarget: "待独测", commitSha: commit, headBranch: branch } },
+      { operation_id: "qa." + id + ".q1", event_type: "claim",
+        actor_type: "test_ai", actor_id: "qa-old", session_id: "qa-old-session",
+        old_status: "待独测", new_status: "独测中", metadata: { claimedFromStatus: "待独测" } },
+      { operation_id: allowId, event_type: "takeover_allowed",
+        actor_type: "test_ai", actor_id: "qa-new", session_id: "qa-new-session",
+        old_status: "独测中", new_status: "独测中",
+        metadata: { authorizedFromStatus: "独测中", authorizedFromSessionId: "qa-old-session",
+          authorizedRegistryRevision: "c".repeat(64), authorizationScope: "task",
+          authorizationSource: "chat_user_instruction_cooperative", explicitUserOverride: true,
+          authorizationForwardedBy: "qa-new", authorizationForwardingSessionId: "qa-new-session" } },
+      { operation_id: "qa." + id + ".takeover", event_type: "takeover",
+        actor_type: "test_ai", actor_id: "qa-new", session_id: "qa-new-session",
+        old_status: "独测中", new_status: "独测中",
+        metadata: { authorizationOperationId: allowId, previousSessionId: "qa-old-session" } },
+      { operation_id: "qa." + id + ".pass", event_type: "test_result",
+        actor_type: "test_ai", actor_id: "qa-new", session_id: "qa-new-session",
+        old_status: "独测中", new_status: "待交付",
+        metadata: { atomicLifecycle: true, testResult: "pass", deliveryDisposition: "required",
+          deliveryActions: ["candidate_merge"], commitSha: commit, headBranch: branch,
+          reportPath: "reports/" + id + "/QA-PASS.md", handoffTarget: "待交付" } }
+    ];
+    if (id === "Q-NOAUTH") events.splice(2, 1);
+    if (id === "Q-BADSHA") events.at(-1).metadata.commitSha = "b".repeat(40);
+    if (id === "Q-BADSESSION") events[2].metadata.authorizedFromSessionId = "unrelated-session";
+    if (id === "Q-STALE-REV") events[2].metadata.authorizedRegistryRevision = "d".repeat(64);
+    if (id === "Q-REVOKED") events.splice(3, 0, {
+      operation_id: "qa." + id + ".revoked", event_type: "takeover_revoked",
+      actor_type: "user", actor_id: "user", session_id: "user-session",
+      old_status: "独测中", new_status: "独测中", metadata: {} });
+    if (id === "Q-INVALIDATED") events.push({
+      operation_id: "qa." + id + ".changed", event_type: "code_change",
+      actor_type: "developer_ai", actor_id: "dev", session_id: "dev-session",
+      old_status: "待交付", new_status: "待交付", metadata: {} });
+    for (const [i, event] of events.entries()) {
+      await store.events.append("fixture", {
+        ...event, project_id: "fixture", task_id: id,
+        timestamp: new Date(Date.parse("2026-10-01T00:00:00Z") + i * 1000).toISOString(),
+        registry_revision_before: ["takeover_allowed", "takeover"].includes(event.event_type) ? "c".repeat(64) : undefined,
+        registry_revision_after: event.event_type === "takeover_allowed" ? "c".repeat(64) : undefined
+      });
+    }
+  }
+  const requirementStore = await new RequirementStore(fixture.boardRoot).init();
+  const evaluator = new CandidateEvaluator(fixture.boardRoot, { taskStore: store, requirementStore });
+  const evaluated = await evaluator.evaluateProject("fixture");
+  const candidates = new Map(evaluated.candidates.map((item) => [item.task_id, item]));
+  assert.equal(candidates.get("Q-VALID").eligible, true);
+  assert.equal(candidates.get("Q-VALID").eligible_role, "controller_ai");
+  for (const id of ids.filter((item) => item !== "Q-VALID")) {
+    assert.equal(candidates.get(id)?.eligible, false, id);
+    assert.ok(candidates.get(id)?.blockers.some((text) => text.includes("独立测试PASS")), id);
+  }
+});
+
 test("scan lock prevents reentry and stale/corrupt state is recoverable", async (t) => {
   const fixture = await fixtureWithLedger(t);
   let now = Date.parse("2026-09-29T00:00:00Z");

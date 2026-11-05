@@ -1985,6 +1985,94 @@ test("legacy 待交付 requires a new controller Session, not the original devel
   assert.equal(claimed.after.sessionId, "controller-session");
 });
 
+test("authorized QA takeover PASS allows controller HTTP delivery claim while fake takeover is rejected", async (t) => {
+  const { base, secret, fixture, app } = await startFixture(t);
+  const ids = ["D-QA-VALID", "D-QA-FAKE"];
+  const rows = ids.map((id) => [id, "F-QA", "bugfix", "P0", "待交付", "总控AI",
+    "—", "—", "—", "2026-10-01T00:00:00Z", "QA takeover delivery", "plan.md",
+    "trace/" + id, "read/" + id + ".md", "src/" + id + ".mjs", "cp/" + id + ".md"]);
+  await fs.writeFile(fixture.registryPath, registryText(rows), "utf8");
+  const commit = "a".repeat(40), branch = "feat/qa-takeover-e2e";
+  async function seed(id, fake) {
+    const authOperationId = "http.qa." + id + ".authorization";
+    const events = [
+      { operation_id: "http.qa." + id + ".handoff", event_type: "handoff",
+        actor_type: "developer_ai", actor_id: "dev", session_id: "dev-session",
+        old_status: "开发中", new_status: "待独测",
+        metadata: { atomicLifecycle: true, completedFromStatus: "开发中",
+          handoffTarget: "待独测", commitSha: commit, headBranch: branch } },
+      { operation_id: "http.qa." + id + ".claim", event_type: "claim",
+        actor_type: "test_ai", actor_id: "qa-original", session_id: "qa-original-session",
+        old_status: "待独测", new_status: "独测中", metadata: { claimedFromStatus: "待独测" } },
+      { operation_id: authOperationId, event_type: "takeover_allowed",
+        actor_type: "test_ai", actor_id: "qa-replacement", session_id: "qa-replacement-session",
+        old_status: "独测中", new_status: "独测中",
+        metadata: { authorizedFromStatus: "独测中", authorizedFromSessionId: "qa-original-session",
+          authorizedRegistryRevision: "c".repeat(64), authorizationScope: "task",
+          authorizationSource: "chat_user_instruction_cooperative",
+          explicitUserOverride: !fake, authorizationForwardedBy: "qa-replacement",
+          authorizationForwardingSessionId: "qa-replacement-session" } },
+      { operation_id: "http.qa." + id + ".takeover", event_type: "takeover",
+        actor_type: "test_ai", actor_id: "qa-replacement", session_id: "qa-replacement-session",
+        old_status: "独测中", new_status: "独测中",
+        metadata: { authorizationOperationId: authOperationId,
+          previousSessionId: "qa-original-session" } },
+      { operation_id: "http.qa." + id + ".pass", event_type: "test_result",
+        actor_type: "test_ai", actor_id: "qa-replacement", session_id: "qa-replacement-session",
+        old_status: "独测中", new_status: "待交付",
+        metadata: { atomicLifecycle: true, testResult: "pass", deliveryDisposition: "required",
+          deliveryActions: ["candidate_merge"], commitSha: commit, headBranch: branch,
+          reportPath: "reports/" + id + "/QA-PASS.md", handoffTarget: "待交付" } }
+    ];
+    for (const [i, event] of events.entries()) {
+      await app.taskStore.events.append("fixture", {
+        ...event, project_id: "fixture", task_id: id,
+        timestamp: new Date(Date.parse("2026-10-01T00:00:00Z") + i * 1000).toISOString(),
+        registry_revision_before: ["takeover_allowed", "takeover"].includes(event.event_type) ? "c".repeat(64) : undefined,
+        registry_revision_after: event.event_type === "takeover_allowed" ? "c".repeat(64) : undefined
+      });
+    }
+  }
+  await seed(ids[0], false);
+  await seed(ids[1], true);
+  const headers = { Authorization: "Bearer " + secret, "Content-Type": "application/json" };
+  for (const [i, id] of ids.entries()) {
+    const actorId = "controller-" + i, sessionId = "controller-session-" + i;
+    await recordPreclaim(base, secret, id, { actorType: "controller_ai", actorId, sessionId });
+    const before = await (await fetch(base + "/api/projects/fixture/tasks/" + id, { headers })).json();
+    const response = await fetch(base + "/api/projects/fixture/tasks/" + id + "/claim", {
+      method: "POST", headers,
+      body: JSON.stringify({
+        operationId: "http.qa." + id + ".delivery.claim",
+        expectedRevision: before.registryRevision, actorType: "controller_ai",
+        actorId, sessionId, assignee: actorId, sessionWindowName: sessionId
+      })
+    });
+    const body = await response.json();
+    if (i === 0) {
+      assert.equal(response.status, 200, JSON.stringify(body));
+      assert.equal(body.after.status, "交付中");
+      const current = await app.taskStore.getTask("fixture", id);
+      await assert.rejects(
+        app.taskStore.updateTask("fixture", id, { status: "已完成" }, {
+          expectedRevision: current.snapshot.registryRevision,
+          operationId: "http.qa." + id + ".completion.probe",
+          eventType: "delivery_complete", actorType: "controller_ai",
+          actorId, sessionId, metadata: {}
+        }),
+        (error) => {
+          assert.equal(error.code, "DELIVERY_REMOTE_UNAVAILABLE",
+            "valid Q2 proof must pass final test-independence gate and reach remote Git verification");
+          return true;
+        }
+      );
+    } else {
+      assert.equal(response.status, 409);
+      assert.equal(body.error.code, "DELIVERY_INDEPENDENT_PASS_REQUIRED");
+    }
+  }
+});
+
 test("delivery failure endpoint records the blocker and retains controller ownership", async (t) => {
   const { base, secret, fixture } = await startFixture(t);
   const { cookie } = await login(base, secret);
