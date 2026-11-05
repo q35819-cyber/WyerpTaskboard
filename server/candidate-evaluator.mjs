@@ -129,11 +129,28 @@ export function latestAuthorizedTestExecution(history, result) {
   const handoff = [...prior].reverse().find((event) =>
     event.event_type === "handoff" && event.actor_type === "developer_ai" &&
     ["开发中", "修复中"].includes(event.metadata?.completedFromStatus));
-  if (!handoff || prior.indexOf(handoff) >= authorizationIndex ||
-    !/^[a-f0-9]{40}$/i.test(String(handoff.metadata?.commitSha || "")) ||
-    handoff.metadata.commitSha !== result.metadata?.commitSha ||
-    handoff.metadata.headBranch !== result.metadata?.headBranch ||
-    !String(result.metadata?.reportPath || "").trim()) return null;
+  const handoffIndex = prior.indexOf(handoff);
+  const directCandidate = /^[a-f0-9]{40}$/i.test(String(handoff?.metadata?.commitSha || ""))
+    && handoff.metadata.commitSha === result.metadata?.commitSha
+    && handoff.metadata.headBranch === result.metadata?.headBranch;
+  const published = handoff && [...prior.slice(0, handoffIndex)].reverse().find((event) =>
+    event.event_type === "code_published" && event.actor_type === "developer_ai"
+    && event.actor_id === handoff.actor_id && event.session_id === handoff.session_id);
+  // Legacy handoff has no Git fields: bind Q2 to the developer's earlier verified publication.
+  const legacyCandidate = !handoff?.metadata?.commitSha && !handoff?.metadata?.headBranch
+    && published?.metadata?.remoteVerified === true
+    && /^[a-f0-9]{40}$/i.test(String(published.metadata.commitSha || ""))
+    && published.metadata.commitSha === result.metadata?.commitSha
+    && published.metadata.branch === result.metadata?.headBranch
+    && /^[A-Za-z0-9][A-Za-z0-9._/-]{0,190}$/.test(String(published.metadata.branch || ""))
+    && !published.metadata.branch.includes("..")
+    && /^[a-f0-9]{64}$/i.test(String(published.metadata.reportSha256 || ""))
+    && Boolean(String(published.metadata.reportPath || "").trim())
+    && handoff.metadata?.atomicLifecycle === true
+    && !prior.slice(prior.indexOf(published) + 1).some((event) =>
+      event.event_type === "code_change" || event.metadata?.invalidatesTestEvidence === true);
+  if (!handoff || handoffIndex >= authorizationIndex || !String(result.metadata?.reportPath || "").trim()
+    || (!directCandidate && !legacyCandidate)) return null;
   return execution;
 }
 export function deliveryEvidence(history, workflow) {
