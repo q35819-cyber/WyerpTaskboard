@@ -4,9 +4,28 @@ import fs from "node:fs/promises";
 import { createTaskboardServer } from "../server/http-server.mjs";
 import { makeFixture } from "./helpers.mjs";
 
-async function startFixture(t) {
+async function startFixture(t, { failed = false } = {}) {
   const fixture = await makeFixture();
+  if (failed) {
+    const registry = await fs.readFile(fixture.registryPath, "utf8");
+    const from = "| 开发中 | 开发AI | worker | B-10窗口 | wc_sess_test |";
+    assert.ok(registry.includes(from));
+    await fs.writeFile(fixture.registryPath,
+      registry.replace(from, "| 测试失败待修复 | 开发AI | — | — | — |"), "utf8");
+  }
   const app = await createTaskboardServer({ rootDir: fixture.boardRoot, host: "127.0.0.1", port: 0 });
+  if (failed) {
+    await app.taskStore.appendTaskEvent("fixture", "B-10", {
+      operationId: "fixture.original.dev.01", eventType: "claim",
+      actorType: "developer_ai", actorId: "original-dev", sessionId: "wc_sess_original",
+      sessionWindowName: "原开发窗口", note: "fixture original developer"
+    });
+    await app.taskStore.appendTaskEvent("fixture", "B-10", {
+      operationId: "fixture.independent.qa.01", eventType: "test_result",
+      actorType: "test_ai", actorId: "independent-qa", sessionId: "wc_sess_qa",
+      note: "QA FAIL", metadata: { testResult: "fail", reportPath: "reports/B-10/report.md" }
+    });
+  }
   await new Promise((resolve, reject) => {
     app.server.once("error", reject);
     app.server.listen(0, "127.0.0.1", resolve);
@@ -26,6 +45,70 @@ async function startFixture(t) {
     bearerHeaders: { Authorization: "Bearer " + auth.adminSecret, "Content-Type": "application/json" }
   };
 }
+
+test("user-authorized takeover restarts a released QA FAIL in a new developer session", async (t) => {
+  const fx = await startFixture(t, { failed: true });
+  const path = fx.base + "/api/projects/fixture/tasks/B-10/takeover";
+  const who = { actorType: "developer_ai", actorId: "new-developer",
+    sessionId: "wc_sess_new", sessionWindowName: "修复窗口" };
+  const denial = await fetch(path + "/allow", {
+    method: "POST", headers: fx.bearerHeaders,
+    body: JSON.stringify({ operationId: "fail.allow.denied", ...who, note: "无用户授权" })
+  });
+  assert.equal(denial.status, 403);
+
+  const scoped = { source: "direct_user_message", projectId: "fixture", taskId: "B-10",
+    scope: "task", quote: "修这个测试失败的，先检查一下最近改动的时间，确实有开发在做就算了，没有开发在做，你就按异常接管" };
+  const blockedQuote = await fetch(path + "/allow", {
+    method: "POST", headers: fx.bearerHeaders,
+    body: JSON.stringify({ operationId: "fail.allow.negative", ...who,
+      note: "不允许接管", chatAuthorization: { ...scoped, quote: "现在不要按异常接管" } })
+  });
+  assert.equal(blockedQuote.status, 403);
+
+  const allowed = await fetch(path + "/allow", {
+    method: "POST", headers: fx.bearerHeaders,
+    body: JSON.stringify({ operationId: "fail.allow.valid", ...who, note: "用户已确认原开发无活动",
+      chatAuthorization: scoped })
+  });
+  assert.equal(allowed.status, 200);
+  const task = await (await fetch(fx.base + "/api/projects/fixture/tasks/B-10", {
+    headers: fx.bearerHeaders
+  })).json();
+  assert.equal(task.status, "测试失败待修复");
+
+  const take = (operationId, overrides = {}) => fetch(path, {
+    method: "POST", headers: fx.bearerHeaders,
+    body: JSON.stringify({ operationId, expectedRevision: task.registryRevision,
+      assignee: "新开发", ...who, previousWorktree: "worktrees/original",
+      nextWorktree: "worktrees/new", liveInspection: "确认原工作区干净、无相关活动Job",
+      ...overrides })
+  });
+  const missingEvidence = await take("fail.execute.missing", { previousWorktree: "" });
+  assert.equal(missingEvidence.status, 400);
+  assert.equal((await missingEvidence.json()).error.code, "TAKEOVER_WORKTREE_EVIDENCE_REQUIRED");
+  const originalIdentity = await take("fail.execute.original", { actorId: "original-dev" });
+  assert.equal(originalIdentity.status, 409);
+  assert.equal((await originalIdentity.json()).error.code, "TAKEOVER_NEW_IDENTITY_REQUIRED");
+  const taken = await take("fail.execute.valid");
+  assert.equal(taken.status, 200);
+  assert.equal((await taken.json()).requiresIndependentRetest, true);
+  const after = await (await fetch(fx.base + "/api/projects/fixture/tasks/B-10", {
+    headers: fx.bearerHeaders
+  })).json();
+  assert.equal(after.status, "修复中");
+  assert.equal(after.sessionId, who.sessionId);
+  const history = (await (await fetch(path.replace("/takeover", "/history"), {
+    headers: fx.bearerHeaders
+  })).json()).events;
+  assert.ok(history.some((e) => e.event_type === "test_result"
+    && e.actor_id === "independent-qa" && e.metadata?.testResult === "fail"));
+  const handoff = history.findLast((e) => e.event_type === "takeover");
+  assert.equal(handoff.metadata.originalDeveloperActorId, "original-dev");
+  assert.equal(handoff.metadata.qaFailureEventId,
+    history.find((e) => e.event_type === "test_result").event_id);
+  assert.equal((await take("fail.execute.replay")).status, 409);
+});
 
 test("takeover needs explicit user authorization and preserves execution status", async (t) => {
   const fx = await startFixture(t);
