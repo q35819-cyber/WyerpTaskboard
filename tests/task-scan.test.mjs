@@ -154,9 +154,12 @@ test("machine-proven current-round auto-unblocked BUG outranks other BUG and new
   const bugIds = eligibleDevelopers.filter((item) => item.track === "bugfix").map((item) => item.task_id);
   const productIds = eligibleDevelopers.filter((item) => item.track !== "bugfix").map((item) => item.task_id);
   assert.ok(bugIds.length >= 4);
-  assert.ok(productIds.length >= 2);
-  assert.ok(eligibleDevelopers.findIndex((item) => item.task_id === bugIds.at(-1)) <
-    eligibleDevelopers.findIndex((item) => item.task_id === productIds[0]), "all eligible bugs precede product tasks");
+  assert.equal(productIds.length, 0, "ordinary new claims must wait while P0 BUGs are claimable");
+  for (const id of ["PRODUCT-RESTORE", "NEW-PRODUCT"]) {
+    const product = list.find((item) => item.task_id === id);
+    assert.equal(product.eligible, false);
+    assert.match(product.reason, /P0 BUG/);
+  }
   assert.equal(list.find((item) => item.task_id === "BLOCKED-BUG").eligible, false);
   assert.deepEqual(list.filter((item) => item.eligible_role === "test_ai")
     .map((item) => item.status), ["待复测", "待独测"], "QA queue unchanged");
@@ -783,4 +786,43 @@ test("unrelated registry changes keep detection_id stable and refresh recheck tr
   assert.notEqual(second.registry_revision, firstRevision);
   const recheck = await new CandidateEvaluator(fixture.boardRoot, { taskStore, requirementStore }).recheck(second);
   assert.equal(recheck.stale, false);
+});
+
+test("ready candidates show claimable P0 BUG before new ordinary work and unblock after STOP", async (t) => {
+  const f = await fixtureWithLedger(t);
+  const row = (id, track, status = "待开发") => [
+    id, "F-PRIORITY", track, "P0", status, "开发AI", "—", "—", "—", "—",
+    "priority", "plan.md", "trace/" + id, "",
+    "src/" + id + ".js", "cp/" + id + ".md"
+  ];
+  await fs.writeFile(f.registryPath, registryText([
+    row("NORMAL-10", "product"), row("BUG-10", "bugfix")
+  ]), "utf8");
+  const store = await new TaskStore(f.boardRoot).init();
+  const requirements = await new RequirementStore(f.boardRoot).init();
+  const evaluator = new CandidateEvaluator(f.boardRoot, { taskStore: store, requirementStore: requirements });
+  const before = await evaluator.evaluateProject("fixture");
+  assert.equal(before.candidates.find((x) => x.task_id === "BUG-10").eligible, true);
+  const ordinary = before.candidates.find((x) => x.task_id === "NORMAL-10");
+  assert.equal(ordinary.eligible, false);
+  assert.match(ordinary.reason, /BUG-10/);
+  await store.appendTaskEvent("fixture", "NORMAL-10", {
+    operationId: "priority.scan.user.urgent", eventType: "priority_change",
+    actorType: "user", actorId: "owner", sessionId: "user", metadata: { urgent: true }
+  });
+  assert.equal((await evaluator.evaluateProject("fixture")).candidates
+    .find((x) => x.task_id === "NORMAL-10").eligible, true);
+  await store.appendTaskEvent("fixture", "NORMAL-10", {
+    operationId: "priority.scan.user.revoke", eventType: "priority_change",
+    actorType: "user", actorId: "owner", sessionId: "user", metadata: { urgent: false }
+  });
+  assert.equal((await evaluator.evaluateProject("fixture")).candidates
+    .find((x) => x.task_id === "NORMAL-10").eligible, false);
+  await store.appendTaskEvent("fixture", "BUG-10", {
+    operationId: "priority.scan.stop", eventType: "stop_request",
+    actorType: "user", actorId: "user", sessionId: "user"
+  });
+  const after = await evaluator.evaluateProject("fixture");
+  assert.equal(after.candidates.find((x) => x.task_id === "BUG-10").eligible, false);
+  assert.equal(after.candidates.find((x) => x.task_id === "NORMAL-10").eligible, true);
 });
