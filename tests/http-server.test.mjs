@@ -1561,7 +1561,7 @@ test("task-scan status endpoint reports scheduler and candidate summary", async 
         expires_at: "2099-09-29T00:30:00.000Z", consumed_at: null, stale_at: null,
         project_id: "fixture", task_id: "QA-ONLY", track: "product", priority: "P0",
         status: "待复测", planned_role: "独立测试AI", eligible_role: "test_ai",
-        eligible: false, blockers: ["独测待办"], reason: "待独测", dedupe_key: "qa"
+        eligible: true, blockers: [], reason: "待独测", dedupe_key: "qa"
       }
     }
   }, null, 2), "utf8");
@@ -1589,6 +1589,10 @@ test("task-scan status endpoint reports scheduler and candidate summary", async 
   assert.equal(body.developerCandidates[0].eligible, true);
   assert.equal(body.developerCandidates[0].originalDeveloperActorId, null);
   assert.ok(!body.developerCandidates.some(x => ["DEL-ONLY","QA-ONLY"].includes(x.taskId)));
+  assert.equal(body.qaCandidates.length,1);
+  assert.equal(body.qaCandidates[0].taskId,"QA-ONLY");
+  assert.equal(body.qaCandidates[0].eligible,false,"scanner alone cannot qualify QA without developer evidence");
+  assert.equal(body.qaCandidates[0].evidenceVerified,false);
 });
 
 
