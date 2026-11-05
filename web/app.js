@@ -5,14 +5,14 @@ const PAGE_SIZE=3;
 const USER_MESSAGE_PAGE_SIZE=3;
 const DELIVERY_USER_COLUMN_LABEL="待交付 / 待用户";
 const state={
-  projects:[],projectId:null,workflow:null,snapshot:null,filtered:[],requirements:[],scanStatus:null,projectServiceStatus:null,
+  projects:[],projectId:null,workflow:null,snapshot:null,filtered:[],requirements:[],scanStatus:null,projectServiceStatus:null,globalQa:null,qaLoadEpoch:0,
   selectedTask:null,selectedTaskProjectId:null,projectEpoch:0,projectLoadEpoch:0,projectsLoadEpoch:0,detailEpoch:0,planEpoch:0,view:"board",columnPages:{},userMessages:[],userMessagePage:1
 };
 const $=id=>document.getElementById(id);
 const els=Object.fromEntries([
   "toast","appView","projectSelect","addRequirementBtn","requirementDialog","requirementForm","requirementText","closeRequirementDialogBtn","reloadRequirementsBtn","requirementList","addProjectBtn","removeProjectBtn","adaptProjectBtn","addProjectDialog",
   "addProjectForm","closeAddProjectBtn","cancelAddProjectBtn","projectRootInput","projectNameInput","projectIdInput",
-  "projectRegistryInput","refreshBtn","aiSettingsBtn","aiSettingsDialog","aiSettingsForm","closeAiSettingsBtn","cancelAiSettingsBtn","developerModel","developerReasoning","testModel","testReasoning","scanIntervalMinutes","maxRequestsPerChat","contextWarningAt","timeoutRetryLimit","anomalyWindowMinutes","anomalyLimit","roleSwitchLimit","appVersion","projectHealth","projectService","projectServiceStatus","projectStartRestartBtn","projectStopServiceBtn","scanStatus","summary","searchInput","planFilter","trackFilter",
+  "projectRegistryInput","globalQaSummary","globalQaList","refreshBtn","aiSettingsBtn","aiSettingsDialog","aiSettingsForm","closeAiSettingsBtn","cancelAiSettingsBtn","developerModel","developerReasoning","testModel","testReasoning","scanIntervalMinutes","maxRequestsPerChat","contextWarningAt","timeoutRetryLimit","anomalyWindowMinutes","anomalyLimit","roleSwitchLimit","appVersion","projectHealth","projectService","projectServiceStatus","projectStartRestartBtn","projectStopServiceBtn","scanStatus","summary","searchInput","planFilter","trackFilter",
   "priorityFilter","statusFilter","archiveFilter","boardViewBtn","listViewBtn","boardView","listView","taskTableBody",
   "planDialog","planDialogTitle","planDialogPath","planNavigator","planLocationStatus","planIndexList","planDocumentContent","closePlanDialogBtn",
   "taskDialog","closeDialogBtn","detailTaskId","detailTitle","userMessagePanel","userMessageCount","userMessageList",
@@ -159,6 +159,44 @@ async function loadProjects(){
   if(els.adaptProjectBtn)els.adaptProjectBtn.hidden=selected?.onboardingStatus!=="adaptation_required";
   if(els.removeProjectBtn)els.removeProjectBtn.disabled=!state.projectId;
   return true;
+}
+// Read-only: never infer a candidate SHA from a different task or another project.
+function qaCandidateSha(events){
+  const handoff=[...(events||[])].reverse().find(e=>e.event_type==="handoff"&&e.actor_type==="developer_ai");
+  const sha=handoff?.metadata?.commitSha;
+  return /^[a-f0-9]{40}$/i.test(String(sha||""))?sha:"待核验";
+}
+async function loadGlobalQaQueue(){
+  const request=++state.qaLoadEpoch,projects=state.projects.slice();
+  const results=await Promise.all(projects.map(async project=>{
+    try{
+      if(!healthOk(project.health))throw new Error("项目不可用");
+      const snapshot=await api("/api/projects/"+encodeURIComponent(project.id)+"/tasks");
+      const tasks=snapshot.tasks||[];
+      const waiting=tasks.filter(t=>["待独测","待复测"].includes(t.status));
+      const running=tasks.filter(t=>["独测中","复测中"].includes(t.status));
+      const pending=await Promise.all(waiting.map(async task=>{
+        try{
+          const history=await api("/api/projects/"+encodeURIComponent(project.id)+"/tasks/"+encodeURIComponent(task.id)+"/history?limit=200");
+          return {projectId:project.id,taskId:task.id,status:task.status,sha:qaCandidateSha(history.events)};
+        }catch{return {projectId:project.id,taskId:task.id,status:task.status,sha:"读取失败"};}
+      }));
+      return {projectId:project.id,pending,running:running.map(t=>({projectId:project.id,taskId:t.id,status:t.status,assignee:t.assignee||"未登记",session:t.sessionId||"未登记"}))};
+    }catch(error){return {projectId:project.id,error:error.message,pending:[],running:[]};}
+  }));
+  if(request!==state.qaLoadEpoch)return;
+  state.globalQa=results;renderGlobalQaQueue();
+}
+function renderGlobalQaQueue(){
+  if(!els.globalQaSummary||!els.globalQaList)return;
+  const results=state.globalQa||[],waiting=results.flatMap(x=>x.pending),running=results.flatMap(x=>x.running),errors=results.filter(x=>x.error);
+  els.globalQaSummary.textContent="已注册项目 "+results.length+" · 待独测/待复测 "+waiting.length+" · 测试占用 "+running.length+(running.length>1?"（警告：全局存在多个独测占用）":"")+(errors.length?" · "+errors.length+" 个项目不可读取":"");
+  const rows=[];
+  for(const task of waiting)rows.push("待测 · "+task.projectId+" / "+task.taskId+" · "+task.status+" · 候选SHA："+task.sha);
+  for(const task of running)rows.push("独测占用 · "+task.projectId+" / "+task.taskId+" · "+task.status+" · "+task.assignee+" · Session："+task.session);
+  for(const item of errors)rows.push("项目 "+item.projectId+" 读取失败："+item.error);
+  if(!rows.length)rows.push("当前没有正式待独测任务或独测占用");
+  els.globalQaList.replaceChildren(...rows.map(value=>{const div=document.createElement("div");div.className="task-user-assistance";div.textContent=value;return div;}));
 }
 async function loadScanStatus(){
   try{state.scanStatus=await api("/api/task-scan/status")}catch{state.scanStatus=null}
@@ -504,6 +542,7 @@ async function refreshAll(message=null){
     if(await loadProjects()===false)return;
     if(await loadProject()===false)return;
     await loadProjectServiceStatus();
+    await loadGlobalQaQueue();
     if(message)toast(message);
   }catch(error){toast(error.message,true)}
 }
