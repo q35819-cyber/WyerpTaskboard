@@ -39,6 +39,85 @@ async function block(store, id, conditions) {
 }
 const status = async (store, id) => (await store.getTask("fixture", id)).task.status;
 
+async function blockedD01(t, { dependency = "", fakeActor = false, earlierDispatch = false } = {}) {
+  const f = await setup(t, [row("A-10", "开发中", {
+    owner: "developer", session: "dev-session", dependencies: dependency
+  }), row("B-10", "已完成")]);
+  if (earlierDispatch) await f.store.appendTaskEvent("fixture", "A-10", {
+    operationId: "d01.earlier.dispatch." + (++sequence), eventType: "controller_dispatch",
+    actorType: "controller_ai", actorId: "controller", sessionId: "ctrl-session"
+  });
+  await change(f.store, "A-10", { status: "开发中", assignee: "developer",
+    sessionWindowName: "developer", sessionId: "dev-session" },
+  "claim", {}, "developer_ai", "dev-session");
+  const blocked = await change(f.store, "A-10", {
+    status: "阻断", assignee: "", sessionId: "", sessionWindowName: ""
+  }, "developer_d01_missing_controller_dispatch_block", {}, fakeActor ? "system" : "developer_ai",
+  "dev-session");
+  return { ...f, blocked };
+}
+
+async function dispatchD01(store, actorType = "controller_ai") {
+  return store.appendTaskEvent("fixture", "A-10", {
+    operationId: "d01.new.dispatch." + (++sequence), eventType: "controller_dispatch",
+    actorType, actorId: "controller", sessionId: "ctrl-session",
+    note: "新一轮真实派工，不能回填旧claim"
+  });
+}
+
+test("D01 missing-dispatch block recovers only after a new authentic controller dispatch", async (t) => {
+  const { store, evaluator, blocked } = await blockedD01(t);
+  await evaluator.evaluateProject("fixture");
+  assert.equal(await status(store, "A-10"), "阻断");
+  const freshDispatch = await dispatchD01(store);
+  const [first, second] = await Promise.all([
+    evaluator.evaluateProject("fixture"), evaluator.evaluateProject("fixture")
+  ]);
+  assert.equal(await status(store, "A-10"), "待开发");
+  assert.ok(first.candidates.find(x => x.task_id === "A-10") || second.candidates.find(x => x.task_id === "A-10"));
+  await evaluator.evaluateProject("fixture");
+  const history = await store.taskHistory("fixture", "A-10", { all: true });
+  const unblocks = history.filter(x => x.event_type === "auto_unblock");
+  assert.equal(unblocks.length, 1);
+  assert.equal(unblocks[0].actor_type, "system");
+  assert.equal(unblocks[0].metadata.blockedEventId, blocked.eventId);
+  assert.equal(unblocks[0].metadata.restoreStatus, "待开发");
+  assert.equal((await store.transactions.read(unblocks[0].operation_id))?.state, "committed");
+  const oldClaim = history.find(x => x.event_type === "claim");
+  assert.ok(history.findIndex(x => x.event_id === oldClaim.event_id)
+    < history.findIndex(x => x.event_id === freshDispatch.event.event_id));
+  assert.equal(history.filter(x => x.event_type === "claim").length, 1,
+    "auto restore must not fabricate a retroactive claim");
+});
+
+test("D01 block never auto-recovers with fake dispatch, old dispatch or wrong block actor", async (t) => {
+  for (const options of [{ earlierDispatch: true }, { fakeActor: true }, {}]) {
+    const { store, evaluator } = await blockedD01(t, options);
+    if (!options.earlierDispatch) await dispatchD01(store, options.fakeActor ? "developer_ai" : "developer_ai");
+    await evaluator.evaluateProject("fixture");
+    assert.equal(await status(store, "A-10"), "阻断");
+    assert.equal((await store.taskHistory("fixture", "A-10", { all: true }))
+      .filter(x => x.event_type === "auto_unblock").length, 0);
+  }
+});
+
+test("D01 automatic recovery preserves STOP and unresolved user message", async (t) => {
+  for (const flag of ["stop", "message"]) {
+    const { store, evaluator } = await blockedD01(t);
+    await dispatchD01(store);
+    if (flag === "stop") await store.appendTaskEvent("fixture", "A-10", {
+      operationId: "d01.stop." + (++sequence), eventType: "stop_request",
+      actorType: "user", note: "用户阻止自动重开"
+    });
+    if (flag === "message") await store.appendTaskEvent("fixture", "A-10", {
+      operationId: "d01.user." + (++sequence), eventType: "user_review",
+      actorType: "user", note: "请先答复这个未处理的问题"
+    });
+    await evaluator.evaluateProject("fixture");
+    assert.equal(await status(store, "A-10"), "阻断");
+  }
+});
+
 test("prepared developer is restored to ready only after every real hard prerequisite is complete", async (t) => {
   const { store, evaluator } = await setup(t, [
     row("A-10", "待准备", { dependencies: "B-10完成;C-10完成" }),
