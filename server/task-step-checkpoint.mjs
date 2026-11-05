@@ -335,10 +335,35 @@ export class TaskStepCheckpoint {
             && r.stepId === "D08_HANDOFF" && r.result === "PASS")
             && state.records.some((r) => r.attempt === state.attempts
               && r.stepId === "Q03_RESULT" && r.result === "PASS" && r.verdict === "pass");
+          const autoIndex = history.findLastIndex((e, index) => index < currentClaimIndex
+            && e.event_type === "auto_unblock" && e.actor_type === "system"
+            && e.actor_id === "task-scan" && e.old_status === "阻断"
+            && e.new_status === "待开发" && e.metadata?.restoreStatus === "待开发");
+          const restore = history[autoIndex];
+          const reblockIndex = history.findIndex((e) =>
+            e.event_id === restore?.metadata?.blockedEventId);
+          const reblock = history[reblockIndex];
+          const journal = restore && await this.taskStore.transactions.read(restore.operation_id);
+          const trustedRestore = reblockIndex > history.indexOf(oldClaim)
+            && autoIndex > reblockIndex && dispatchIndex > reblockIndex
+            && reblock?.event_type === "developer_step_cursor_blocked"
+            && reblock.old_status === "开发中" && reblock.new_status === "阻断"
+            && reblock.actor_type === "developer_ai"
+            && history.findLastIndex((e, i) => i < currentClaimIndex
+              && e.old_status !== "阻断" && e.new_status === "阻断") === reblockIndex
+            && history.some((e, i) => i > autoIndex && i < currentClaimIndex
+              && e.event_type === "preclaim_report" && e.actor_type === "developer_ai"
+              && e.actor_id === actorId && e.session_id === sessionId
+              && e.metadata?.taskStatus === "待开发")
+            && journal?.state === "committed"
+            && journal.projectId === projectId && journal.taskId === taskId
+            && journal.eventId === restore.event_id
+            && journal.result?.eventId === restore.event_id;
           if (oldClaim && oldClaim.actor_id !== actorId && oldClaim.session_id !== sessionId
-            && previousPass && qaResult?.metadata?.atomicLifecycle === true
-            && qaResult.metadata.testResult === "pass"
-            && dispatchIndex > qaResultIndex && qaResultIndex > history.indexOf(oldClaim)) {
+            && ((previousPass && qaResult?.metadata?.atomicLifecycle === true
+              && qaResult.metadata.testResult === "pass"
+              && dispatchIndex > qaResultIndex && qaResultIndex > history.indexOf(oldClaim))
+              || trustedRestore)) {
             state.attempts += 1;
             state.cursors.developer_ai = "D01_CLAIM";
             state.cursors.test_ai = "Q01_ADMISSION";

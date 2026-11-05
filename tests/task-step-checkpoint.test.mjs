@@ -1763,3 +1763,103 @@ test("v2 real QA PASS plus new controller delivery claim reopens C00 then gates 
   }), (error) => error.code === "CHECKPOINT_FORMAL_EVENT_REQUIRED");
   assert.equal((await cp.show("fixture", "A-10")).sha256, beforeClose.sha256);
 });
+
+
+async function autoUnblockedLegacyD09(t, { dispatch = true, forged = false, stop = false } = {}) {
+  const { cp, taskStore, newActor: oldActor, newSession: oldSession } =
+    await legacyD09Restart(t, { dispatch: false });
+  const update = async (patch, eventType, actorType, actorId, sessionId, metadata = {}) =>
+    taskStore.updateTask("fixture", "A-10", patch, {
+      operationId: "fixture.auto-reblock." + String(sequence++).padStart(8, "0"),
+      expectedRevision: (await taskStore.snapshot("fixture")).registryRevision,
+      eventType, actorType, actorId, sessionId, metadata
+    });
+  const prior = await cp.show("fixture", "A-10");
+  const blocked = await update({
+    status: "阻断", assignee: "", sessionId: "", sessionWindowName: ""
+  }, "developer_step_cursor_blocked", "developer_ai", "taskctl", "");
+  if (dispatch) await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.auto-reblock.dispatch." + sequence++,
+    eventType: "controller_dispatch", actorType: "controller_ai",
+    actorId: "controller", sessionId: "controller.session"
+  });
+  // Match the committed scanner transaction shape without bypassing TaskStore's restore guard.
+  await update({ status: "待开发", plannedRole: "开发AI" },
+    "controller_restore_development", "controller_ai", "controller", "controller.session");
+  const autoOp = "fixture.auto-reblock.journal." + sequence++;
+  const auto = (await taskStore.events.append("fixture", {
+    operation_id: autoOp, project_id: "fixture", task_id: "A-10",
+    event_type: "auto_unblock", actor_type: "system", actor_id: "task-scan",
+    timestamp: new Date().toISOString(), old_status: "阻断", new_status: "待开发",
+    metadata: { blockedEventId: blocked.eventId, restoreStatus: "待开发" }
+  })).event;
+  if (!forged) {
+    await taskStore.transactions.prepare({
+      operationId: autoOp, projectId: "fixture", taskId: "A-10",
+      event: auto, expectedRevision: "fixture"
+    });
+    await taskStore.transactions.phase(autoOp, "committed", {
+      eventId: auto.event_id, result: { eventId: auto.event_id }
+    });
+  }
+  const actorId = "fresh-dev", sessionId = "fresh-dev.session";
+  await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.auto-reblock.preclaim." + sequence++,
+    eventType: "preclaim_report", actorType: "developer_ai", actorId, sessionId,
+    metadata: { taskStatus: "待开发" }
+  });
+  const claim = await update({
+    status: "开发中", assignee: "fresh-dev", sessionId,
+    sessionWindowName: "fresh-dev"
+  }, "claim", "developer_ai", actorId, sessionId);
+  if (stop) await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.auto-reblock.stop." + sequence++,
+    eventType: "stop_request", actorType: "user", note: "pause"
+  });
+  return { cp, taskStore, prior, claim, actorId, sessionId, oldActor, oldSession };
+}
+
+test("journal-backed auto_unblock repairs legacy D09 reblock with fresh dispatch, claim and D01", async t => {
+  const x = await autoUnblockedLegacyD09(t);
+  const resumed = await step(x.cp, "developer_ai", "D01_CLAIM", {
+    eventId: x.claim.eventId, actorId: x.actorId, sessionId: x.sessionId
+  });
+  assert.equal(resumed.state.attempts, x.prior.state.attempts + 1);
+  assert.equal(resumed.state.cursors.developer_ai, "D02_WORKTREE");
+  assert.equal(resumed.state.cursors.test_ai, "Q01_ADMISSION");
+  assert.ok(resumed.state.records.some(r => r.attempt === x.prior.state.attempts
+    && r.stepId === "D08_HANDOFF" && r.result === "PASS"));
+  assert.equal(resumed.state.records.filter(r => r.stepId === "D01_CLAIM"
+    && r.eventId === x.claim.eventId).length, 1);
+  await assert.rejects(step(x.cp, "developer_ai", "D01_CLAIM", {
+    eventId: x.claim.eventId, actorId: x.oldActor, sessionId: x.oldSession
+  }), e => ["CHECKPOINT_STEP_ORDER", "CHECKPOINT_SESSION_MISMATCH"].includes(e.code));
+});
+
+test("reblocked D09 rejects uncommitted auto_unblock and STOP without changing history", async t => {
+  const x = await autoUnblockedLegacyD09(t, { forged: true });
+  const rejectsUnchanged = async () => {
+    const before = await x.cp.show("fixture", "A-10");
+    await assert.rejects(step(x.cp, "developer_ai", "D01_CLAIM", {
+      eventId: x.claim.eventId, actorId: x.actorId, sessionId: x.sessionId
+    }), e => e.code === "CHECKPOINT_STEP_ORDER");
+    const after = await x.cp.show("fixture", "A-10");
+    assert.equal(after.sha256, before.sha256);
+    assert.equal(after.state.cursors.developer_ai, "D09_MERGE_MAIN");
+  };
+  await rejectsUnchanged(); // An event alone cannot replace a committed scanner transaction.
+  const events = await x.taskStore.taskHistory("fixture", "A-10", { all: true });
+  const auto = events.findLast(e => e.event_type === "auto_unblock");
+  await x.taskStore.transactions.prepare({
+    operationId: auto.operation_id, projectId: "fixture", taskId: "A-10",
+    event: auto, expectedRevision: "fixture"
+  });
+  await x.taskStore.transactions.phase(auto.operation_id, "committed", {
+    eventId: auto.event_id, result: { eventId: auto.event_id }
+  });
+  await x.taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.auto-reblock.stop." + sequence++,
+    eventType: "stop_request", actorType: "user", note: "pause"
+  });
+  await rejectsUnchanged(); // A now-committed event still cannot override STOP.
+});
