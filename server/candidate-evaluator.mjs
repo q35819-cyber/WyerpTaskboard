@@ -92,20 +92,63 @@ export async function provisionalClaimAuthorization(store, projectId, task, task
   return null;
 }
 
+// The Q2 tester may replace Q1 only with a consumed, task-scoped user authorization.
+export function latestAuthorizedTestExecution(history, result) {
+  const index = history.indexOf(result);
+  if (index < 1 || result.actor_type !== "test_ai") return null;
+  const prior = history.slice(0, index);
+  const execution = [...prior].reverse().find((event) =>
+    event.actor_type === "test_ai" && ["claim", "takeover"].includes(event.event_type));
+  if (!execution || execution.actor_id !== result.actor_id || execution.session_id !== result.session_id) return null;
+  if (execution.event_type === "claim") return execution;
+  const authorizationIndex = prior.findIndex((event) =>
+    event.event_type === "takeover_allowed" && event.operation_id === execution.metadata?.authorizationOperationId);
+  if (authorizationIndex < 0) return null;
+  const authorization = prior[authorizationIndex], approved = authorization.metadata || {};
+  const predecessor = [...prior.slice(0, authorizationIndex)].reverse().find((event) =>
+    event.actor_type === "test_ai" && ["claim", "takeover"].includes(event.event_type));
+  if (!predecessor || !predecessor.actor_id || !predecessor.session_id ||
+    predecessor.actor_id === execution.actor_id || predecessor.session_id === execution.session_id ||
+    authorization.actor_type !== "test_ai" ||
+    authorization.actor_id !== execution.actor_id || authorization.session_id !== execution.session_id ||
+    approved.authorizationScope !== "task" ||
+    !["browser_user_session", "chat_user_instruction_cooperative"].includes(approved.authorizationSource) ||
+    (approved.authorizationSource === "chat_user_instruction_cooperative" &&
+      (approved.explicitUserOverride !== true ||
+        approved.authorizationForwardedBy !== execution.actor_id ||
+        approved.authorizationForwardingSessionId !== execution.session_id)) ||
+    !/^[a-f0-9]{64}$/i.test(String(approved.authorizedRegistryRevision || "")) ||
+    approved.authorizedRegistryRevision !== authorization.registry_revision_before ||
+    authorization.registry_revision_after !== execution.registry_revision_before ||
+    authorization.old_status !== execution.old_status ||
+    !["独测中", "复测中"].includes(approved.authorizedFromStatus) ||
+    approved.authorizedFromStatus !== execution.old_status ||
+    approved.authorizedFromSessionId !== predecessor.session_id ||
+    execution.metadata?.previousSessionId !== predecessor.session_id ||
+    prior.slice(authorizationIndex + 1).some((event) => event.event_type === "takeover_revoked")) return null;
+  const handoff = [...prior].reverse().find((event) =>
+    event.event_type === "handoff" && event.actor_type === "developer_ai" &&
+    ["开发中", "修复中"].includes(event.metadata?.completedFromStatus));
+  if (!handoff || prior.indexOf(handoff) >= authorizationIndex ||
+    !/^[a-f0-9]{40}$/i.test(String(handoff.metadata?.commitSha || "")) ||
+    handoff.metadata.commitSha !== result.metadata?.commitSha ||
+    handoff.metadata.headBranch !== result.metadata?.headBranch ||
+    !String(result.metadata?.reportPath || "").trim()) return null;
+  return execution;
+}
 export function deliveryEvidence(history, workflow) {
   const latestResult = [...history].reverse().find((event) => event.event_type === "test_result");
   const metadata = latestResult?.metadata || {};
   const passIndex = latestResult ? history.indexOf(latestResult) : -1;
   const prior = passIndex >= 0 ? history.slice(0, passIndex) : [];
-  const testerClaim = [...prior].reverse().find((event) =>
-    event.event_type === "claim" && event.actor_type === "test_ai" && event.actor_id === latestResult?.actor_id);
+  const testerExecution = latestAuthorizedTestExecution(history, latestResult);
   const developerHandoff = [...prior].reverse().find((event) =>
     event.event_type === "handoff" && event.actor_type === "developer_ai"
     && ["开发中", "修复中"].includes(event.metadata?.completedFromStatus));
   const invalidated = passIndex >= 0 && history.slice(passIndex + 1).some((event) =>
     event.event_type === "code_change" || event.event_type === "test_result" || event.metadata?.invalidatesTestEvidence === true);
-  const independent = Boolean(testerClaim && testerClaim.session_id === latestResult?.session_id
-    && developerHandoff && history.indexOf(developerHandoff) < history.indexOf(testerClaim)
+  const independent = Boolean(testerExecution && developerHandoff &&
+    history.indexOf(developerHandoff) < history.indexOf(testerExecution)
     && developerHandoff.actor_id !== latestResult?.actor_id
     && developerHandoff.session_id !== latestResult?.session_id);
   const valid = latestResult?.actor_type === "test_ai" && !invalidated && independent

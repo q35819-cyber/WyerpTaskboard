@@ -12,7 +12,7 @@ import { ProjectRegistry } from "./project-registry.mjs";
 import { EventStore } from "./event-store.mjs";
 import { TransactionStore } from "./transaction-store.mjs";
 import { ScanStore } from "./scan-store.mjs";
-import { hardDependencyBlockers, provisionalClaimAuthorization } from "./candidate-evaluator.mjs";
+import { hardDependencyBlockers, provisionalClaimAuthorization, latestAuthorizedTestExecution } from "./candidate-evaluator.mjs";
 
 function assertOperationId(id) {
   if (typeof id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(id)) {
@@ -446,13 +446,12 @@ async function verifyDeliveryCompletion(context, task, events, patch, { actorTyp
   }
   const passIndex = events.indexOf(latestTest);
   const prior = events.slice(0, passIndex);
-  const testerClaim = [...prior].reverse().find((event) =>
-    event.event_type === "claim" && event.actor_type === "test_ai" && event.actor_id === latestTest.actor_id);
+  const testerExecution = latestAuthorizedTestExecution(events, latestTest);
   const developerHandoff = [...prior].reverse().find((event) =>
     event.event_type === "handoff" && event.actor_type === "developer_ai"
     && ["开发中", "修复中"].includes(event.metadata?.completedFromStatus));
-  if (!testerClaim || testerClaim.session_id !== latestTest.session_id || !developerHandoff
-    || events.indexOf(developerHandoff) >= events.indexOf(testerClaim)
+  if (!testerExecution || !developerHandoff
+    || events.indexOf(developerHandoff) >= events.indexOf(testerExecution)
     || developerHandoff.actor_id === latestTest.actor_id || developerHandoff.session_id === latestTest.session_id) {
     throw new TaskboardError("独立测试必须由不同于原开发者的正式test_ai认领并完成", {
       code: "DELIVERY_TEST_INDEPENDENCE_INVALID", status: 409
