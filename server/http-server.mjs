@@ -18,6 +18,7 @@ import { TaskboardRuntimeStatus } from "./runtime-status.mjs";
 import { AutomationControlStore } from "./automation-control.mjs";
 import { ChatgptMcpExecutor } from "./chatgpt-mcp-executor.mjs";
 import { SystemEventLog } from "./system-event-log.mjs";
+import { TaskStatusEvents } from "./task-status-events.mjs";
 
 // A mention of a historical PASS is not an independent QA verdict.
 // Preserve delivery authority only with an explicit affirmative conclusion and
@@ -252,6 +253,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
   if (!appVersion) throw new Error("taskboard package version missing");
   const systemEventLog = await new SystemEventLog(rootDir).init();
   const taskStore = await new TaskStore(rootDir).init();
+  const taskStatusEvents = new TaskStatusEvents(rootDir);
   const erpPassGate = await new ErpPassGate({ rootDir, taskStore, systemEventLog, ...erpPassGateOptions }).init();
   const requirementStore = await new RequirementStore(rootDir, { taskStore }).init();
   const scanStore = await new ScanStore(rootDir, { systemEventLog }).init();
@@ -1027,7 +1029,13 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           boardColumns: workflow.boardColumns
         });
       }
-      let params = routeMatch(url.pathname, "/api/projects/:projectId/tasks");
+      let params = routeMatch(url.pathname, "/api/projects/:projectId/task-status-events");
+      if (req.method === "GET" && params) {
+        await taskStore.projects.context(params.projectId);
+        await taskStatusEvents.subscribe(params.projectId, res);
+        return;
+      }
+      params = routeMatch(url.pathname, "/api/projects/:projectId/tasks");
       if (req.method === "GET" && params) return send(res, 200, await taskStore.snapshot(params.projectId));
       if (req.method === "POST" && params) {
         const body = await readJson(req);
