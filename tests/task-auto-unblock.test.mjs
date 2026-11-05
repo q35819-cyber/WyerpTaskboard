@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { TaskStore } from "../server/task-store.mjs";
 import { CandidateEvaluator } from "../server/candidate-evaluator.mjs";
 import { makeFixture, registryText } from "./helpers.mjs";
@@ -64,6 +65,112 @@ async function dispatchD01(store, actorType = "controller_ai") {
     note: "新一轮真实派工，不能回填旧claim"
   });
 }
+
+const D09_FIX = "WTB-P0-LEGACY-D09-REENTRY-BUG-20261105-T1";
+async function blockedD09(t, { release = true, qaPass = true, published = true,
+  dispatch = true, stopped = false, untrustedNote = false,
+  unfinished = false, dispatchBeforeRelease = false, unmetHardDependency = false } = {}) {
+  const f = await setup(t, [
+    row("A-10", "待开发"),
+    row(D09_FIX, unfinished ? "待独测" : "已完成")
+  ]);
+  const git = (...args) => execFileSync("git", ["-C", f.projectRoot, ...args],
+    { encoding: "utf8", windowsHide: true }).trim();
+  git("init", "-b", "main");
+  git("add", "tasks.md");
+  git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+    "commit", "-m", "D09 published fixture");
+  const mainSha = git("rev-parse", "HEAD");
+  const claim = await change(f.store, "A-10", {
+    status: "开发中", assignee: "old-dev", sessionWindowName: "old-dev",
+    sessionId: "old-session"
+  }, "claim", {}, "developer_ai", "old-session");
+  await f.store.appendTaskEvent("fixture", "A-10", {
+    operationId: "d09.fail." + (++sequence),
+    eventType: "developer_checkpoint_resume_blocked",
+    actorType: "developer_ai", actorId: "fixture-actor", sessionId: "",
+    note: "D09_MERGE_MAIN CHECKPOINT_STEP_ORDER "
+      + (untrustedNote ? "fabricated" : claim.eventId)
+  });
+  const blocked = await change(f.store, "A-10", {
+    status: "阻断", assignee: "", sessionWindowName: "", sessionId: ""
+  }, "developer_step_cursor_blocked", {}, "developer_ai", "");
+  if (unmetHardDependency) {
+    const lines = (await fs.readFile(f.registryPath, "utf8")).split(/\r?\n/);
+    const index = lines.findIndex((line) => line.startsWith("| A-10 |"));
+    const cells = lines[index].split("|");
+    cells[14] = " UNFINISHED完成 ";
+    lines[index] = cells.join("|");
+    await fs.writeFile(f.registryPath, lines.join("\n"));
+  }
+  const dispatchController = async () => f.store.appendTaskEvent("fixture", "A-10", {
+    operationId: "d09.dispatch." + (++sequence),
+    eventType: "controller_dispatch", actorType: "controller_ai",
+    actorId: "controller", sessionId: "controller-session"
+  });
+  if (dispatchBeforeRelease) await dispatchController();
+  if (qaPass) {
+    const qa = await f.store.appendTaskEvent("fixture", D09_FIX, {
+      operationId: "d09.qa." + (++sequence), eventType: "test_result",
+      actorType: "test_ai", actorId: "qa", sessionId: "qa-session",
+      metadata: { atomicLifecycle: true, testResult: "pass",
+        commitSha: "a".repeat(40) }
+    });
+    if (release) await f.store.appendTaskEvent("fixture", D09_FIX, {
+      operationId: "d09.delivery." + (++sequence),
+      eventType: "delivery_complete", actorType: "controller_ai",
+      actorId: "controller", sessionId: "controller-session",
+      metadata: { independentPassEventId: qa.event.event_id,
+        deliveryVerified: true, postMergeRegressionResult: "PASS",
+        candidateCommitSha: "a".repeat(40),
+        mergeCommitSha: published ? mainSha : "b".repeat(40),
+        remoteMainSha: published ? mainSha : "b".repeat(40) }
+    });
+  }
+  await new Promise((done) => setTimeout(done, 8));
+  if (dispatch && !dispatchBeforeRelease) await dispatchController();
+  if (stopped) await f.store.appendTaskEvent("fixture", "A-10", {
+    operationId: "d09.stop." + (++sequence),
+    eventType: "stop_request", actorType: "user", actorId: "user",
+    note: "用户暂停旧任务"
+  });
+  return { ...f, blocked, mainSha };
+}
+
+test("published D09 fix and fresh dispatch recover a real old D09 cursor block once", async (t) => {
+  const { store, evaluator, blocked } = await blockedD09(t);
+  await Promise.all([evaluator.evaluateProject("fixture"), evaluator.evaluateProject("fixture")]);
+  assert.equal(await status(store, "A-10"), "待开发");
+  const history = await store.taskHistory("fixture", "A-10", { all: true });
+  const events = history.filter((event) => event.event_type === "auto_unblock");
+  assert.equal(events.length, 1);
+  assert.equal(events[0].metadata.blockedEventId, blocked.eventId);
+  assert.equal(events[0].metadata.restoreStatus, "待开发");
+  assert.equal((await store.transactions.read(events[0].operation_id)).state, "committed");
+  const ready = await evaluator.evaluateProject("fixture");
+  assert.equal(ready.candidates.find((item) => item.task_id === "A-10")?.auto_unblocked_bug, true);
+  await change(store, "A-10", { status: "开发中", assignee: "fresh-dev",
+    sessionWindowName: "fresh-dev", sessionId: "fresh-session" },
+  "claim", {}, "developer_ai", "fresh-session");
+  assert.equal(await status(store, "A-10"), "开发中");
+  assert.equal((await store.taskHistory("fixture", "A-10", { all: true }))
+    .filter((event) => event.event_type === "developer_step_cursor_blocked").length, 1);
+});
+
+test("D09 recovery denies missing/forged proof, stale dispatch, unpublished fix and STOP", async (t) => {
+  for (const options of [
+    { release: false }, { qaPass: false }, { published: false },
+    { dispatch: false }, { dispatchBeforeRelease: true },
+    { stopped: true }, { untrustedNote: true }, { unfinished: true },
+    { unmetHardDependency: true }
+  ]) {
+    const { store, evaluator } = await blockedD09(t, options);
+    await evaluator.evaluateProject("fixture");
+    assert.equal(await status(store, "A-10"), "阻断", JSON.stringify(options));
+    assert.equal((await store.taskHistory("fixture", "A-10", { all: true }))
+      .filter((event) => event.event_type === "auto_unblock").length, 0);
+  }
+});
 
 test("D01 missing-dispatch block recovers only after a new authentic controller dispatch", async (t) => {
   const { store, evaluator, blocked } = await blockedD01(t);
