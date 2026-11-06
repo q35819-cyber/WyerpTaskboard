@@ -733,13 +733,14 @@ function messageScope({ actorType = "developer_ai", actorId = "taskctl", session
 }
 
 export class TaskStore {
-  constructor(rootDir, { faultAfter = null } = {}) {
+  constructor(rootDir, { faultAfter = null, inspectCleanupResources = null } = {}) {
     this.rootDir = rootDir;
     this.projects = new ProjectRegistry(rootDir);
     this.events = new EventStore(rootDir);
     this.transactions = new TransactionStore(rootDir);
     this.scanStore = new ScanStore(rootDir);
     this.faultAfter = faultAfter;
+    this.inspectCleanupResources = inspectCleanupResources;
   }
 
   async init() {

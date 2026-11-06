@@ -739,3 +739,23 @@ test("independent test pass defaults to system auto-close for an unscoped task",
   assert.equal(result.after.assignee, "");
   assert.equal(result.after.sessionId, "");
 });
+
+test("taskctl cleanup-delivery requires controller session and cannot bypass C06 route", async (t) => {
+  const { fixture, base } = await startFixture(t);
+  const common = ["cleanup-delivery", "--project", "fixture", "--task", "A-10",
+    "--delivery-worktree", "D:/temporary", "--report", "reports/C05.md"];
+  await assert.rejects(taskctl(fixture.boardRoot, base, [
+    ...common, "--actor-type", "developer_ai", "--actor-id", "developer", "--session-id", "dev"
+  ]), e => { assert.match(e.stderr, /C06_CONTROLLER_DELIVERY_REQUIRED/); return true; });
+  await assert.rejects(taskctl(fixture.boardRoot, base, [
+    ...common, "--actor-type", "controller_ai", "--actor-id", "ctrl"
+  ]), e => { assert.match(e.stderr, /C06_CONTROLLER_DELIVERY_REQUIRED/); return true; });
+  await assert.rejects(taskctl(fixture.boardRoot, base, [
+    ...common, "--actor-type", "controller_ai", "--actor-id", "ctrl",
+    "--session-id", "ctrl-session"
+  ]), e => { assert.match(e.stderr, /C06_CONTROLLER_DELIVERY_REQUIRED/); return true; });
+  const status = JSON.parse((await taskctl(fixture.boardRoot, base, [
+    "get", "--project", "fixture", "--task", "A-10"
+  ])).stdout);
+  assert.equal(status.status, "待开发", "invalid CLI cleanup cannot alter task status");
+});

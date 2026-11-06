@@ -244,7 +244,7 @@ function lastResumeTarget(events) {
   return null;
 }
 
-export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port = 47831, chatgptMcpExecutorFactory = null, erpPassGateOptions = {} } = {}) {
+export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port = 47831, chatgptMcpExecutorFactory = null, erpPassGateOptions = {}, cleanupResourceInspector = null } = {}) {
   if (host !== "127.0.0.1") throw new TaskboardError("任务看板服务只能监听 127.0.0.1", {
     code: "LOOPBACK_BIND_REQUIRED", status: 400, details: { requestedHost: String(host || "") }
   });
@@ -252,7 +252,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
   const appVersion = String(appPackage.version || "").trim();
   if (!appVersion) throw new Error("taskboard package version missing");
   const systemEventLog = await new SystemEventLog(rootDir).init();
-  const taskStore = await new TaskStore(rootDir).init();
+  const taskStore = await new TaskStore(rootDir, { inspectCleanupResources: cleanupResourceInspector }).init();
   const taskStatusEvents = new TaskStatusEvents(rootDir);
   const erpPassGate = await new ErpPassGate({ rootDir, taskStore, systemEventLog, ...erpPassGateOptions }).init();
   const requirementStore = await new RequirementStore(rootDir, { taskStore }).init();
@@ -1066,6 +1066,51 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         const limit = Math.min(500, Math.max(1, Number(url.searchParams.get("limit") || 200)));
         return send(res, 200, { events: await taskStore.taskHistory(params.projectId, params.taskId, { limit }) });
       }
+      params = routeMatch(url.pathname, "/api/projects/:projectId/tasks/:taskId/delivery-cleanup");
+      if (req.method === "POST" && params) {
+        requireTrustedApiIdentity(identity);
+        const body = await readJson(req);
+        requireOperation(body);
+        const actorType = body.actorType;
+        const actorId = String(body.actorId || "").trim();
+        const sessionId = String(body.sessionId || "").trim();
+        const { task } = await taskStore.getTask(params.projectId, params.taskId);
+        const history = await taskStore.taskHistory(params.projectId, params.taskId, { all: true });
+        const completed = [...history].reverse().find(event => event.event_type === "delivery_complete");
+        const committed = completed?.operation_id
+          ? await taskStore.transactions.read(completed.operation_id) : null;
+        if (actorType !== "controller_ai" || !actorId || !sessionId
+          || task.status !== "已完成" || completed?.actor_type !== "controller_ai"
+          || completed.actor_id !== actorId || completed.session_id !== sessionId
+          || completed.metadata?.postMergeRegressionResult !== "PASS"
+          || completed.metadata?.deliveryWorktreePath !== body.deliveryWorktreePath
+          || completed.metadata?.postMergeReportPath !== body.postMergeReportPath
+          || committed?.state !== "committed"
+          || committed.result?.eventId !== completed.event_id
+          || committed.event?.event_type !== "delivery_complete"
+          || committed.event?.actor_id !== actorId
+          || committed.event?.session_id !== sessionId) {
+          throw new TaskboardError("C06只允许真实C05完成记录对应的总控Session操作", {
+            code: "C06_CONTROLLER_DELIVERY_REQUIRED", status: 403
+          });
+        }
+        if (typeof taskStore.inspectCleanupResources !== "function") {
+          throw new TaskboardError("没有可信Job、资源归属和PR检查器，禁止清理", {
+            code: "C06_RESOURCE_UNVERIFIED", status: 409
+          });
+        }
+        if (typeof taskStore.cleanupMergedDelivery !== "function") {
+          throw new TaskboardError("C06核心清理尚未通过独测并发布", {
+            code: "C06_CORE_NOT_PUBLISHED", status: 409
+          });
+        }
+        const result = await taskStore.cleanupMergedDelivery(params.projectId, params.taskId, {
+          operationId: body.operationId, actorType, actorId, sessionId,
+          deliveryWorktreePath: body.deliveryWorktreePath, postMergeReportPath: body.postMergeReportPath
+        });
+        return send(res, 200, result);
+      }
+
       params = routeMatch(url.pathname, "/api/projects/:projectId/tasks/:taskId/guard");
       if (req.method === "GET" && params) {
         const pair = await taskStore.getTask(params.projectId, params.taskId);

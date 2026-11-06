@@ -2334,3 +2334,97 @@ test("project removal is browser-only, blocks active work/resources, and never d
   const projects = await (await fetch(base + "/api/projects", { headers: { Cookie: cookie } })).json();
   assert.equal(projects.projects.some((item) => item.id === "safe-remove"), false);
 });
+
+test("C06 HTTP refuses fake controller, missing resource authority, and unpublished cleanup core", async (t) => {
+  const { app, base, secret } = await startFixture(t);
+  const path = base + "/api/projects/fixture/tasks/A-10/delivery-cleanup";
+  const proof = { event_id: "evt_c06_http_auth", operation_id: "delivery_complete.fixture.c06",
+    event_type: "delivery_complete", actor_type: "controller_ai",
+    actor_id: "ctrl", session_id: "ctrl-session", metadata: {
+      postMergeRegressionResult: "PASS", deliveryWorktreePath: "D:/registered-worktree",
+      postMergeReportPath: "reports/C05.md" } };
+  const originalGet = app.taskStore.getTask.bind(app.taskStore);
+  app.taskStore.getTask = async (...args) => {
+    const pair = await originalGet(...args);
+    return { ...pair, task: { ...pair.task, status: "已完成" } };
+  };
+  app.taskStore.taskHistory = async () => [proof];
+  let trustedJournal = false;
+  app.taskStore.transactions.read = async (operationId) => trustedJournal
+    && operationId === proof.operation_id ? { state: "committed",
+      result: { eventId: proof.event_id },
+      event: { event_type: "delivery_complete", actor_id: "ctrl", session_id: "ctrl-session" }
+    } : null;
+  const payload = { operationId: "c06.test.http.1", actorType: "controller_ai",
+    actorId: "ctrl", sessionId: "ctrl-session",
+    deliveryWorktreePath: "D:/registered-worktree", postMergeReportPath: "reports/C05.md",
+    activeJobs: 0, otherOwners: 0, openPullRequests: 0 };
+  const sendCleanup = (data, headers = {}) => fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
+    body: JSON.stringify(data)
+  });
+  assert.equal((await sendCleanup(payload)).status, 403, "untrusted client denied");
+  const auth = { Authorization: "Bearer " + secret };
+  let response = await sendCleanup({ ...payload, actorType: "developer_ai" }, auth);
+  assert.equal(response.status, 403);
+  assert.equal((await response.json()).error.code, "C06_CONTROLLER_DELIVERY_REQUIRED");
+  response = await sendCleanup({ ...payload, sessionId: "other-session" }, auth);
+  assert.equal(response.status, 403);
+  response = await sendCleanup(payload, auth);
+  assert.equal(response.status, 403, "fabricated completion event without committed journal is refused");
+  trustedJournal = true;
+  response = await sendCleanup(payload, auth);
+  assert.equal(response.status, 409, "missing production inspector must fail closed");
+  assert.equal((await response.json()).error.code, "C06_RESOURCE_UNVERIFIED");
+  app.taskStore.inspectCleanupResources = async () => ({
+    ownerTaskId: "A-10", activeJobs: 0, otherOwners: 0, openPullRequests: 0
+  });
+  response = await sendCleanup(payload, auth);
+  assert.equal(response.status, 409, "unpublished C06 core cannot be assumed present");
+  assert.equal((await response.json()).error.code, "C06_CORE_NOT_PUBLISHED");
+});
+
+test("C06 controller route forwards only server-validated clean-up arguments to existing core", async (t) => {
+  const { app, base, secret } = await startFixture(t, {
+    cleanupResourceInspector: async () => ({ ownerTaskId: "A-10", activeJobs: 0,
+      otherOwners: 0, openPullRequests: 0 })
+  });
+  const originalGet = app.taskStore.getTask.bind(app.taskStore);
+  app.taskStore.getTask = async (...args) => {
+    const pair = await originalGet(...args);
+    return { ...pair, task: { ...pair.task, status: "已完成" } };
+  };
+  app.taskStore.taskHistory = async () => [{
+    event_id: "evt_c06_http_forward", operation_id: "delivery_complete.fixture.forward",
+    event_type: "delivery_complete", actor_type: "controller_ai",
+    actor_id: "ctrl", session_id: "ctrl-session",
+    metadata: { postMergeRegressionResult: "PASS",
+      deliveryWorktreePath: "D:/worktree", postMergeReportPath: "reports/C05.md" }
+  }];
+  app.taskStore.transactions.read = async (operationId) => operationId === "delivery_complete.fixture.forward"
+    ? { state: "committed", result: { eventId: "evt_c06_http_forward" },
+      event: { event_type: "delivery_complete", actor_id: "ctrl", session_id: "ctrl-session" }
+    } : null;
+  let invoked = 0;
+  app.taskStore.cleanupMergedDelivery = async (projectId, taskId, options) => {
+    invoked++;
+    assert.equal(projectId, "fixture");
+    assert.equal(taskId, "A-10");
+    assert.deepEqual(options, { operationId: "c06.http.forward.1",
+      actorType: "controller_ai", actorId: "ctrl", sessionId: "ctrl-session",
+      deliveryWorktreePath: "D:/worktree", postMergeReportPath: "reports/C05.md" });
+    return { receipt: { verified: true } };
+  };
+  const response = await fetch(base + "/api/projects/fixture/tasks/A-10/delivery-cleanup", {
+    method: "POST",
+    headers: { Authorization: "Bearer " + secret, "Content-Type": "application/json" },
+    body: JSON.stringify({ operationId: "c06.http.forward.1", actorType: "controller_ai",
+      actorId: "ctrl", sessionId: "ctrl-session", deliveryWorktreePath: "D:/worktree",
+      postMergeReportPath: "reports/C05.md", activeJobs: 0, otherOwners: 0,
+      openPullRequests: 0, ownerTaskId: "FORGED" })
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { receipt: { verified: true } });
+  assert.equal(invoked, 1);
+});

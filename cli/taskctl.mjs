@@ -230,6 +230,7 @@ try {
         "taskctl priority --project PROJECT --task WTB-TEST-001 --value P1",
         "taskctl transition --project PROJECT --task WTB-TEST-001 --status 待独测 --event-type handoff",
         "taskctl complete --project PROJECT --task WTB-TEST-001 --actor-id ID --session-id ID --note TEXT [--actor-type controller_ai when 交付中] [--report POST_MERGE_PASS_REPORT] [--delivery-worktree REGISTERED_CLEAN_WORKTREE when 交付中]",
+        "taskctl cleanup-delivery --project PROJECT --task TASK --actor-type controller_ai --actor-id ID --session-id C05_SESSION --delivery-worktree WORKTREE --report C05_REPORT",
         "taskctl delivery-failed --project PROJECT --task WTB-TEST-001 --actor-id ID --session-id ID --failure-stage merge|push|remote_sync|regression|report|verification --failure-code CODE --note REASON --next-action ACTION",
         "taskctl changed --project PROJECT --task WTB-TEST-001 --kind code|doc --paths a,b --note TEXT [--invalidates-test true]",
         "taskctl test-start --project PROJECT --task WTB-TEST-001 --note TEXT [--report path] [--actor-type test_ai --actor-id ID --session-id ID]",
@@ -584,6 +585,22 @@ try {
         }
       }));
     }
+  } else if (command === "cleanup-delivery") {
+    const { project, task } = projectTask(args);
+    await preflight(project, task, args);
+    const who = actor(args, "controller_ai");
+    if (who.actorType !== "controller_ai" || !who.actorId || who.actorId === "taskctl"
+      || !who.sessionId) throw preflightError("C06_CONTROLLER_DELIVERY_REQUIRED", "C06必须提供真实总控actor与C05 Session");
+    output(await request("/api/projects/" + encodeURIComponent(project) + "/tasks/"
+      + encodeURIComponent(task) + "/delivery-cleanup", {
+      method: "POST",
+      body: {
+        operationId: operationId(args, "delivery_cleanup"),
+        actorType: "controller_ai", actorId: who.actorId, sessionId: who.sessionId,
+        deliveryWorktreePath: required(args, "delivery-worktree"),
+        postMergeReportPath: required(args, "report")
+      }
+    }));
   } else if (command === "delivery-failed") {
     const { project, task } = projectTask(args);
     await preflight(project, task, args);
