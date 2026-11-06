@@ -16,7 +16,7 @@ const els=Object.fromEntries([
   "priorityFilter","statusFilter","archiveFilter","boardViewBtn","listViewBtn","boardView","listView","taskTableBody",
   "planDialog","planDialogTitle","planDialogPath","planNavigator","planLocationStatus","planIndexList","planDocumentContent","closePlanDialogBtn",
   "taskDialog","closeDialogBtn","detailTaskId","detailTitle","dependencyBackBtn","dependencyTrail","userMessagePanel","userMessageCount","userMessageList",
-  "taskPlanList","responsibilityText","currentProgressText","userAssistanceText","traceabilityText","readDependenciesText","writeTargetsText","relatedArtifactsText","detailMeta",
+  "taskPlanList","responsibilityText","currentProgressText","userAssistanceText","traceabilityText","readDependenciesText","relatedTasksText","writeTargetsText","relatedArtifactsText","detailMeta",
   "sessionInfo","testResourceSummary","testResourceList","prioritySelect","savePriorityBtn","stopBtn","resumeBtn","suspectDisconnectBtn","allowTakeoverBtn",
   "revokeTakeoverBtn","reviewNote","commentBtn","userAcceptanceActions","acceptBtn","rejectReason","rejectBtn","reloadHistoryBtn","historyList"
 ].map(id=>[id,$(id)]));
@@ -444,8 +444,44 @@ function renderTaskDependencies(task){
     els.readDependenciesText.append(row);
   }
 }
+function cardStage(task){
+  return task.presentation?.cardStage || (task.status === "已完成" ? "completed"
+    : ["开发中", "修复中", "待独测", "待复测", "待交付", "交付中"].includes(task.status) ? "running" : "not_started");
+}
+const CARD_STAGE_LABELS={not_started:"未开工",running:"正在执行",
+  paused_by_issue:"开发受阻·已报告·暂停｜不是失联",completed:"已完成",cancelled:"已取消"};
+function relatedTaskRefs(task){
+  const registered=new Map((state.snapshot?.tasks||[]).map(item=>[item.id,item]));
+  return (task.presentation?.relatedTasks||[]).filter(ref=>ref?.id && ref.id!==task.id)
+    .map(ref=>({id:ref.id,task:registered.get(ref.id)||null,status:registered.get(ref.id)?.status||null}));
+}
+function relatedTaskNode(ref,parentTaskId){
+  const status=ref.status;
+  const label=status==="已完成"?"关联已完成":status==="已取消"?"关联已取消"
+    :status?"关联未完成":"关联待核实";
+  const element=ref.task?dependencyButton(ref,true,state.projectId,state.projectEpoch,parentTaskId):document.createElement("span");
+  element.className="related-task-status "+(status==="已完成"?"related-done"
+    :status==="已取消"||!status?"related-unknown":"related-open");
+  element.textContent=label+" · "+ref.id+(status?" · "+statusLabel(status):"");
+  element.title=ref.id;
+  if(ref.task)element.setAttribute("aria-label","查看关联任务："+ref.id);
+  return element;
+}
+function renderRelatedTasks(task){
+  if(!els.relatedTasksText)return;
+  els.relatedTasksText.replaceChildren();
+  const issue=task.presentation?.developmentIssue;
+  if(issue){
+    const note=document.createElement("div");note.className="related-issue-note";
+    note.textContent="已报告开发暂停｜"+issue.failureCode+"｜"+issue.nextAction+"｜事件 "+issue.eventId;
+    els.relatedTasksText.append(note);
+  }
+  const refs=relatedTaskRefs(task);
+  for(const ref of refs)els.relatedTasksText.append(relatedTaskNode(ref,task.id));
+  if(!issue&&!refs.length)els.relatedTasksText.textContent="—";
+}
 function taskCard(task){
-  const card=document.createElement("article");card.className="task-card"+(task.track==="bugfix"?" bug-card":"");
+  const card=document.createElement("article");card.className="task-card card-stage-"+cardStage(task).replaceAll("_","-")+(task.track==="bugfix"?" bug-card":"");
   if(task.presentation?.latestUserMessage?.replied){
     const stamp=document.createElement("div");stamp.className="reply-stamp";stamp.textContent="已回复";stamp.title="最新用户留言已有AI回复";card.append(stamp);
   }
@@ -459,7 +495,17 @@ function taskCard(task){
   if(plan)planRow.append(planButton(task.id,plan,true));else planRow.textContent="主计划：未绑定";
   const responsibility=document.createElement("div");responsibility.className="task-responsibility";responsibility.textContent="本任务负责："+(task.presentation?.responsibility||task.boundary||"未填写");
   const progress=document.createElement("div");progress.className="task-progress";progress.textContent="当前进展："+(task.presentation?.currentProgress||statusLabel(task.status));
-  card.append(id,h4,badges,planRow,responsibility,progress);
+  const stage=cardStage(task),stageLine=document.createElement("div");
+  stageLine.className="card-stage-line";
+  stageLine.textContent=CARD_STAGE_LABELS[stage]||"未开工";
+  if(task.presentation?.developmentIssue){
+    stageLine.textContent+=" · "+task.presentation.developmentIssue.failureCode;
+  }
+  if(task.presentation?.suspectedDisconnect||task.takeover?.suspectedDisconnect){
+    const disconnect=document.createElement("div");disconnect.className="card-disconnect";
+    disconnect.textContent="疑似失联（请核对正式接管条件）";stageLine.append(disconnect);
+  }
+  card.append(id,h4,badges,stageLine,planRow,responsibility,progress);
   const pending=taskDependencies(task).filter(ref=>ref.id&&ref.task?.status!=="已完成");
   if(pending.length){
     const links=document.createElement("div");links.className="dependency-card-row";
@@ -467,6 +513,16 @@ function taskCard(task){
     const projectId=state.projectId,epoch=state.projectEpoch;
     for(const ref of pending){if(ref.task&&ref.id!==task.id)links.append(dependencyButton(ref,true,projectId,epoch,task.id));}
     card.append(links);
+  }
+  const related=relatedTaskRefs(task);
+  if(related.length){
+    const row=document.createElement("div");row.className="related-task-row";
+    for(const ref of related.slice(0,3))row.append(relatedTaskNode(ref,task.id));
+    if(related.length>3){
+      const more=document.createElement("span");more.className="related-more";
+      more.textContent="另有 "+(related.length-3)+" 项，点击任务查看全部";row.append(more);
+    }
+    card.append(row);
   }
   const candidate=developerCandidateFor(task);
   if(candidate?.blockers?.length||(task.status==="待执行"&&!isReadyTask(task))){const why=document.createElement("div");why.className="task-user-assistance";why.textContent="暂不能执行："+(candidate?.blockers?.length?candidate.blockers.join("；"):"缺少有效的最新准入扫描结果");card.append(why);}
@@ -737,6 +793,7 @@ async function openTask(taskId,nested=false){
     els.userAssistanceText.textContent=p.userAssistance||"当前无需你操作";
     els.traceabilityText.textContent=p.traceability||data.traceability||"—";
     renderTaskDependencies(data);
+    renderRelatedTasks(data);
     els.writeTargetsText.textContent=data.writeTargets||"—";
     const documents=p.documents||[];
     els.relatedArtifactsText.replaceChildren(...documents.map(document=>documentButton(data.id,document)));

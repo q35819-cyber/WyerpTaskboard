@@ -688,7 +688,59 @@ function activeUserAction(events, task) {
   };
   return fallback[task.status] || "当前无需你操作；如后续需要账号、权限、业务决策或页面验收，执行AI必须在这里明确写出具体事项。";
 }
-function presentationForTask(task, events = [], project = {}) {
+function taskVisualState(task, events, statuses) {
+  let claimed = false, owner = null, issue = null, suspected = false;
+  for (const e of events) {
+    if (["claim", "takeover"].includes(e.event_type) && e.actor_type === "developer_ai"
+      && e.actor_id && e.session_id && ["开发中", "修复中"].includes(e.new_status)) {
+      claimed = true; owner = { actor: e.actor_id, session: e.session_id }; issue = null;
+    } else if (e.event_type === "developer_issue_reported" && owner
+      && e.actor_type === "developer_ai" && e.actor_id === owner.actor
+      && e.session_id === owner.session && e.metadata?.paused === true
+      && typeof e.metadata.failureCode === "string" && e.metadata.failureCode.trim()
+      && typeof e.metadata.nextAction === "string" && e.metadata.nextAction.trim()
+      && Array.isArray(e.metadata.relatedTaskIds) && e.metadata.relatedTaskIds.length) {
+      issue = { eventId: e.event_id, timestamp: e.timestamp,
+        failureCode: cleanHumanText(e.metadata.failureCode).slice(0, 120),
+        nextAction: cleanHumanText(e.metadata.nextAction).slice(0, 300),
+        relatedTaskIds: e.metadata.relatedTaskIds };
+    } else if (["developer_issue_resolved", "release", "resume", "auto_unblock",
+      "handoff", "test_result", "complete", "task_completed"].includes(e.event_type)
+      || (e.new_status && e.old_status !== e.new_status
+        && !["开发中", "修复中", "阻断"].includes(e.new_status))) {
+      issue = null;
+      if (["release", "handoff"].includes(e.event_type)) owner = null;
+    }
+    if (e.event_type === "suspected_disconnect") suspected = true;
+    if (["takeover", "claim", "resume", "takeover_revoked"].includes(e.event_type)) suspected = false;
+  }
+  const seen = new Set(), ids = [];
+  const add = id => {
+    if (typeof id !== "string" || !/^[A-Za-z][A-Za-z0-9-]+-T[0-9]+$/.test(id)
+      || id === task.id || seen.has(id)) return;
+    seen.add(id); ids.push(id);
+  };
+  for (const part of String(task.readDependencies || "").split(/[;；]/)) {
+    const match = /^([A-Za-z][A-Za-z0-9-]+-T[0-9]+)完成$/.exec(part.trim());
+    if (match) add(match[1]);
+  }
+  if (issue) issue.relatedTaskIds.forEach(add);
+  if (["阻断", "HOLD"].includes(task.status)) {
+    const last = [...events].reverse().find(e => e.event_type === "controller_blocker_resolution_plan");
+    if (Array.isArray(last?.metadata?.rootCauseTaskIds)) last.metadata.rootCauseTaskIds.forEach(add);
+  }
+  const paused = Boolean(issue && ["开发中", "修复中", "阻断"].includes(task.status));
+  return {
+    cardStage: task.status === "已取消" ? "cancelled" : task.status === "已完成" ? "completed"
+      : paused ? "paused_by_issue" : claimed ? "running" : "not_started",
+    developmentIssue: paused ? {eventId: issue.eventId, timestamp: issue.timestamp,
+      failureCode: issue.failureCode, nextAction: issue.nextAction} : null,
+    suspectedDisconnect: suspected && claimed && !paused && task.status !== "已完成",
+    relatedTasks: ids.map(id => ({id, status: statuses.get(id) || null}))
+  };
+}
+
+function presentationForTask(task, events = [], project = {}, statuses = new Map()) {
   const messages = events.filter(isUserMessage);
   const decisions = events.filter((event) => event.actor_type === "user" && USER_DECISION_TYPES.has(event.event_type));
   const latest = messages.at(-1) || null;
@@ -712,6 +764,7 @@ function presentationForTask(task, events = [], project = {}) {
   const latestReplies = latest ? (repliesByMessage.get(latest.event_id) || []) : [];
   return {
     title: readableTitle(task),
+    ...taskVisualState(task, events, statuses),
     responsibility: cleanHumanText(task.boundary) || "尚未填写任务职责说明，执行AI需要补充。",
     currentProgress: currentProgressText(task, events),
     userAssistance: activeUserAction(events, task),
@@ -779,6 +832,7 @@ export class TaskStore {
       context.workflow.validateStatus(task.status);
     }
     const eventMap = await this.events.listProjectTaskEvents(projectId, parsed.tasks.map((task) => task.id), { all: true });
+    const statuses = new Map(parsed.tasks.map((task) => [task.id, task.status]));
     const tasks = [...parsed.tasks].sort((a, b) =>
       context.workflow.sortKey(a) - context.workflow.sortKey(b) || a.id.localeCompare(b.id)
     ).map((task) => {
@@ -787,7 +841,7 @@ export class TaskStore {
       return {
         ...task,
         acceptanceScope,
-        presentation: { ...presentationForTask(task, events, context.project), acceptanceScope }
+        presentation: { ...presentationForTask(task, events, context.project, statuses), acceptanceScope }
       };
     });
     return {
@@ -1222,6 +1276,31 @@ export class TaskStore {
           details: { expectedRevision, actualRevision: snapshot.registryRevision }
         });
       }
+      if (["developer_issue_reported", "developer_issue_resolved"].includes(eventType)) {
+        const history = await this.events.listTaskEvents(projectId, taskId, { all: true });
+        const activeClaim = [...history].reverse().find(e => ["claim", "takeover"].includes(e.event_type)
+          && e.actor_type === "developer_ai" && e.session_id === task.sessionId);
+        if (!["开发中", "修复中", "阻断"].includes(task.status)
+          || actorType !== "developer_ai" || !actorId || !sessionId
+          || task.sessionId !== sessionId || activeClaim?.actor_id !== actorId) {
+          throw new TaskboardError("开发问题事件必须由当前合法开发会话提交", {
+            code: "DEVELOPER_ISSUE_SESSION_REQUIRED", status: 409
+          });
+        }
+        if (eventType === "developer_issue_reported") {
+          const links = metadata?.relatedTaskIds;
+          const known = new Set(snapshot.tasks.map(item => item.id));
+          if (metadata?.paused !== true || typeof metadata.failureCode !== "string"
+            || !metadata.failureCode.trim() || metadata.failureCode.length > 120
+            || typeof metadata.nextAction !== "string" || !metadata.nextAction.trim()
+            || metadata.nextAction.length > 300 || !Array.isArray(links)
+            || links.length < 1 || links.length > 8 || links.some(id => id === taskId || !known.has(id))) {
+            throw new TaskboardError("开发暂停必须提供真实关联任务、错误码和下一动作", {
+              code: "DEVELOPER_ISSUE_EVIDENCE_REQUIRED", status: 409
+            });
+          }
+        }
+      }
       const appended = await this.events.append(projectId, {
         operation_id: operationId,
         project_id: projectId,
@@ -1417,8 +1496,7 @@ export class TaskStore {
 
   async presentation(projectId, taskId) {
     const { task } = await this.getTask(projectId, taskId);
-    const events = await this.taskHistory(projectId, taskId, { all: true });
-    return presentationForTask(task, events, this.projects.get(projectId));
+    return task.presentation;
   }
 
   async readTaskDocument(projectId, taskId, documentIndex) {

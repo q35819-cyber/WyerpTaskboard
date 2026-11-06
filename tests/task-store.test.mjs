@@ -5,6 +5,60 @@ import { TaskStore } from "../server/task-store.mjs";
 import { TaskStepCheckpoint } from "../server/task-step-checkpoint.mjs";
 import { makeFixture, registryText } from "./helpers.mjs";
 
+
+test("task presentation derives exclusive color from real claim, current issue and completed registry", async (t) => {
+  const f=await makeFixture();t.after(()=>fs.rm(f.boardRoot,{recursive:true,force:true}));
+  const source="WTB-UI-20261107-T1",done="WTB-DONE-20261107-T1",
+    blocked="WTB-BLOCKED-20261107-T1",cancel="WTB-CANCEL-20261107-T1";
+  const row=(id,status,dep="")=>[id,"F-UI","bugfix","P0",status,"开发AI",
+    status==="开发中"?"dev-visual":"—","window",status==="开发中"?"sess-one":"—",
+    "2026-11-07T00:00:00Z","scope","plan.md","trace",dep,"web/app.js","done"];
+  await fs.writeFile(f.registryPath,registryText([
+    row(source,"开发中",done+"完成;"+blocked+"完成;"+cancel+"完成;WTB-MISSING-20261107-T1完成"),
+    row(done,"已完成"),row(blocked,"阻断"),row(cancel,"已取消"),
+    row("WTB-PENDING-20261107-T1","待开发")
+  ]),"utf8");
+  const store=await new TaskStore(f.boardRoot).init();
+  const find=async (id=source)=>(await store.snapshot("fixture")).tasks.find(x=>x.id===id).presentation;
+  assert.equal((await find("WTB-PENDING-20261107-T1")).cardStage,"not_started");
+  assert.equal((await find(done)).cardStage,"completed");
+  assert.equal((await find(source)).cardStage,"not_started","status alone never proves a claim");
+  await store.appendTaskEvent("fixture",source,{
+    operationId:"visual.claim",eventType:"claim",actorType:"developer_ai",
+    actorId:"dev-visual",sessionId:"sess-one"
+  });
+  assert.equal((await find(source)).cardStage,"running");
+  await assert.rejects(store.appendTaskEvent("fixture",source,{
+    operationId:"visual.forged.issue",eventType:"developer_issue_reported",
+    actorType:"developer_ai",actorId:"dev-foreign",sessionId:"sess-foreign",
+    metadata:{paused:true,failureCode:"OUTSIDE",nextAction:"upstream",relatedTaskIds:[blocked]}
+  }),e=>e.code==="DEVELOPER_ISSUE_SESSION_REQUIRED");
+  await assert.rejects(store.appendTaskEvent("fixture",source,{
+    operationId:"visual.missing.related",eventType:"developer_issue_reported",
+    actorType:"developer_ai",actorId:"dev-visual",sessionId:"sess-one",
+    metadata:{paused:true,failureCode:"OUTSIDE",nextAction:"upstream",
+      relatedTaskIds:["WTB-MISSING-20261107-T1"]}
+  }),e=>e.code==="DEVELOPER_ISSUE_EVIDENCE_REQUIRED");
+  assert.equal((await find(source)).cardStage,"running","rejected event cannot pause task");
+  await store.appendTaskEvent("fixture",source,{
+    operationId:"visual.valid.issue",eventType:"developer_issue_reported",
+    actorType:"developer_ai",actorId:"dev-visual",sessionId:"sess-one",
+    metadata:{paused:true,failureCode:"EXTERNAL_REQUIRED",nextAction:"等待关联BUG正式发布",
+      relatedTaskIds:[blocked,done]}
+  });
+  const active=await find(source);
+  assert.equal(active.cardStage,"paused_by_issue");
+  assert.equal(active.developmentIssue.failureCode,"EXTERNAL_REQUIRED");
+  assert.deepEqual(active.relatedTasks.map(x=>x.status),["已完成","阻断","已取消",null]);
+  await store.appendTaskEvent("fixture",source,{
+    operationId:"visual.issue.clear",eventType:"developer_issue_resolved",
+    actorType:"developer_ai",actorId:"dev-visual",sessionId:"sess-one"
+  });
+  assert.equal((await find(source)).cardStage,"running");
+  assert.equal((await find(source)).developmentIssue,null);
+  const standalone=await store.presentation("fixture",source);
+  assert.equal(standalone.cardStage,"running");
+});
 test("snapshot sorts product/P0 before infrastructure/P0", async (t) => {
   const f = await makeFixture(); t.after(() => fs.rm(f.boardRoot, { recursive: true, force: true }));
   const store = await new TaskStore(f.boardRoot).init();
