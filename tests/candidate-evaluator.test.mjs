@@ -148,3 +148,45 @@ test("R3: unfinished upstream cannot use provisional claim to reach QA or comple
   }), (error) => error.code === "PROVISIONAL_UPSTREAM_NOT_COMPLETE");
   assert.equal((await f.store.getTask("fixture", "DOWN-10")).task.status, "开发中");
 });
+
+
+test("R1: a pending requirement does not erase otherwise eligible developer and QA candidates", async (t) => {
+  const f = await setup(t);
+  await authorize(f);
+  f.evaluator.requirementStore.pending = async () => ({
+    pendingCount: 2, waitingUserCount: 0, items: [
+      { id: "REQ-ONE", status: "待AI拆解" },
+      { id: "REQ-TWO", status: "待AI拆解" }
+    ]
+  });
+  const scan = await f.evaluator.evaluateProject("fixture");
+  assert.equal(scan.watch.pending_requirements, 2, "unprocessed requests remain visible to controller");
+  const dev = scan.candidates.find(item => item.task_id === "DOWN-10");
+  const qa = scan.candidates.find(item => item.task_id === "UP-10");
+  assert.ok(dev);
+  assert.ok(qa);
+  assert.equal(dev.eligible, true, "unrelated pending requirements cannot remove legal developer candidate");
+  assert.equal(dev.provisional, true);
+  assert.equal(dev.blockers.some(item => item.includes("待AI拆解")), false);
+  assert.equal(qa.blockers.some(item => item.includes("待AI拆解")), false,
+    "independent QA remains subject to real QA evidence, not unrelated request intake");
+});
+
+test("R2: pending requirement never weakens STOP, hard dependencies or identity gates", async (t) => {
+  const f = await setup(t);
+  f.evaluator.requirementStore.pending = async () => ({ pendingCount: 1, waitingUserCount: 0 });
+  const upstream = await f.candidate();
+  assert.equal(upstream.eligible, false);
+  assert.match(upstream.blockers.join(" "), /前置任务/);
+  await authorize(f);
+  const eligible = await f.candidate();
+  assert.equal(eligible.eligible, true);
+  await f.store.appendTaskEvent("fixture", "DOWN-10", {
+    operationId: "pending.req.stop.20261106.0001",
+    eventType: "stop_request", actorType: "user", actorId: "real-user",
+    note: "User STOP must still block the claim"
+  });
+  const stopped = await f.candidate();
+  assert.equal(stopped.eligible, false);
+  assert.match(stopped.blockers.join(" "), /stop_request/);
+});

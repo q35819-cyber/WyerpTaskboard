@@ -299,7 +299,6 @@ export class CandidateEvaluator {
         ? await provisionalClaimAuthorization(this.taskStore, projectId, task, tasksById) : null;
       if (!provisional) blockers.push(...dependencyBlockers);
       if (task.assignee || task.sessionId) blockers.push("已有负责人或活动会话");
-      if (requirements.pendingCount > 0) blockers.push("存在待AI拆解的新需求");
       const stop = await this.taskStore.stopState(projectId, task.id).catch(() => ({ stopRequested: false }));
       if (stop.stopRequested) blockers.push("存在stop_request");
       const takeover = await this.taskStore.takeoverState(projectId, task.id).catch(() => ({ suspectedDisconnect: false, takeoverAllowed: false }));
