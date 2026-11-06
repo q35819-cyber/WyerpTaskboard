@@ -231,6 +231,7 @@ try {
         "taskctl transition --project PROJECT --task WTB-TEST-001 --status 待独测 --event-type handoff",
         "taskctl complete --project PROJECT --task WTB-TEST-001 --actor-id ID --session-id ID --note TEXT [--actor-type controller_ai when 交付中] [--report POST_MERGE_PASS_REPORT] [--delivery-worktree REGISTERED_CLEAN_WORKTREE when 交付中]",
         "taskctl delivery-failed --project PROJECT --task WTB-TEST-001 --actor-id ID --session-id ID --failure-stage merge|push|remote_sync|regression|report|verification --failure-code CODE --note REASON --next-action ACTION",
+        "taskctl delivery-rework --project PROJECT --task WTB-TEST-001 --actor-type controller_ai --actor-id ID --session-id ID --candidate-sha SHA --main-sha SHA --note REASON",
         "taskctl changed --project PROJECT --task WTB-TEST-001 --kind code|doc --paths a,b --note TEXT [--invalidates-test true]",
         "taskctl test-start --project PROJECT --task WTB-TEST-001 --note TEXT [--report path] [--actor-type test_ai --actor-id ID --session-id ID]",
         "taskctl test-result --project PROJECT --task WTB-TEST-001 --result pass|fail|blocked --report path --note TEXT [--delivery-actions candidate_merge,...] [--commit-sha SHA --branch feature/name when candidate_merge] [--actor-type test_ai --actor-id ID --session-id ID]",
@@ -604,6 +605,25 @@ try {
         note: required(args, "note"),
         nextAction: required(args, "next-action"),
         metadata: metadata(args)
+      }
+    }));
+  } else if (command === "delivery-rework") {
+    const { project, task } = projectTask(args);
+    await preflight(project, task, args);
+    const before = await current(project, task);
+    if (before.status !== "交付中") throw preflightError(
+      "DELIVERY_REWORK_STAGE_REQUIRED", "仅交付中的任务可凭真实冲突退回开发", { status: before.status });
+    const who = actor(args, "controller_ai");
+    if (who.actorType !== "controller_ai") throw new Error("必须由controller_ai发起冲突返修");
+    required(args, "actor-id"); required(args, "session-id");
+    output(await request("/api/projects/" + encodeURIComponent(project) +
+      "/tasks/" + encodeURIComponent(task) + "/delivery-merge-conflict-rework", {
+      method: "POST",
+      body: {
+        operationId: operationId(args, "delivery_merge_conflict_rework"),
+        expectedRevision: before.registryRevision,
+        ...who, candidateSha: required(args, "candidate-sha"),
+        mainSha: required(args, "main-sha"), note: required(args, "note")
       }
     }));
   } else if (command === "test-start") {
