@@ -19,6 +19,7 @@ async function fixtureWithLedger(t) {
   const fixture = await makeFixture();
   t.after(() => fs.rm(fixture.boardRoot, { recursive: true, force: true }));
   await fs.writeFile(path.join(fixture.projectRoot, "ledger.md"), "# ledger\n", "utf8");
+  await fs.writeFile(path.join(fixture.projectRoot, "计划.md"), "# 合法准备计划\n", "utf8");
   return fixture;
 }
 
@@ -760,7 +761,7 @@ test("developer preparation task is claimable when gates pass and non-developer 
   const prep = candidates.find((x) => x.task_id === "PREP-DEV");
   assert.equal(prep.eligible, true);
   assert.equal(prep.eligible_role, "developer_ai");
-  assert.equal(prep.status, "待准备");
+  assert.equal(prep.status, "待开发");
   assert.equal(candidates.some((x) => x.task_id === "PREP-TEST"), false);
 });
 
@@ -803,7 +804,8 @@ test("hard task prerequisites block candidates until every declared task is comp
   await fs.writeFile(fixture.registryPath, registryText(completedRows), "utf8");
   await scanner.scanOnce();
   const restored = (await scanStore.list()).find((item) => item.task_id === "B-08");
-  assert.equal(restored.detection_id, firstDetectionId);
+  assert.notEqual(restored.detection_id, firstDetectionId, "automatic promotion creates a new status round");
+  assert.equal(restored.status, "待开发");
   assert.equal(restored.eligible, true);
   assert.deepEqual(restored.blockers, []);
 });

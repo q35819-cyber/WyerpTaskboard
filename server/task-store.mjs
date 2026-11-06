@@ -12,6 +12,7 @@ import { ProjectRegistry } from "./project-registry.mjs";
 import { EventStore } from "./event-store.mjs";
 import { TransactionStore } from "./transaction-store.mjs";
 import { ScanStore } from "./scan-store.mjs";
+import { RequirementStore } from "./requirement-store.mjs";
 import { hardDependencyBlockers, provisionalClaimAuthorization, latestAuthorizedTestExecution } from "./candidate-evaluator.mjs";
 
 function assertOperationId(id) {
@@ -185,6 +186,17 @@ async function firstClaimableP0Bug(store, projectId, tasks, actorId, sessionId) 
       !["待准备", "待开发", "待执行", "测试失败待修复"].includes(task.status) ||
       task.assignee || task.sessionId || task.plannedRole !== "开发AI" ||
       !String(task.writeTargets || "").trim() || hardDependencyBlockers(task, byId).length) continue;
+    if (task.status === "待准备") {
+      const plans = planEntries(task);
+      if (!plans.length) continue;
+      try {
+        const context = await store.projects.context(projectId);
+        for (const plan of plans) await resolveProjectPath(context.rootRealPath, plan.path, { mustExist: true, rejectReparse: true });
+      } catch { continue; }
+      const history = await store.events.listTaskEvents(projectId, task.id, { all: true });
+      if (history.some((event) => event.actor_type === "developer_ai"
+        && ["claim", "takeover"].includes(event.event_type))) continue;
+    }
     if ((await store.stopState(projectId, task.id)).stopRequested) continue;
     const takeover = await store.takeoverState(projectId, task.id);
     if (takeover.suspectedDisconnect && !takeover.takeoverAllowed) continue;
@@ -900,6 +912,38 @@ export class TaskStore {
           metadata?.blockedEventId !== allowed.blockedEventId) {
           throw new TaskboardError("临时阻断未满足机器核验条件", {
             code: "AUTO_UNBLOCK_NOT_READY", status: 409
+          });
+        }
+      }
+      if (eventType === "auto_preparation_ready") {
+        const history = await this.events.listTaskEvents(projectId, taskId, { all: true });
+        const messages = await this.userMessageState(projectId, taskId, { actorType: "scanner", actorId: "task-scan", sessionId: "task-scan" });
+        const takeover = await this.takeoverState(projectId, taskId);
+        const pending = await new RequirementStore(this.rootDir).pending(projectId);
+        const preparationUpdatedAt = String(metadata?.preparationUpdatedAt || "");
+        const autoId = "auto_preparation_ready." + crypto.createHash("sha256")
+          .update(projectId + "|" + taskId + "|" + preparationUpdatedAt).digest("hex");
+        const plans = planEntries(currentTask);
+        let planExists = plans.length > 0;
+        if (planExists) {
+          try {
+            for (const plan of plans) await resolveProjectPath(context.rootRealPath, plan.path, { mustExist: true, rejectReparse: true });
+          } catch { planExists = false; }
+        }
+        if (actorType !== "system" || actorId !== "task-scan"
+          || operationId !== autoId || metadata?.preparationUpdatedAt !== currentTask.updatedAt
+          || currentTask.status !== "待准备" || currentTask.plannedRole !== "开发AI"
+          || !planExists || !String(currentTask.writeTargets || "").trim()
+          || currentTask.assignee || currentTask.sessionId || patch.status !== "待开发"
+          || hardDependencyBlockers(currentTask, new Map(parsed.tasks.map((item) => [item.id, item]))).length
+          || (await this.stopState(projectId, taskId)).stopRequested
+          || takeover.suspectedDisconnect || messages.requiresAcknowledgement
+          || messages.messages?.at(-1)?.replies?.length === 0
+          || pending.pendingCount || pending.waitingUserCount
+          || history.some((event) => ["claim", "takeover"].includes(event.event_type)
+            && event.actor_type === "developer_ai")) {
+          throw new TaskboardError("准备任务缺少可信自动准入条件", {
+            code: "AUTO_PREPARATION_NOT_READY", status: 409
           });
         }
       }
