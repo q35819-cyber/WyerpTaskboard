@@ -221,6 +221,7 @@ const TEMPORARY_RESTORE = new Map([
   ["待独测", "待独测"], ["独测中", "待独测"],
   ["待复测", "待复测"], ["复测中", "待复测"]
 ]);
+const TAKEOVER_D01_FIX = "WTB-P0-TAKEOVER-D01-PREDECESSOR-GATE-20261106-T1";
 const VERIFIED_DEV_BLOCK_FIXES = {
   blocked: ["WTB-P0-BLOCKED-DEV-RECOVERY-GATE-20261106-T1"],
   developer_c06_blocked: ["WTB-P0-BLOCKED-DEV-RECOVERY-GATE-20261106-T1",
@@ -252,14 +253,53 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
       || !claim || claim.actor_id !== blocked.actor_id || claim.session_id !== blocked.session_id
       || !dispatch || history.slice(blockIndex + 1).some((event) =>
         ["claim", "takeover"].includes(event.event_type) && event.actor_type === "developer_ai")) return null;
+    let verifiedTakeover = false;
     if (blocked.event_type === "blocked") {
-      const failure = history.slice(history.indexOf(claim) + 1, blockIndex).find((event) =>
-        event.event_type === "developer_claim_checkpoint_predecessor_blocked"
+      const claimIndex = history.indexOf(claim);
+      const failureType = claim.event_type === "takeover"
+        ? "developer_takeover_d01_gate_verified_block"
+        : "developer_claim_checkpoint_predecessor_blocked";
+      const failure = history.slice(claimIndex + 1, blockIndex).find((event) =>
+        event.event_type === failureType
         && event.actor_type === "developer_ai" && event.actor_id === claim.actor_id
         && event.session_id === claim.session_id
         && event.note?.includes("CHECKPOINT_PREDECESSOR_REQUIRED")
         && event.note?.includes(claim.event_id));
-      if (claim.event_type !== "claim" || !failure) return null;
+      if (!failure) return null;
+      if (claim.event_type === "takeover") {
+        const priorIndex = history.findLastIndex((event, index) => index < claimIndex
+          && ["claim", "takeover"].includes(event.event_type)
+          && event.actor_type === "developer_ai" && event.actor_id && event.session_id);
+        const prior = history[priorIndex];
+        const allowedIndex = history.findLastIndex((event, index) => index < claimIndex
+          && event.event_type === "takeover_allowed"
+          && event.operation_id === claim.metadata?.authorizationOperationId
+          && event.actor_type === "developer_ai" && event.actor_id === claim.actor_id
+          && event.session_id === claim.session_id);
+        const allowed = history[allowedIndex];
+        const suspicionIndex = history.findLastIndex((event, index) =>
+          index > priorIndex && index < allowedIndex
+          && event.event_type === "suspected_disconnect"
+          && event.operation_id === allowed?.metadata?.suspicionOperationId
+          && event.actor_type === "developer_ai" && event.actor_id === claim.actor_id
+          && event.session_id === claim.session_id);
+        if (!prior || suspicionIndex < 0 || !allowed
+          || prior.session_id !== claim.metadata?.previousSessionId
+          || priorIndex >= allowedIndex || allowedIndex >= claimIndex
+          || allowed.metadata?.explicitUserOverride !== true
+          || !["chat_user_instruction_cooperative", "browser_user_session"].includes(
+            allowed.metadata?.authorizationSource)
+          || !["task", "project"].includes(allowed.metadata?.authorizationScope)
+          || !String(allowed.metadata?.authorizationQuote || "").trim()
+          || allowed.metadata?.authorizationForwardedBy !== claim.actor_id
+          || allowed.metadata?.authorizationForwardingSessionId !== claim.session_id
+          || allowed.metadata?.authorizedFromSessionId !== prior.session_id
+          || allowed.metadata?.authorizedFromStatus !== claim.old_status
+          || claim.old_status !== "开发中" || claim.new_status !== "开发中"
+          || history.slice(allowedIndex + 1, claimIndex).some((event) =>
+            event.event_type === "takeover_revoked")) return null;
+        verifiedTakeover = true;
+      } else if (claim.event_type !== "claim") return null;
     }
     if (blocked.event_type === "developer_r3_runner_timeout_blocked"
       && (blocked.metadata?.failureStage !== "D07_TEST_3"
@@ -271,7 +311,8 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
         || blocked.metadata?.blockedByWriteScope !== "server/task-step-checkpoint.mjs"
         || blocked.metadata?.candidateWipPreserved !== true
         || !GIT_SHA.test(blocked.metadata?.candidateSha || ""))) return null;
-    for (const fixId of VERIFIED_DEV_BLOCK_FIXES[blocked.event_type]) {
+    for (const fixId of [...VERIFIED_DEV_BLOCK_FIXES[blocked.event_type],
+      ...(verifiedTakeover ? [TAKEOVER_D01_FIX] : [])]) {
       const fix = tasks.find((item) => item.id === fixId && item.status === "已完成");
       if (!fix) return null;
       const releases = await store.events.listTaskEvents(projectId, fixId, { all: true });
@@ -284,6 +325,9 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
         && event.actor_type === "test_ai" && event.actor_id && event.session_id
         && event.metadata?.atomicLifecycle === true && event.metadata?.testResult === "pass");
       if (!qa || releases.indexOf(qa) >= releases.indexOf(delivered)
+        || (verifiedTakeover && (!Number.isFinite(Date.parse(dispatch.timestamp))
+          || !Number.isFinite(Date.parse(delivered?.timestamp || ""))
+          || Date.parse(dispatch.timestamp) <= Date.parse(delivered.timestamp)))
         || proof.deliveryVerified !== true || proof.postMergeRegressionResult !== "PASS"
         || !GIT_SHA.test(proof.mergeCommitSha || "")
         || !GIT_SHA.test(proof.candidateCommitSha || "")
