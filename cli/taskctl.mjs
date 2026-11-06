@@ -191,13 +191,32 @@ async function taskContext(args) {
 function preflightError(code, message, details) {
   const error = new Error(message); error.code = code; error.status = 409; error.details = details; return error;
 }
-async function preflight(project, task, args) {
+async function verifiedInFlight(project, task, args, command) {
+  if (!["test-start", "test-result", "transition"].includes(command)) return false;
+  const actorType = args["actor-type"] || "developer_ai";
+  const actorId = args["actor-id"], sessionId = args["session-id"];
+  if (!actorId || !sessionId) return false;
+  const active = await current(project, task);
+  const developer = actorType === "developer_ai" && ["开发中", "修复中"].includes(active.status);
+  const independent = actorType === "test_ai" && ["独测中", "复测中"].includes(active.status);
+  if (!developer && !independent) return false;
+  if (!active.assignee || active.sessionId !== sessionId) return false;
+  if (command === "transition" && (!developer || args["event-type"] !== "handoff" ||
+    args.status !== (active.status === "修复中" ? "待复测" : "待独测"))) return false;
+  const history = await request("/api/projects/" + encodeURIComponent(project) + "/tasks/" +
+    encodeURIComponent(task) + "/history?limit=200");
+  const events = Array.isArray(history) ? history : history.events || [];
+  const claim = [...events].reverse().find(event => ["claim", "takeover"].includes(event.event_type));
+  return claim?.actor_type === actorType && claim.actor_id === actorId && claim.session_id === sessionId;
+}
+
+async function preflight(project, task, args, command = "") {
   const result = await guardState(project, task, args);
   if (result.stopRequested) throw preflightError("STOP_REQUESTED", "用户已请求停止，必须先处理停止请求", { request: result.request });
   if (result.userMessages?.requiresAcknowledgement) {
     throw preflightError("USER_MESSAGE_ACK_REQUIRED", "存在未读用户留言，必须先阅读、按需回复并确认已读", { unreadMessages: result.userMessages.unreadMessages });
   }
-  if (result.requirements?.pendingCount > 0) {
+  if (result.requirements?.pendingCount > 0 && !(await verifiedInFlight(project, task, args, command))) {
     throw preflightError("REQUIREMENT_INTAKE_PENDING", "存在待AI拆解的新需求，必须先处理需求入口", { requirements: result.requirements.items?.filter((item) => item.status === "待AI拆解") || [] });
   }
   return result;
@@ -492,7 +511,7 @@ try {
     }));
   } else if (command === "transition") {
     const { project, task } = projectTask(args);
-    await preflight(project, task, args);
+    await preflight(project, task, args, command);
     const before = await current(project, task);
     const targetStatus = required(args, "status");
     const atomicDeveloperHandoff =
@@ -608,7 +627,7 @@ try {
     }));
   } else if (command === "test-start") {
     const { project, task } = projectTask(args);
-    await preflight(project, task, args);
+    await preflight(project, task, args, command);
     if (args["actor-type"] === "test_ai" && !args["actor-id"]) throw new Error("--actor-id is required for independent test");
     if (args["actor-type"] === "test_ai") required(args, "session-id");
     output(await request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task) + "/events", {
@@ -622,7 +641,7 @@ try {
     }));
   } else if (command === "test-result") {
     const { project, task } = projectTask(args);
-    await preflight(project, task, args);
+    await preflight(project, task, args, command);
     if (args["actor-type"] === "test_ai" && !args["actor-id"]) throw new Error("--actor-id is required for independent test");
     if (args["actor-type"] === "test_ai") required(args, "session-id");
     const result = required(args, "result");

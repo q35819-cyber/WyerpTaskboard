@@ -739,3 +739,114 @@ test("independent test pass defaults to system auto-close for an unscoped task",
   assert.equal(result.after.assignee, "");
   assert.equal(result.after.sessionId, "");
 });
+
+
+test("R1: pending unrelated requirement permits verified in-flight dev selftest and D08 handoff", async t => {
+  const { fixture, base } = await startFixture(t);
+  const actorId = "dev-inflight", sessionId = "sess-inflight";
+  await preclaim(fixture.boardRoot, base, "A-10", { actorId, sessionId });
+  await taskctl(fixture.boardRoot, base, [
+    "claim", "--project", "fixture", "--task", "A-10",
+    "--actor-type", "developer_ai", "--actor-id", actorId,
+    "--assignee", "开发AI", "--session-name", "合法开发", "--session-id", sessionId
+  ]);
+  const { RequirementStore } = await import("../server/requirement-store.mjs");
+  const requirements = await new RequirementStore(fixture.boardRoot).init();
+  const req = await requirements.create("fixture", {
+    operationId: "req.inflight.20261106.001", text: "与A-10无关的新需求", actorId: "user"
+  });
+  const initial = await requirements.pending("fixture");
+  assert.equal(initial.pendingCount, 1);
+  const started = JSON.parse((await taskctl(fixture.boardRoot, base, [
+    "test-start", "--project", "fixture", "--task", "A-10",
+    "--actor-type", "developer_ai", "--actor-id", actorId,
+    "--session-id", sessionId, "--report", "reports/A-10/R1.md"
+  ])).stdout);
+  assert.equal(started.event.event_type, "test_start");
+  const passed = JSON.parse((await taskctl(fixture.boardRoot, base, [
+    "test-result", "--project", "fixture", "--task", "A-10",
+    "--actor-type", "developer_ai", "--actor-id", actorId,
+    "--session-id", sessionId, "--result", "pass", "--report", "reports/A-10/R1.md"
+  ])).stdout);
+  assert.equal(passed.event.event_type, "test_result");
+  const handed = JSON.parse((await taskctl(fixture.boardRoot, base, [
+    "transition", "--project", "fixture", "--task", "A-10",
+    "--actor-type", "developer_ai", "--actor-id", actorId,
+    "--session-id", sessionId, "--status", "待独测", "--event-type", "handoff"
+  ])).stdout);
+  assert.equal(handed.after.status, "待独测");
+  assert.equal((await requirements.pending("fixture")).pendingCount, 1);
+  assert.equal(req.requirement.status, "待AI拆解");
+});
+
+test("R2: pending requirement rejects spoofed session/actor, new command and STOP", async t => {
+  const { fixture, base } = await startFixture(t);
+  const actorId = "dev-secure", sessionId = "sess-secure";
+  await preclaim(fixture.boardRoot, base, "A-10", { actorId, sessionId });
+  await taskctl(fixture.boardRoot, base, [
+    "claim", "--project", "fixture", "--task", "A-10",
+    "--actor-type", "developer_ai", "--actor-id", actorId,
+    "--assignee", "开发AI", "--session-name", "合法开发", "--session-id", sessionId
+  ]);
+  const { RequirementStore } = await import("../server/requirement-store.mjs");
+  const reqs = await new RequirementStore(fixture.boardRoot).init();
+  await reqs.create("fixture", { operationId: "req.secure.20261106.001", text: "待拆的另一条需求", actorId: "user" });
+  const opts = ["--project", "fixture", "--task", "A-10", "--report", "reports/A-10/R1.md"];
+  for (const [fakeActor, fakeSession] of [["impostor", sessionId], [actorId, "old-session"], ["", sessionId]]) {
+    const args = ["test-start", ...opts, ...(fakeActor ? ["--actor-id", fakeActor] : []),
+      "--actor-type", "developer_ai", "--session-id", fakeSession];
+    await assert.rejects(taskctl(fixture.boardRoot, base, args), err =>
+      /REQUIREMENT_INTAKE_PENDING/.test(err.stderr));
+  }
+  await assert.rejects(taskctl(fixture.boardRoot, base, [
+    "changed", "--project", "fixture", "--task", "A-10",
+    "--kind", "code", "--paths", "web/app.js",
+    "--actor-type", "developer_ai", "--actor-id", actorId, "--session-id", sessionId
+  ]), err => /REQUIREMENT_INTAKE_PENDING/.test(err.stderr));
+  await assert.rejects(taskctl(fixture.boardRoot, base, [
+    "transition", "--project", "fixture", "--task", "A-10", "--status", "待准备",
+    "--actor-type", "developer_ai", "--actor-id", actorId, "--session-id", sessionId
+  ]), err => /REQUIREMENT_INTAKE_PENDING/.test(err.stderr));
+  const { TaskStore } = await import("../server/task-store.mjs");
+  const store = await new TaskStore(fixture.boardRoot).init();
+  await store.appendTaskEvent("fixture", "A-10", {
+    operationId: "req.inflight.stop.fixture.20261106", eventType: "stop_request",
+    actorType: "user", actorId: "real-user", note: "用户暂停"
+  });
+  await assert.rejects(taskctl(fixture.boardRoot, base, [
+    "test-start", ...opts, "--actor-type", "developer_ai",
+    "--actor-id", actorId, "--session-id", sessionId
+  ]), err => /STOP_REQUESTED/.test(err.stderr));
+});
+
+
+test("R1: a pending unrelated requirement preserves legitimate in-flight independent QA verdict", async t => {
+  const { fixture, base } = await startFixture(t);
+  const actorId = "qa-inflight", sessionId = "qa-session-inflight";
+  await preclaim(fixture.boardRoot, base, "T-01", {
+    actorType: "test_ai", actorId, sessionId
+  });
+  await taskctl(fixture.boardRoot, base, [
+    "claim", "--project", "fixture", "--task", "T-01",
+    "--assignee", "独立测试AI", "--session-name", "唯一独测窗口",
+    "--session-id", sessionId, "--actor-type", "test_ai", "--actor-id", actorId
+  ]);
+  const { RequirementStore } = await import("../server/requirement-store.mjs");
+  const requirements = await new RequirementStore(fixture.boardRoot).init();
+  await requirements.create("fixture", {
+    operationId: "req.qa.inflight.20261106.001", text: "与独测无关待拆需求", actorId: "user"
+  });
+  const started = JSON.parse((await taskctl(fixture.boardRoot, base, [
+    "test-start", "--project", "fixture", "--task", "T-01",
+    "--actor-type", "test_ai", "--actor-id", actorId,
+    "--session-id", sessionId, "--report", "reports/T-01/new-QA.md"
+  ])).stdout);
+  assert.equal(started.event.actor_type, "test_ai");
+  const result = JSON.parse((await taskctl(fixture.boardRoot, base, [
+    "test-result", "--project", "fixture", "--task", "T-01",
+    "--result", "fail", "--report", "reports/T-01/new-QA.md",
+    "--actor-type", "test_ai", "--actor-id", actorId, "--session-id", sessionId
+  ])).stdout);
+  assert.equal(result.after.status, "测试失败待修复");
+  assert.equal((await requirements.pending("fixture")).pendingCount, 1);
+});
