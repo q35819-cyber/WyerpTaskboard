@@ -1009,6 +1009,26 @@ export class TaskStore {
         effectiveMetadata = { ...(effectiveMetadata || {}), acceptanceScope };
         effectivePatchInput = { ...patch, status: acceptanceScope === "user_ui_business" ? "待用户验收" : "已完成" };
       }
+      if (actorType === "developer_ai" && ["开发中","修复中"].includes(currentTask.status)
+        && effectivePatchInput?.status === "阻断") {
+        const pause = { ...(effectiveMetadata || {}) };
+        delete pause.externalIssueVerified;
+        delete pause.externalIssueEventId;
+        if (sessionId === currentTask.sessionId) {
+          const events = await this.events.listTaskEvents(projectId, taskId, { all: true });
+          const lastClaim = events.findLastIndex(e => ["claim","takeover"].includes(e.event_type));
+          const proof = events.slice(lastClaim + 1).find(e =>
+            e.event_id === pause.evidenceEventId && e.event_type === "developer_external_issue_reported"
+            && e.actor_type === "developer_ai" && e.actor_id === actorId && e.session_id === sessionId);
+          const issue = proof?.metadata || {};
+          if (issue.errorCode && issue.relatedTaskId && issue.resumeCondition && issue.reportPath
+            && parsed.tasks.some(t => t.id === issue.relatedTaskId && t.id !== taskId)) {
+            pause.externalIssueVerified = true;
+            pause.externalIssueEventId = proof.event_id;
+          }
+        }
+        effectiveMetadata = pause;
+      }
       const effectivePatch = context.workflow.normalizeTaskPatch(currentTask, effectivePatchInput, {
         eventType, actorType, actorId, sessionId, metadata: effectiveMetadata
       });
