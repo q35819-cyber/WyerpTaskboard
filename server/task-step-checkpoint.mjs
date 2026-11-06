@@ -316,6 +316,70 @@ export class TaskStepCheckpoint {
           record.stepId === "D01_CLAIM" && record.eventId === currentClaim?.event_id);
         // A completed legacy QA pass can leave D09 as the developer cursor.
         // A new controller dispatch and a genuinely fresh claim start a new attempt.
+        if (modern && result === "PASS" && state.cursors.developer_ai === "D09_NEXT"
+          && currentClaim?.event_id === eventId && currentClaim?.actor_id === actorId
+          && currentClaim?.session_id === sessionId && currentClaim?.old_status === "待开发"
+          && currentClaim?.new_status === "开发中" && task.status === "开发中"
+          && task.sessionId === sessionId && previouslyStarted && !alreadyRestarted
+          && !(await this.taskStore.stopState(projectId, taskId)).stopRequested
+          && await hardDependenciesCompleted(this.taskStore, projectId, task)) {
+          const reworkIndex = history.findLastIndex((entry, i) => i < currentClaimIndex
+            && entry.event_type === "delivery_merge_conflict_rework");
+          const rework = history[reworkIndex];
+          const qaIndex = history.findLastIndex((entry, i) => i < reworkIndex
+            && entry.event_type === "test_result" && entry.actor_type === "test_ai");
+          const qaPass = history[qaIndex];
+          const controllerClaim = history.slice(qaIndex + 1, reworkIndex).findLast((entry) =>
+            entry.event_type === "claim" && entry.actor_type === "controller_ai"
+            && entry.old_status === "待交付" && entry.new_status === "交付中");
+          const oldDevClaim = history.slice(0, qaIndex).findLast((entry) =>
+            entry.event_type === "claim" && entry.actor_type === "developer_ai");
+          const oldHandoff = history.slice(0, qaIndex).findLast((entry) =>
+            entry.event_type === "handoff" && entry.actor_type === "developer_ai");
+          const qaClaim = history.slice(0, qaIndex).findLast((entry) =>
+            entry.event_type === "claim" && entry.actor_type === "test_ai");
+          const meta = rework?.metadata || {};
+          const failure = history.slice(qaIndex + 1, reworkIndex).findLast((entry) =>
+            entry.event_type === "delivery_attempt_failed"
+            && entry.actor_type === "controller_ai"
+            && entry.actor_id === rework?.actor_id && entry.session_id === rework?.session_id
+            && entry.metadata?.failureStage === "merge"
+            && entry.metadata?.candidateSha === qaPass?.metadata?.commitSha);
+          if (rework?.old_status === "交付中" && rework.new_status === "待开发"
+            && rework.actor_type === "controller_ai" && controllerClaim
+            && controllerClaim.actor_id === rework.actor_id
+            && controllerClaim.session_id === rework.session_id
+            && meta.mergeConflictVerified === true && meta.invalidatesTestEvidence === true
+            && meta.requiresIndependentRetest === true
+            && meta.independentPassEventId === qaPass?.event_id
+            && Boolean(failure?.event_id) && meta.deliveryFailureEventId === failure.event_id
+            && /^[a-f0-9]{40}$/i.test(String(qaPass?.metadata?.commitSha || ""))
+            && meta.candidateSha === qaPass?.metadata?.commitSha
+            && Boolean(String(qaPass?.metadata?.reportPath || "").trim())
+            && meta.originalControllerActorId === rework.actor_id
+            && meta.originalControllerSessionId === rework.session_id
+            && meta.originalDeveloperActorId === actorId
+            && meta.originalDeveloperSessionId === oldDevClaim?.session_id
+            && meta.originalDeveloperSessionId !== sessionId
+            && oldDevClaim?.actor_id === actorId && oldHandoff?.actor_id === actorId
+            && oldHandoff?.session_id === oldDevClaim?.session_id
+            && history.indexOf(oldHandoff) > history.indexOf(oldDevClaim)
+            && qaPass?.metadata?.atomicLifecycle === true
+            && qaPass.metadata.testResult === "pass" && qaPass.old_status === "独测中"
+            && qaPass.new_status === "待交付" && qaPass.actor_id === qaClaim?.actor_id
+            && qaPass.session_id === qaClaim?.session_id
+            && history.findLastIndex((entry) => entry.event_type === "test_result"
+              && entry.actor_type === "test_ai") === qaIndex
+            && state.records.some((entry) => entry.attempt === state.attempts
+              && entry.stepId === "D08_HANDOFF" && entry.result === "PASS")
+            && state.records.some((entry) => entry.attempt === state.attempts
+              && entry.stepId === "Q03_RESULT" && entry.result === "PASS"
+              && entry.verdict === "pass")) {
+            state.attempts += 1;
+            state.cursors.developer_ai = "D01_CLAIM";
+            state.cursors.test_ai = "Q01_ADMISSION";
+          }
+        }
         if (!modern && result === "PASS" && state.cursors.developer_ai === "D09_MERGE_MAIN"
           && currentClaim?.event_id === eventId && currentClaim?.actor_id === actorId
           && currentClaim?.session_id === sessionId && currentClaim?.old_status === "待开发"

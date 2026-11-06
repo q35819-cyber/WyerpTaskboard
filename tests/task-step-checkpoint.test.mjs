@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { TaskStore } from "../server/task-store.mjs";
 import { TaskStepCheckpoint, ROLE_STAGE_STEPS } from "../server/task-step-checkpoint.mjs";
-import { makeFixture } from "./helpers.mjs";
+import { makeFixture, registryText } from "./helpers.mjs";
 
 async function fixture(t) {
   const f = await makeFixture();
@@ -1762,4 +1762,129 @@ test("v2 real QA PASS plus new controller delivery claim reopens C00 then gates 
     actorId: "controller-2", sessionId: "controller-2-session"
   }), (error) => error.code === "CHECKPOINT_FORMAL_EVENT_REQUIRED");
   assert.equal((await cp.show("fixture", "A-10")).sha256, beforeClose.sha256);
+});
+
+
+async function modernDeliveryRework(t, options = {}) {
+  const f = await makeFixture();
+  t.after(() => fs.rm(f.boardRoot, { recursive: true, force: true }));
+  const row = ["A-10", "F-DELIVERY", "product", "P0", "开发中", "开发AI",
+    "developer", "dev", options.oldSession ? "old-session" : "new-session", "2026-11-06T01:00:00Z",
+    "现代交付冲突D01返修", "测试计划.md", "cp/A-10.md"];
+  let registry = registryText([row]);
+  if (options.dependency) registry = registry.replace("read/A-10.md", "MISSING-UPSTREAM完成");
+  await fs.writeFile(f.registryPath, registry, "utf8");
+  const taskStore = await new TaskStore(f.boardRoot).init();
+  const cp = await new TaskStepCheckpoint(f.boardRoot, { taskStore, flowVersion: "role-steps-v2" }).init();
+  const oldDev = "developer", oldSession = "old-session", newSession = options.oldSession ? oldSession : "new-session";
+  let serial = 0;
+  async function event(type, role, actor, session, from, to, meta = {}) {
+    const saved = await taskStore.events.append("fixture", {
+      operation_id: "delivery.rework.fixture." + String(++serial).padStart(8, "0"),
+      project_id: "fixture", task_id: "A-10", event_type: type,
+      actor_type: role, actor_id: actor, session_id: session,
+      old_status: from, new_status: to, old_priority: "P0", new_priority: "P0",
+      old_track: "product", new_track: "product", metadata: meta
+    });
+    return saved.event;
+  }
+  await event("controller_dispatch", "controller_ai", "controller", "controller-session", "待开发", "待开发");
+  const originalClaim = await event("claim", "developer_ai", oldDev, oldSession, "待开发", "开发中");
+  const originalHandoff = options.noHandoff ? null : await event("handoff", "developer_ai", oldDev,
+    oldSession, "开发中", "待独测", { atomicLifecycle: true, completedFromStatus: "开发中", handoffTarget: "待独测" });
+  await event("claim", "test_ai", "qa", "qa-session", "待独测", "独测中");
+  const qaPass = await event("test_result", "test_ai", "qa", "qa-session", "独测中",
+    "待交付", { atomicLifecycle: true, testResult: options.failQa ? "fail" : "pass",
+      reportPath: options.noReport ? "" : "reports/old-QA-PASS.md",
+      commitSha: "a".repeat(40), headBranch: "feature/candidate",
+      deliveryActions: ["candidate_merge"] });
+  await event("claim", "controller_ai", "controller", "controller-session", "待交付", "交付中");
+  const failure = options.noFailure ? null : await event("delivery_attempt_failed", "controller_ai",
+    "controller", "controller-session", "交付中", "交付中",
+    { failureStage: "merge", candidateSha: "a".repeat(40) });
+  if (!options.noRework) await event("delivery_merge_conflict_rework",
+    options.spoofController ? "developer_ai" : "controller_ai",
+    "controller", "controller-session", options.wrongStatus ? "HOLD" : "交付中", "待开发", {
+      mergeConflictVerified: !options.noConflict, invalidatesTestEvidence: true,
+      requiresIndependentRetest: true, independentPassEventId: options.fakeQaEvent ? "evt_fake" : qaPass.event_id,
+      deliveryFailureEventId: failure?.event_id, candidateSha: options.wrongCandidate ? "c".repeat(40) : "a".repeat(40),
+      mainSha: "b".repeat(40),
+      originalDeveloperActorId: options.wrongOldActor ? "someone-else" : oldDev,
+      originalDeveloperSessionId: oldSession,
+      originalControllerActorId: "controller", originalControllerSessionId: "controller-session"
+    });
+  const newClaim = await event("claim", "developer_ai",
+    options.wrongNewActor ? "someone-else" : oldDev, newSession,
+    "待开发", "开发中");
+  if (options.stop) await event("stop_request", "user", "user", "", "开发中", "开发中");
+  const state = {
+    version: 1, projectId: "fixture", taskId: "A-10", flowVersion: "role-steps-v2",
+    cursors: { controller_ai: "C00_A_REQUIREMENTS", developer_ai: "D09_NEXT", test_ai: null },
+    attempts: 1,
+    records: [
+      { stepId: "D01_CLAIM", actorType: "developer_ai", actorId: oldDev,
+        sessionId: oldSession, result: "PASS", attempt: 1, eventId: originalClaim.event_id },
+      { stepId: "D08_HANDOFF", actorType: "developer_ai", actorId: oldDev,
+        sessionId: oldSession, result: "PASS", attempt: 1, eventId: originalHandoff?.event_id },
+      { stepId: "Q03_RESULT", actorType: "test_ai", actorId: "qa",
+        sessionId: "qa-session", result: "PASS", verdict: "pass", attempt: 1, eventId: qaPass.event_id }
+    ],
+    lastAction: { stepId: "D09_NEXT", result: "PASS" }
+  };
+  await fs.writeFile(path.join(f.projectRoot, "cp", "A-10.md"),
+    "## 曾完成的旧轮步骤\n<!-- TASK_STEP_CHECKPOINT_START v1 -->\n" +
+    JSON.stringify(state, null, 2) + "\n<!-- TASK_STEP_CHECKPOINT_END -->\n", "utf8");
+  return { cp, taskStore, newClaim, oldSession, newSession, f };
+}
+
+test("modern merge rework accepts genuine committed chain and starts new D01/D02 without erasing old PASS", async t => {
+  const x = await modernDeliveryRework(t);
+  const old = await x.cp.show("fixture", "A-10");
+  const started = await step(x.cp, "developer_ai", "D01_CLAIM", {
+    actorId: "developer", sessionId: x.newSession, eventId: x.newClaim.event_id
+  });
+  assert.equal(started.state.attempts, 2);
+  assert.equal(started.state.cursors.developer_ai, "D02_WORKTREE");
+  assert.equal(started.state.cursors.test_ai, "Q01_ADMISSION");
+  assert.equal(started.state.records.filter(r => r.attempt === 1 && r.stepId === "Q03_RESULT").length, 1);
+  assert.equal(started.state.records.filter(r => r.attempt === 1 && r.stepId === "D08_HANDOFF").length, 1);
+  assert.ok(started.state.records.length > old.state.records.length);
+  await step(x.cp, "developer_ai", "D02_WORKTREE", { actorId: "developer", sessionId: x.newSession });
+  await assert.rejects(step(x.cp, "developer_ai", "D01_CLAIM", {
+    actorId: "developer", sessionId: x.newSession, eventId: x.newClaim.event_id
+  }), e => e.code === "CHECKPOINT_STEP_ORDER");
+});
+
+test("modern merge rework refuses missing or forged chain, wrong actor/session, STOP and unfinished dependencies without altering checkpoint", async t => {
+  const cases = [
+    ["missing event", { noRework: true }],
+    ["forged developer claim eventId", { fakeClaimEvent: true }],
+    ["wrong QA event pointer", { fakeQaEvent: true }],
+    ["wrong candidate SHA", { wrongCandidate: true }],
+    ["fake controller", { spoofController: true }],
+    ["wrong rework status", { wrongStatus: true }],
+    ["missing conflict proof", { noConflict: true }],
+    ["missing delivery failure", { noFailure: true }],
+    ["wrong original actor", { wrongOldActor: true }],
+    ["old session reuse", { oldSession: true }],
+    ["wrong new actor", { wrongNewActor: true }],
+    ["missing QA PASS", { failQa: true }],
+    ["missing QA report", { noReport: true }],
+    ["missing real handoff", { noHandoff: true }],
+    ["STOP", { stop: true }],
+    ["hard dependency", { dependency: true }]
+  ];
+  for (const [label, options] of cases) {
+    const x = await modernDeliveryRework(t, options);
+    const before = await x.cp.show("fixture", "A-10");
+    await assert.rejects(step(x.cp, "developer_ai", "D01_CLAIM", {
+      actorId: options.wrongNewActor ? "someone-else" : "developer",
+      sessionId: x.newSession, eventId: options.fakeClaimEvent ? "evt_forged" : x.newClaim.event_id
+    }), e => e.code === "CHECKPOINT_STEP_ORDER" ||
+      e.code === "CHECKPOINT_PREDECESSOR_REQUIRED", label);
+    const after = await x.cp.show("fixture", "A-10");
+    assert.equal(after.sha256, before.sha256, label);
+    assert.equal(after.state.attempts, 1, label);
+    assert.equal(after.state.records.length, 3, label);
+  }
 });
