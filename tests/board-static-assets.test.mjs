@@ -232,3 +232,50 @@ test("R2 actual async openTask supports four-level drilldown, back, branches, cl
   resolveLater(tasks[2]);await inflight;
   assert.equal(state.dependencyTrail.join("|"),ids[1],"a previous-project reply cannot pollute the navigation path");
 });
+
+
+test("R1 mutually exclusive ready-column counters count each task exactly once", async () => {
+  const source=await fs.readFile("web/app.js","utf8");
+  const begin=source.indexOf("function renderBoard(){");
+  const end=source.indexOf("function renderList(){",begin);
+  assert.ok(begin>=0&&end>begin);
+  const element=(tag)=>({tag,className:"",textContent:"",children:[],
+    classList:{add(){}},
+    append(...nodes){this.children.push(...nodes)},
+    replaceChildren(...nodes){this.children=nodes}
+  });
+  const tasks=[
+    {id:"DEV-1",track:"product",dev:true},
+    {id:"DEV-2",track:"infrastructure",dev:true},
+    {id:"BUG-1",track:"bugfix",dev:true},
+    {id:"BUG-2",track:"bugfix",dev:true},
+    {id:"BUG-3",track:"bugfix",dev:true},
+    {id:"QA-1",track:"product",dev:false},
+    {id:"QA-BUG-1",track:"bugfix",dev:false},
+    {id:"QA-BUG-2",track:"bugfix",dev:false}
+  ];
+  const board=element("main");
+  const ctx={
+    document:{createElement:element},
+    state:{workflow:{boardColumns:[{id:"qa_pending",title:"待执行",statuses:["待独测","待复测"]}]},
+      filtered:tasks,columnPages:{}},
+    els:{boardView:board},
+    boardTasksForColumn:()=>ctx.state.filtered,
+    paginateColumn:(items)=>({page:1,totalPages:1,visible:items}),
+    PAGE_SIZE:10,
+    isReadyTask:(item)=>item.dev,
+    taskCard:()=>element("article")
+  };
+  vm.runInNewContext(source.slice(begin,end)+"\nthis.renderReadyBoard=renderBoard;",ctx);
+  const check=(items,expected)=>{
+    ctx.state.filtered=items;
+    ctx.renderReadyBoard();
+    const column=board.children[0],head=column.children[0];
+    assert.equal(head.children[1].textContent,expected);
+    const values=[...head.children[1].textContent.matchAll(/(\d+) 项/g)].map(x=>Number(x[1]));
+    assert.equal(values.reduce((sum,value)=>sum+value,0),items.length);
+  };
+  check(tasks,"开发 2 项 · 测试 3 项 · BUG 3 项");
+  check(tasks.filter(x=>x.id.startsWith("QA-BUG")||x.id==="BUG-1"),"开发 0 项 · 测试 2 项 · BUG 1 项");
+  check([tasks[0]],"开发 1 项 · 测试 0 项 · BUG 0 项");
+});
