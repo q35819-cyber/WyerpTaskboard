@@ -89,3 +89,26 @@ test("both technology-stack examples execute their declared test gates", () => {
     assert.equal(result.status, 0, `${example.id} test gate failed\n${result.stdout || ""}\n${result.stderr || ""}`);
   }
 });
+
+test("current dispatch and dependency governance keep both local blocking recovery and published auto-preparation rules", async () => {
+  const pairs = [
+    ["流程文档/06_全任务依赖审计与阻断优先调度规范.md", [
+      "## 2026-11-06｜所有阻断必须有可执行解决链",
+      "真实失败证据与错误码", "唯一责任", "可信机器解阻条件",
+      "auto_preparation_ready", "无需逐张"
+    ]],
+    ["流程文档/总控/C03_DISPATCH_正式派工.md", [
+      "- **阻断修复必须派工**：", "来源失败事件",
+      "正式 controller_dispatch", "auto_preparation_ready",
+      "人工仅处理例外授权"
+    ]]
+  ];
+  for (const [file, rules] of pairs) {
+    const current = await fs.readFile(path.resolve(file), "utf8");
+    const mirrored = await fs.readFile(path.join(templateRoot, file), "utf8");
+    assert.equal(current, mirrored, file + " must match the single governance template");
+    for (const phrase of rules) assert.ok(current.includes(phrase), file + " lost: " + phrase);
+    assert.doesNotMatch(current, /^(?:<<<<<<< |=======|>>>>>>> )/m,
+      "merged governance must not contain unresolved Git conflict markers");
+  }
+});
