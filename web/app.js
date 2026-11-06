@@ -6,7 +6,7 @@ const USER_MESSAGE_PAGE_SIZE=3;
 const DELIVERY_USER_COLUMN_LABEL="待交付 / 待用户";
 const state={
   projects:[],projectId:null,workflow:null,snapshot:null,filtered:[],requirements:[],scanStatus:null,projectServiceStatus:null,
-  selectedTask:null,selectedTaskProjectId:null,projectEpoch:0,projectLoadEpoch:0,projectsLoadEpoch:0,detailEpoch:0,planEpoch:0,view:"board",columnPages:{},userMessages:[],userMessagePage:1
+  selectedTask:null,selectedTaskProjectId:null,dependencyTrail:[],projectEpoch:0,projectLoadEpoch:0,projectsLoadEpoch:0,detailEpoch:0,planEpoch:0,view:"board",columnPages:{},userMessages:[],userMessagePage:1
 };
 const $=id=>document.getElementById(id);
 const els=Object.fromEntries([
@@ -15,7 +15,7 @@ const els=Object.fromEntries([
   "projectRegistryInput","refreshBtn","aiSettingsBtn","aiSettingsDialog","aiSettingsForm","closeAiSettingsBtn","cancelAiSettingsBtn","developerModel","developerReasoning","testModel","testReasoning","scanIntervalMinutes","maxRequestsPerChat","contextWarningAt","timeoutRetryLimit","anomalyWindowMinutes","anomalyLimit","roleSwitchLimit","appVersion","projectHealth","projectService","projectServiceStatus","projectStartRestartBtn","projectStopServiceBtn","scanStatus","summary","searchInput","planFilter","trackFilter",
   "priorityFilter","statusFilter","archiveFilter","boardViewBtn","listViewBtn","boardView","listView","taskTableBody",
   "planDialog","planDialogTitle","planDialogPath","planNavigator","planLocationStatus","planIndexList","planDocumentContent","closePlanDialogBtn",
-  "taskDialog","closeDialogBtn","detailTaskId","detailTitle","userMessagePanel","userMessageCount","userMessageList",
+  "taskDialog","closeDialogBtn","detailTaskId","detailTitle","dependencyBackBtn","dependencyTrail","userMessagePanel","userMessageCount","userMessageList",
   "taskPlanList","responsibilityText","currentProgressText","userAssistanceText","traceabilityText","readDependenciesText","writeTargetsText","relatedArtifactsText","detailMeta",
   "sessionInfo","testResourceSummary","testResourceList","prioritySelect","savePriorityBtn","stopBtn","resumeBtn","suspectDisconnectBtn","allowTakeoverBtn",
   "revokeTakeoverBtn","reviewNote","commentBtn","userAcceptanceActions","acceptBtn","rejectReason","rejectBtn","reloadHistoryBtn","historyList"
@@ -120,7 +120,7 @@ function selectedTaskScope(){
 }
 function sameTask(scope){return !!scope&&sameProject(scope.projectId,scope.epoch)&&state.selectedTask===scope.task&&state.detailEpoch===scope.detailEpoch;}
 function clearProjectDetails(){
-  state.detailEpoch++;state.planEpoch++;state.selectedTask=null;state.selectedTaskProjectId=null;
+  state.detailEpoch++;state.planEpoch++;state.selectedTask=null;state.selectedTaskProjectId=null;state.dependencyTrail=[];
   state.userMessages=[];state.userMessagePage=1;
   for(const dialog of [els.taskDialog,els.planDialog,els.requirementDialog,els.addProjectDialog]){
     if(dialog?.open)dialog.close();
@@ -385,6 +385,65 @@ function documentButton(taskId,doc){
   button.addEventListener("click",event=>{event.stopPropagation();if(sameProject(projectId,epoch))openDocument(taskId,doc.index)});
   return button;
 }
+function taskDependencies(task){
+  const registered=new Map((state.snapshot?.tasks||[]).map(item=>[item.id,item]));
+  return String(task?.readDependencies||"").split(/[;；]/).map(raw=>{
+    const text=raw.trim();
+    if(!text)return null;
+    const matched=/^([A-Za-z][A-Za-z0-9-]+-T[0-9]+)完成$/.exec(text);
+    const id=matched?.[1]||null;
+    return {text,id,task:id?registered.get(id)||null:null};
+  }).filter(Boolean);
+}
+function dependencyTrailFor(trail,taskId,nested){
+  if(!nested)return [taskId];
+  const path=Array.isArray(trail)?trail:[];
+  const previous=path.indexOf(taskId);
+  return previous<0?[...path,taskId]:path.slice(0,previous+1);
+}
+function dependencyButton(ref,nested,projectId,epoch,parentTaskId=null){
+  const button=document.createElement("button");button.type="button";button.className="dependency-link";
+  button.textContent=ref.id;button.title=ref.id+" · "+statusLabel(ref.task.status);
+  button.setAttribute("aria-label","查看前置任务："+ref.id);
+  button.addEventListener("click",event=>{
+    event.stopPropagation();
+    if(sameProject(projectId,epoch)&&ref.id!==state.selectedTask?.id){
+      if(parentTaskId)state.dependencyTrail=[parentTaskId];
+      void openTask(ref.id,nested);
+    }
+  });
+  return button;
+}
+function renderDependencyTrail(){
+  const trail=state.dependencyTrail||[];
+  els.dependencyBackBtn.hidden=trail.length<2;
+  els.dependencyTrail.replaceChildren(...trail.map((taskId,index)=>{
+    const isCurrent=index===trail.length-1;
+    const item=isCurrent?document.createElement("strong"):document.createElement("button");
+    if(!isCurrent){
+      item.type="button";item.className="dependency-trail-link";
+      item.addEventListener("click",()=>{if(state.dependencyTrail.length>index+1)void openTask(taskId,true)});
+    }
+    item.textContent=taskId;item.title=taskId;
+    return item;
+  }));
+}
+function renderTaskDependencies(task){
+  const projectId=state.projectId,epoch=state.projectEpoch;
+  const entries=taskDependencies(task);
+  els.readDependenciesText.replaceChildren();
+  if(!entries.length){els.readDependenciesText.textContent="—";return}
+  for(const ref of entries){
+    const row=document.createElement("span");row.className="dependency-item";
+    if(ref.id&&ref.task&&ref.id!==task.id){
+      row.append(dependencyButton(ref,true,projectId,epoch));
+      const status=document.createElement("span");status.textContent=" · "+statusLabel(ref.task.status);row.append(status);
+    }else{
+      row.textContent=ref.text+(ref.id&&!ref.task?"（未登记/不可跳转）":"");
+    }
+    els.readDependenciesText.append(row);
+  }
+}
 function taskCard(task){
   const card=document.createElement("article");card.className="task-card"+(task.track==="bugfix"?" bug-card":"");
   if(task.presentation?.latestUserMessage?.replied){
@@ -401,6 +460,14 @@ function taskCard(task){
   const responsibility=document.createElement("div");responsibility.className="task-responsibility";responsibility.textContent="本任务负责："+(task.presentation?.responsibility||task.boundary||"未填写");
   const progress=document.createElement("div");progress.className="task-progress";progress.textContent="当前进展："+(task.presentation?.currentProgress||statusLabel(task.status));
   card.append(id,h4,badges,planRow,responsibility,progress);
+  const pending=taskDependencies(task).filter(ref=>ref.id&&ref.task?.status!=="已完成");
+  if(pending.length){
+    const links=document.createElement("div");links.className="dependency-card-row";
+    const count=document.createElement("span");count.className="dependency-count";count.textContent="前置 "+pending.length+" 项";links.append(count);
+    const projectId=state.projectId,epoch=state.projectEpoch;
+    for(const ref of pending){if(ref.task&&ref.id!==task.id)links.append(dependencyButton(ref,true,projectId,epoch,task.id));}
+    card.append(links);
+  }
   const candidate=developerCandidateFor(task);
   if(candidate?.blockers?.length||(task.status==="待执行"&&!isReadyTask(task))){const why=document.createElement("div");why.className="task-user-assistance";why.textContent="暂不能执行："+(candidate?.blockers?.length?candidate.blockers.join("；"):"缺少有效的最新准入扫描结果");card.append(why);}
   const assistanceText=task.presentation?.userAssistance||"";
@@ -650,7 +717,9 @@ function renderTestResources(resourceState){
     card.append(head,locator,detail);return card;
   }));
 }
-async function openTask(taskId){
+async function openTask(taskId,nested=false){
+  if(nested&&state.selectedTask?.id===taskId)return;
+  const nextTrail=dependencyTrailFor(state.dependencyTrail,taskId,nested);
   const projectId=state.projectId,epoch=state.projectEpoch,request=++state.detailEpoch;
   state.selectedTask=null;state.selectedTaskProjectId=null;
   if(!projectId||!(state.snapshot?.tasks||[]).some(task=>task.id===taskId))return;
@@ -658,6 +727,7 @@ async function openTask(taskId){
     const data=await api("/api/projects/"+encodeURIComponent(projectId)+"/tasks/"+encodeURIComponent(taskId));
     if(!sameProject(projectId,epoch)||request!==state.detailEpoch||data.id!==taskId)return;
     state.selectedTask=data;state.selectedTaskProjectId=projectId;
+    state.dependencyTrail=nextTrail;renderDependencyTrail();
     els.detailTaskId.textContent=data.id;els.detailTitle.textContent=taskTitle(data);
     const p=data.presentation||{};
     els.taskPlanList.replaceChildren(...(p.plans||[]).map(plan=>planButton(data.id,plan)));
@@ -666,7 +736,7 @@ async function openTask(taskId){
     els.currentProgressText.textContent=p.currentProgress||statusLabel(data.status);
     els.userAssistanceText.textContent=p.userAssistance||"当前无需你操作";
     els.traceabilityText.textContent=p.traceability||data.traceability||"—";
-    els.readDependenciesText.textContent=data.readDependencies||"—";
+    renderTaskDependencies(data);
     els.writeTargetsText.textContent=data.writeTargets||"—";
     const documents=p.documents||[];
     els.relatedArtifactsText.replaceChildren(...documents.map(document=>documentButton(data.id,document)));
@@ -695,7 +765,7 @@ async function openTask(taskId){
     els.resumeBtn.disabled=!(data.status==="HOLD"||data.stop?.stopRequested);
     els.allowTakeoverBtn.disabled=!data.takeover?.suspectedDisconnect||data.takeover?.takeoverAllowed;
     els.revokeTakeoverBtn.disabled=!data.takeover?.takeoverAllowed;
-    els.taskDialog.showModal();await loadHistory();
+    if(!els.taskDialog.open)els.taskDialog.showModal();await loadHistory();
   }catch(error){if(sameProject(projectId,epoch)&&request===state.detailEpoch)toast(error.message,true)}
 }
 async function loadHistory(){
@@ -860,6 +930,10 @@ els.boardViewBtn.addEventListener("click",()=>{state.view="board";render()});
 els.listViewBtn.addEventListener("click",()=>{state.view="list";render()});
 els.closePlanDialogBtn.addEventListener("click",()=>els.planDialog.close());
 els.closeDialogBtn.addEventListener("click",()=>els.taskDialog.close());
+els.taskDialog.addEventListener("close",()=>{state.dependencyTrail=[];state.detailEpoch++});
+els.dependencyBackBtn.addEventListener("click",()=>{
+  const path=state.dependencyTrail;if(path.length>1)void openTask(path[path.length-2],true);
+});
 els.reloadHistoryBtn.addEventListener("click",loadHistory);
 els.suspectDisconnectBtn.addEventListener("click",()=>mutateTask("/takeover/suspect",{operationId:opId("suspected_disconnect"),note:els.reviewNote.value.trim()||"用户标记疑似失联；尚未授权异常接管"},"已标记疑似失联（尚未授权接管）"));
 els.allowTakeoverBtn.addEventListener("click",()=>{
