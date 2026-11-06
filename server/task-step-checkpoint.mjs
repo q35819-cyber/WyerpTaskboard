@@ -556,7 +556,18 @@ export class TaskStepCheckpoint {
             && entry.metadata?.authorizationForwardingSessionId === sessionId
             && entry.metadata?.authorizedFromSessionId === authorityEvent.metadata?.previousSessionId
             && entry.metadata?.authorizedFromStatus === authorityEvent.old_status);
+          const authorization = history[allowedIndex];
+          const suspicionIndex = history.findIndex((entry, index) =>
+            index > priorDeveloperIndex && index < allowedIndex
+            && entry.event_type === "suspected_disconnect"
+            && entry.operation_id === authorization?.metadata?.suspicionOperationId
+            && entry.actor_type === "developer_ai" && entry.actor_id === actorId
+            && entry.session_id === sessionId);
+          const revoked = history.slice(allowedIndex + 1, authorityIndex).some((entry) =>
+            entry.event_type === "takeover_revoked");
           authorizedTakeover = priorDeveloperIndex >= 0 && allowedIndex >= 0
+            && suspicionIndex >= 0 && !revoked
+            && String(authorization?.metadata?.authorizationQuote || "").trim().length > 0
             && dispatchIndex > priorDeveloperIndex
             && history[priorDeveloperIndex].session_id === authorityEvent.metadata?.previousSessionId
             && authorityEvent.old_status === authorityEvent.new_status
