@@ -34,6 +34,20 @@ async function change(store, id, patch, eventType, metadata = {}, actorType = "s
   });
 }
 
+// Historical recovery fixtures still need a legitimate developer issue before releasing an active Session.
+async function developerPause(store, id, patch, eventType, metadata = {}, sessionId = "dev-session", actorType = "developer_ai") {
+  if (actorType !== "developer_ai") return change(store, id, patch, eventType, metadata, actorType, sessionId);
+  const relatedTaskId = (await store.snapshot("fixture")).tasks.find(task => task.id !== id)?.id;
+  const issue = await store.appendTaskEvent("fixture", id, {
+    operationId: "legacy.pause.issue." + (++sequence), eventType: "developer_external_issue_reported",
+    actorType, actorId: "fixture-actor", sessionId,
+    metadata: { errorCode: "EXTERNAL_FIX_NOT_RELEASED", relatedTaskId,
+      resumeCondition: relatedTaskId + "正式发布后复核",
+      reportPath: "reports/" + id + "/EXTERNAL-ISSUE.md" }
+  });
+  return change(store, id, patch, eventType,
+    { ...metadata, evidenceEventId: issue.event.event_id }, actorType, sessionId);
+}
 async function block(store, id, conditions) {
   return change(store, id, { status: "阻断", assignee: "", sessionId: "" },
     "temporary_block", { conditions });
@@ -51,10 +65,10 @@ async function blockedD01(t, { dependency = "", fakeActor = false, earlierDispat
   await change(f.store, "A-10", { status: "开发中", assignee: "developer",
     sessionWindowName: "developer", sessionId: "dev-session" },
   "claim", {}, "developer_ai", "dev-session");
-  const blocked = await change(f.store, "A-10", {
+  const blocked = await developerPause(f.store, "A-10", {
     status: "阻断", assignee: "", sessionId: "", sessionWindowName: ""
-  }, "developer_d01_missing_controller_dispatch_block", {}, fakeActor ? "system" : "developer_ai",
-  "dev-session");
+  }, "developer_d01_missing_controller_dispatch_block", {}, "dev-session",
+  fakeActor ? "system" : "developer_ai");
   return { ...f, blocked };
 }
 
@@ -88,13 +102,13 @@ async function blockedD09(t, { release = true, qaPass = true, published = true,
   await f.store.appendTaskEvent("fixture", "A-10", {
     operationId: "d09.fail." + (++sequence),
     eventType: "developer_checkpoint_resume_blocked",
-    actorType: "developer_ai", actorId: "fixture-actor", sessionId: "",
+    actorType: "developer_ai", actorId: "fixture-actor", sessionId: "old-session",
     note: "D09_MERGE_MAIN CHECKPOINT_STEP_ORDER "
       + (untrustedNote ? "fabricated" : claim.eventId)
   });
-  const blocked = await change(f.store, "A-10", {
+  const blocked = await developerPause(f.store, "A-10", {
     status: "阻断", assignee: "", sessionWindowName: "", sessionId: ""
-  }, "developer_step_cursor_blocked", {}, "developer_ai", "");
+  }, "developer_step_cursor_blocked", {}, "old-session");
   if (unmetHardDependency) {
     const lines = (await fs.readFile(f.registryPath, "utf8")).split(/\r?\n/);
     const index = lines.findIndex((line) => line.startsWith("| A-10 |"));
@@ -209,9 +223,9 @@ test("D01 machine restores pending work even when an unrelated QA or delivery ta
     await change(store, "A-10", { status: "开发中", assignee: "developer",
       sessionWindowName: "developer", sessionId: "dev-session" },
     "claim", {}, "developer_ai", "dev-session");
-    await change(store, "A-10", {
+    await developerPause(store, "A-10", {
       status: "阻断", assignee: "", sessionId: "", sessionWindowName: ""
-    }, "developer_d01_missing_controller_dispatch_block", {}, "developer_ai", "dev-session");
+    }, "developer_d01_missing_controller_dispatch_block");
     await dispatchD01(store);
     await evaluator.evaluateProject("fixture");
     assert.equal(await status(store, "A-10"), "待开发", otherStatus);
@@ -324,9 +338,9 @@ test("authentic developer full-suite pause resumes after its recorded requiredTa
     operationId: "claim.pause.fixture." + (++sequence), eventType: "claim", actorType: "developer_ai",
     actorId: "fixture-actor", sessionId: "dev-session"
   });
-  await change(store, "A-10", { status: "阻断", assignee: "", sessionId: "" },
+  await developerPause(store, "A-10", { status: "阻断", assignee: "", sessionId: "" },
     "developer_paused_for_independent_full_suite_gate",
-    { requiredTask: "B-10", candidateSha: "a".repeat(40) }, "developer_ai", "dev-session");
+    { requiredTask: "B-10", candidateSha: "a".repeat(40) });
   await evaluator.evaluateProject("fixture");
   assert.equal(await status(store, "A-10"), "阻断");
   await change(store, "B-10", { status: "已完成", assignee: "", sessionId: "" },
@@ -343,9 +357,8 @@ test("authentic developer full-suite pause resumes after its recorded requiredTa
 test("unclaimed, unknown and stopped developer pauses cannot auto-resume", async (t) => {
   const rows = [row("A-10", "开发中", { owner: "dev", session: "dev-session" }), row("B-10", "已完成")];
   const forged = await setup(t, rows);
-  await change(forged.store, "A-10", { status: "阻断", assignee: "", sessionId: "" },
-    "developer_paused_for_independent_full_suite_gate", { requiredTask: "B-10" },
-    "developer_ai", "dev-session");
+  await developerPause(forged.store, "A-10", { status: "阻断", assignee: "", sessionId: "" },
+    "developer_paused_for_independent_full_suite_gate", { requiredTask: "B-10" });
   await forged.evaluator.evaluateProject("fixture");
   assert.equal(await status(forged.store, "A-10"), "阻断", "an unclaimed pause is not proof");
 
@@ -354,9 +367,8 @@ test("unclaimed, unknown and stopped developer pauses cannot auto-resume", async
     operationId: "claim.invalidpause.fixture." + (++sequence), eventType: "claim",
     actorType: "developer_ai", actorId: "fixture-actor", sessionId: "dev-session"
   });
-  await change(invalid.store, "A-10", { status: "阻断", assignee: "", sessionId: "" },
-    "developer_paused_for_independent_full_suite_gate", { requiredTask: "UNKNOWN" },
-    "developer_ai", "dev-session");
+  await developerPause(invalid.store, "A-10", { status: "阻断", assignee: "", sessionId: "" },
+    "developer_paused_for_independent_full_suite_gate", { requiredTask: "UNKNOWN" });
   await invalid.evaluator.evaluateProject("fixture");
   assert.equal(await status(invalid.store, "A-10"), "阻断");
 
@@ -365,9 +377,8 @@ test("unclaimed, unknown and stopped developer pauses cannot auto-resume", async
     operationId: "claim.stoppedpause.fixture." + (++sequence), eventType: "claim",
     actorType: "developer_ai", actorId: "fixture-actor", sessionId: "dev-session"
   });
-  await change(stopped.store, "A-10", { status: "阻断", assignee: "", sessionId: "" },
-    "developer_paused_for_independent_full_suite_gate", { requiredTask: "B-10" },
-    "developer_ai", "dev-session");
+  await developerPause(stopped.store, "A-10", { status: "阻断", assignee: "", sessionId: "" },
+    "developer_paused_for_independent_full_suite_gate", { requiredTask: "B-10" });
   await stopped.store.appendTaskEvent("fixture", "A-10", {
     operationId: "stop.pause.fixture." + (++sequence), eventType: "stop_request", actorType: "user"
   });
