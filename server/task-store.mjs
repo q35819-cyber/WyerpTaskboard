@@ -219,6 +219,15 @@ const VERIFIED_DEV_BLOCK_FIXES = {
     "WTB-P0-BLOCKED-DEV-RECOVERY-GATE-20261106-T1",
     "WTB-P0-DELIVERY-REWORK-D01-CHECKPOINT-20261106-T1"]
 };
+function originalDeveloperAuthorization(history, claim, task) {
+  if (claim?.new_status !== "开发中" || !String(task.plan || "").trim()
+    || !String(task.writeTargets || "").trim()) return false;
+  const index = history.indexOf(claim);
+  return index > 0 && history.slice(0, index).some((event) =>
+    ["task_created", "controller_dispatch"].includes(event.event_type)
+    && event.actor_type === "controller_ai" && event.actor_id && event.session_id
+    && (event.event_type !== "task_created" || event.old_status === null));
+}
 async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) {
   if (task.status !== "阻断" || task.assignee || task.sessionId) return null;
   const history = await store.events.listTaskEvents(projectId, task.id, { all: true });
@@ -233,12 +242,10 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
     const claim = history.slice(0, blockIndex).findLast((event) =>
       ["claim", "takeover"].includes(event.event_type) && event.actor_type === "developer_ai"
       && event.new_status === "开发中" && event.actor_id && event.session_id);
-    const dispatch = history.slice(blockIndex + 1).find((event) =>
-      event.event_type === "controller_dispatch" && event.actor_type === "controller_ai"
-      && event.actor_id && event.session_id);
     if (blocked.old_status !== "开发中" || blocked.actor_type !== "developer_ai"
-      || !claim || claim.actor_id !== blocked.actor_id || claim.session_id !== blocked.session_id
-      || !dispatch || history.slice(blockIndex + 1).some((event) =>
+      || !originalDeveloperAuthorization(history, claim, task)
+      || claim.actor_id !== blocked.actor_id || claim.session_id !== blocked.session_id
+      || history.slice(blockIndex + 1).some((event) =>
         ["claim", "takeover"].includes(event.event_type) && event.actor_type === "developer_ai")) return null;
     if (blocked.event_type === "blocked") {
       const failure = history.slice(history.indexOf(claim) + 1, blockIndex).find((event) =>
@@ -302,9 +309,6 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
       && event.note?.includes("CHECKPOINT_STEP_ORDER")
       && event.note?.includes("D09_MERGE_MAIN")
       && event.note?.includes(claim?.event_id));
-    const dispatch = history.slice(blockIndex + 1).find((event) =>
-      event.event_type === "controller_dispatch" && event.actor_type === "controller_ai"
-      && event.actor_id && event.session_id);
     const fix = tasks.find((item) =>
       item.id === "WTB-P0-LEGACY-D09-REENTRY-BUG-20261105-T1");
     const fixHistory = fix?.status === "已完成"
@@ -317,16 +321,16 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
       && event.metadata?.atomicLifecycle === true && event.metadata?.testResult === "pass");
     const release = delivered?.metadata || {};
     if (blocked.old_status !== "开发中" || blocked.actor_type !== "developer_ai"
-      || !claim || !failure || failure.actor_id !== blocked.actor_id
-      || failure.session_id !== blocked.session_id || !dispatch
+      || !originalDeveloperAuthorization(history, claim, task)
+      || !failure || failure.actor_id !== blocked.actor_id
+      || failure.session_id !== blocked.session_id
       || history.slice(blockIndex + 1).some((event) =>
         event.event_type === "claim" && event.actor_type === "developer_ai")
       || !qaPass || !delivered.actor_id || !delivered.session_id
       || release.deliveryVerified !== true || release.postMergeRegressionResult !== "PASS"
       || release.candidateCommitSha !== qaPass.metadata.commitSha
       || !/^[a-f0-9]{40}$/i.test(release.mergeCommitSha || "")
-      || release.remoteMainSha !== release.mergeCommitSha
-      || Date.parse(dispatch.timestamp) <= Date.parse(delivered.timestamp)) return null;
+      || release.remoteMainSha !== release.mergeCommitSha) return null;
     try {
       if ((await runGit(context.rootRealPath,
         ["merge-base", "--is-ancestor", release.mergeCommitSha, "HEAD"])).code !== 0) return null;
@@ -341,20 +345,16 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
     const oldClaimIndex = history.findLastIndex((event, index) => index < blockIndex
       && event.event_type === "claim" && event.actor_type === "developer_ai");
     const oldClaim = history[oldClaimIndex];
-    const newDispatch = history.slice(blockIndex + 1).some((event) =>
-      event.event_type === "controller_dispatch" && event.actor_type === "controller_ai"
-      && Boolean(event.actor_id) && Boolean(event.session_id));
     if (blocked.old_status !== "开发中" || blocked.actor_type !== "developer_ai"
-      || !blocked.session_id || !oldClaim || oldClaim.new_status !== "开发中"
+      || !blocked.session_id || oldClaim?.new_status !== "开发中"
+      || !originalDeveloperAuthorization(history, oldClaim, task)
       || oldClaim.actor_id !== blocked.actor_id || oldClaim.session_id !== blocked.session_id
-      || !newDispatch || history.slice(oldClaimIndex + 1, blockIndex).some((event) =>
-        event.event_type === "controller_dispatch" && event.actor_type === "controller_ai")
       || history.slice(blockIndex + 1).some((event) =>
-        event.event_type === "claim" && event.actor_type === "developer_ai")) return null;
+        ["claim", "takeover"].includes(event.event_type) && event.actor_type === "developer_ai")) return null;
     const messages = await store.userMessageState(projectId, task.id, {
       actorType: "scanner", actorId: "task-scan", sessionId: "task-scan"
     });
-    if (messages.messages?.at(-1)?.replies?.length === 0) return null;
+    if (messages.requiresAcknowledgement || messages.messages?.at(-1)?.replies?.length === 0) return null;
   }
   if (developerPause) {
     if (blocked.actor_type !== "developer_ai" || blocked.old_status !== "开发中") return null;

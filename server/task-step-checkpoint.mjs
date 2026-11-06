@@ -68,6 +68,25 @@ async function hardDependenciesCompleted(taskStore, projectId, task) {
   return ids.every((id) => snapshot.tasks.some((entry) =>
     entry.id === id && entry.status === "已完成"));
 }
+async function committedAutoRecovery(store, projectId, taskId, history, priorClaimIndex, claimIndex) {
+  if (priorClaimIndex < 0 || claimIndex <= priorClaimIndex) return false;
+  const recovery = history.slice(priorClaimIndex + 1, claimIndex).findLast((event) =>
+    event.event_type === "auto_unblock" && event.actor_type === "system"
+    && event.actor_id === "task-scan" && event.old_status === "阻断"
+    && event.new_status === "待开发" && event.metadata?.restoreStatus === "待开发");
+  const blockedIndex = history.findIndex((event) =>
+    event.event_id === recovery?.metadata?.blockedEventId);
+  if (!recovery || blockedIndex <= priorClaimIndex
+    || blockedIndex >= history.indexOf(recovery)
+    || history[blockedIndex]?.new_status !== "阻断") return false;
+  const operationId = "auto_unblock." + SHA(projectId + "|" + taskId + "|" + recovery.metadata.blockedEventId);
+  if (recovery.operation_id !== operationId) return false;
+  const transaction = await store.transactions.read(operationId);
+  return transaction?.state === "committed" && transaction.result?.eventId === recovery.event_id
+    && transaction.event?.event_type === "auto_unblock"
+    && transaction.event?.actor_type === "system"
+    && transaction.event?.metadata?.blockedEventId === recovery.metadata.blockedEventId;
+}
 function emptyState(projectId, taskId, flowVersion) {
   return {
     version: 1, projectId, taskId, flowVersion,
@@ -314,6 +333,22 @@ export class TaskStepCheckpoint {
           record.stepId === "D01_CLAIM" && record.result === "PASS");
         const alreadyRestarted = state.records.some((record) =>
           record.stepId === "D01_CLAIM" && record.eventId === currentClaim?.event_id);
+        const priorDeveloperIndex = history.findLastIndex((entry, index) =>
+          index < currentClaimIndex && entry.actor_type === "developer_ai"
+          && ["claim", "takeover"].includes(entry.event_type));
+        const autoRecovery = await committedAutoRecovery(this.taskStore, projectId,
+          taskId, history, priorDeveloperIndex, currentClaimIndex);
+        if (result === "PASS" && autoRecovery && previouslyStarted && !alreadyRestarted
+          && currentClaim?.event_id === eventId && currentClaim.actor_id === actorId
+          && currentClaim.session_id === sessionId && currentClaim.old_status === "待开发"
+          && currentClaim.new_status === "开发中" && task.status === "开发中"
+          && task.sessionId === sessionId
+          && !(await this.taskStore.stopState(projectId, taskId)).stopRequested
+          && await hardDependenciesCompleted(this.taskStore, projectId, task)) {
+          state.attempts += 1;
+          state.cursors.developer_ai = "D01_CLAIM";
+          state.cursors.test_ai = "Q01_ADMISSION";
+        }
         // A completed legacy QA pass can leave D09 as the developer cursor.
         // A new controller dispatch and a genuinely fresh claim start a new attempt.
         if (modern && result === "PASS" && state.cursors.developer_ai === "D09_NEXT"
@@ -562,8 +597,11 @@ export class TaskStepCheckpoint {
             && authorityEvent.old_status === authorityEvent.new_status
             && ["开发中", "修复中"].includes(authorityEvent.old_status);
         }
+        const trustedRestoration = authorityEvent?.event_type === "claim"
+          && await committedAutoRecovery(this.taskStore, projectId, taskId, history,
+            priorDeveloperIndex, authorityIndex);
         if (authorityEvent?.event_id !== currentClaim?.event_id
-          || dispatchIndex < 0 || !authorizedTakeover || task.sessionId !== sessionId
+          || (dispatchIndex < 0 && !trustedRestoration) || !authorizedTakeover || task.sessionId !== sessionId
           || !["开发中", "修复中"].includes(task.status)
           || (await this.taskStore.stopState(projectId, taskId)).stopRequested
           || !(await hardDependenciesCompleted(this.taskStore, projectId, task))) {

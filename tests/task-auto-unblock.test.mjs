@@ -5,6 +5,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { TaskStore } from "../server/task-store.mjs";
 import { CandidateEvaluator } from "../server/candidate-evaluator.mjs";
+import { TaskStepCheckpoint } from "../server/task-step-checkpoint.mjs";
 import { makeFixture, registryText } from "./helpers.mjs";
 
 let sequence = 0;
@@ -40,22 +41,37 @@ async function block(store, id, conditions) {
 }
 const status = async (store, id) => (await store.getTask("fixture", id)).task.status;
 
-async function blockedD01(t, { dependency = "", fakeActor = false, earlierDispatch = false } = {}) {
+async function blockedD01(t, { dependency = "", fakeActor = false,
+  originalAuthorization = true, withCheckpoint = false } = {}) {
   const f = await setup(t, [row("A-10", "开发中", {
     owner: "developer", session: "dev-session", dependencies: dependency
   }), row("B-10", "已完成")]);
-  if (earlierDispatch) await f.store.appendTaskEvent("fixture", "A-10", {
+  if (originalAuthorization) await f.store.appendTaskEvent("fixture", "A-10", {
     operationId: "d01.earlier.dispatch." + (++sequence), eventType: "controller_dispatch",
     actorType: "controller_ai", actorId: "controller", sessionId: "ctrl-session"
   });
-  await change(f.store, "A-10", { status: "开发中", assignee: "developer",
+  const claim = await change(f.store, "A-10", { status: "开发中", assignee: "developer",
     sessionWindowName: "developer", sessionId: "dev-session" },
   "claim", {}, "developer_ai", "dev-session");
+  const checkpoint = withCheckpoint
+    ? await new TaskStepCheckpoint(f.boardRoot, { taskStore: f.store, flowVersion: "role-steps-v1" }).init()
+    : null;
+  if (checkpoint) {
+    for (const [stepId, eventId] of [["D01_CLAIM", claim.eventId], ["D02_WORKTREE", null]]) {
+      const before = await checkpoint.show("fixture", "A-10");
+      await checkpoint.record("fixture", "A-10", {
+        operationId: "d01.original.step." + (++sequence),
+        expectedSha256: before.sha256, stepId,
+        actorType: "developer_ai", actorId: "fixture-actor", sessionId: "dev-session",
+        result: "PASS", eventId, evidence: "valid original developer step " + stepId
+      });
+    }
+  }
   const blocked = await change(f.store, "A-10", {
     status: "阻断", assignee: "", sessionId: "", sessionWindowName: ""
   }, "developer_d01_missing_controller_dispatch_block", {}, fakeActor ? "system" : "developer_ai",
   "dev-session");
-  return { ...f, blocked };
+  return { ...f, blocked, checkpoint };
 }
 
 async function dispatchD01(store, actorType = "controller_ai") {
@@ -81,6 +97,11 @@ async function blockedD09(t, { release = true, qaPass = true, published = true,
   git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
     "commit", "-m", "D09 published fixture");
   const mainSha = git("rev-parse", "HEAD");
+  await f.store.appendTaskEvent("fixture", "A-10", {
+    operationId: "d09.original.dispatch." + (++sequence),
+    eventType: "controller_dispatch", actorType: "controller_ai",
+    actorId: "controller", sessionId: "controller-session"
+  });
   const claim = await change(f.store, "A-10", {
     status: "开发中", assignee: "old-dev", sessionWindowName: "old-dev",
     sessionId: "old-session"
@@ -137,8 +158,8 @@ async function blockedD09(t, { release = true, qaPass = true, published = true,
   return { ...f, blocked, mainSha };
 }
 
-test("published D09 fix and fresh dispatch recover a real old D09 cursor block once", async (t) => {
-  const { store, evaluator, blocked } = await blockedD09(t);
+test("published D09 fix restores original authorized block without fresh dispatch", async (t) => {
+  const { store, evaluator, blocked } = await blockedD09(t, { dispatch: false });
   await Promise.all([evaluator.evaluateProject("fixture"), evaluator.evaluateProject("fixture")]);
   assert.equal(await status(store, "A-10"), "待开发");
   const history = await store.taskHistory("fixture", "A-10", { all: true });
@@ -160,7 +181,6 @@ test("published D09 fix and fresh dispatch recover a real old D09 cursor block o
 test("D09 recovery denies missing/forged proof, stale dispatch, unpublished fix and STOP", async (t) => {
   for (const options of [
     { release: false }, { qaPass: false }, { published: false },
-    { dispatch: false }, { dispatchBeforeRelease: true },
     { stopped: true }, { untrustedNote: true }, { unfinished: true },
     { unmetHardDependency: true }
   ]) {
@@ -172,11 +192,8 @@ test("D09 recovery denies missing/forged proof, stale dispatch, unpublished fix 
   }
 });
 
-test("D01 missing-dispatch block recovers only after a new authentic controller dispatch", async (t) => {
+test("D01 authorized block recovers without any post-block controller dispatch", async (t) => {
   const { store, evaluator, blocked } = await blockedD01(t);
-  await evaluator.evaluateProject("fixture");
-  assert.equal(await status(store, "A-10"), "阻断");
-  const freshDispatch = await dispatchD01(store);
   const [first, second] = await Promise.all([
     evaluator.evaluateProject("fixture"), evaluator.evaluateProject("fixture")
   ]);
@@ -191,10 +208,61 @@ test("D01 missing-dispatch block recovers only after a new authentic controller 
   assert.equal(unblocks[0].metadata.restoreStatus, "待开发");
   assert.equal((await store.transactions.read(unblocks[0].operation_id))?.state, "committed");
   const oldClaim = history.find(x => x.event_type === "claim");
-  assert.ok(history.findIndex(x => x.event_id === oldClaim.event_id)
-    < history.findIndex(x => x.event_id === freshDispatch.event.event_id));
+  assert.ok(history.findIndex(x => x.event_type === "controller_dispatch")
+    < history.findIndex(x => x.event_id === oldClaim.event_id));
+  assert.equal(history.filter(x => x.event_type === "controller_dispatch").length, 1,
+    "no second human dispatch is required");
   assert.equal(history.filter(x => x.event_type === "claim").length, 1,
     "auto restore must not fabricate a retroactive claim");
+});
+
+test("committed auto recovery reopens D01 without fresh dispatch or losing old steps", async (t) => {
+  const { store, evaluator, checkpoint } = await blockedD01(t, { withCheckpoint: true });
+  const old = await checkpoint.show("fixture", "A-10");
+  assert.equal(old.state.cursors.developer_ai, "D03_WRITE_SCOPE");
+  await evaluator.evaluateProject("fixture");
+  assert.equal(await status(store, "A-10"), "待开发");
+  const fresh = await change(store, "A-10", {
+    status: "开发中", assignee: "new-developer", sessionWindowName: "new",
+    sessionId: "new-session"
+  }, "claim", {}, "developer_ai", "new-session");
+  const before = await checkpoint.show("fixture", "A-10");
+  const result = await checkpoint.record("fixture", "A-10", {
+    operationId: "d01.auto.restart." + (++sequence),
+    expectedSha256: before.sha256, stepId: "D01_CLAIM",
+    actorType: "developer_ai", actorId: "fixture-actor", sessionId: "new-session",
+    result: "PASS", eventId: fresh.eventId, evidence: "confirmed automatic recovery new D01"
+  });
+  assert.equal(result.state.attempts, old.state.attempts + 1);
+  assert.equal(result.state.cursors.developer_ai, "D02_WORKTREE");
+  assert.equal(result.state.records.filter((item) => item.stepId === "D02_WORKTREE"
+    && item.attempt === old.state.attempts).length, 1);
+  const history = await store.taskHistory("fixture", "A-10", { all: true });
+  assert.equal(history.filter((item) => item.event_type === "controller_dispatch").length, 1);
+});
+
+test("fake system recovery event cannot reset developer D01 cursor", async (t) => {
+  const { store, checkpoint, blocked } = await blockedD01(t, { withCheckpoint: true });
+  await change(store, "A-10", {
+    status: "待开发", assignee: "", sessionId: "", sessionWindowName: ""
+  }, "manual_bad_transition");
+  await store.appendTaskEvent("fixture", "A-10", {
+    operationId: "d01.fake.auto.unblock." + (++sequence),
+    eventType: "auto_unblock", actorType: "system", actorId: "task-scan",
+    metadata: { blockedEventId: blocked.eventId, restoreStatus: "待开发" }
+  });
+  const fresh = await change(store, "A-10", {
+    status: "开发中", assignee: "fake-developer", sessionWindowName: "fake",
+    sessionId: "fake-session"
+  }, "claim", {}, "developer_ai", "fake-session");
+  const before = await checkpoint.show("fixture", "A-10");
+  await assert.rejects(checkpoint.record("fixture", "A-10", {
+    operationId: "d01.fake.restart." + (++sequence),
+    expectedSha256: before.sha256, stepId: "D01_CLAIM",
+    actorType: "developer_ai", actorId: "fixture-actor", sessionId: "fake-session",
+    result: "PASS", eventId: fresh.eventId, evidence: "fake auto recovery must be rejected"
+  }), (error) => error.code === "CHECKPOINT_STEP_ORDER");
+  assert.equal((await checkpoint.show("fixture", "A-10")).sha256, before.sha256);
 });
 
 test("D01 machine restores pending work even when an unrelated QA or delivery task shares source paths", async (t) => {
@@ -206,13 +274,16 @@ test("D01 machine restores pending work even when an unrelated QA or delivery ta
     });
     second[14] = first[14];
     const { store, evaluator } = await setup(t, [first, second]);
+    await store.appendTaskEvent("fixture", "A-10", {
+      operationId: "d01.original.dispatch." + (++sequence), eventType: "controller_dispatch",
+      actorType: "controller_ai", actorId: "controller", sessionId: "ctrl-session"
+    });
     await change(store, "A-10", { status: "开发中", assignee: "developer",
       sessionWindowName: "developer", sessionId: "dev-session" },
     "claim", {}, "developer_ai", "dev-session");
     await change(store, "A-10", {
       status: "阻断", assignee: "", sessionId: "", sessionWindowName: ""
     }, "developer_d01_missing_controller_dispatch_block", {}, "developer_ai", "dev-session");
-    await dispatchD01(store);
     await evaluator.evaluateProject("fixture");
     assert.equal(await status(store, "A-10"), "待开发", otherStatus);
     assert.equal(await status(store, "B-10"), otherStatus,
@@ -223,10 +294,10 @@ test("D01 machine restores pending work even when an unrelated QA or delivery ta
   }
 });
 
-test("D01 block never auto-recovers with fake dispatch, old dispatch or wrong block actor", async (t) => {
-  for (const options of [{ earlierDispatch: true }, { fakeActor: true }, {}]) {
+test("D01 block rejects absent original authorization and wrong block actor", async (t) => {
+  for (const options of [{ originalAuthorization: false }, { fakeActor: true }]) {
     const { store, evaluator } = await blockedD01(t, options);
-    if (!options.earlierDispatch) await dispatchD01(store, options.fakeActor ? "developer_ai" : "developer_ai");
+    if (options.originalAuthorization === false) await dispatchD01(store, "developer_ai");
     await evaluator.evaluateProject("fixture");
     assert.equal(await status(store, "A-10"), "阻断");
     assert.equal((await store.taskHistory("fixture", "A-10", { all: true }))
@@ -237,7 +308,6 @@ test("D01 block never auto-recovers with fake dispatch, old dispatch or wrong bl
 test("D01 automatic recovery preserves STOP and unresolved user message", async (t) => {
   for (const flag of ["stop", "message"]) {
     const { store, evaluator } = await blockedD01(t);
-    await dispatchD01(store);
     if (flag === "stop") await store.appendTaskEvent("fixture", "A-10", {
       operationId: "d01.stop." + (++sequence), eventType: "stop_request",
       actorType: "user", note: "用户阻止自动重开"
@@ -533,6 +603,11 @@ async function verifiedDeveloperBlockFixture(t, { kind = "blocked", dispatch = t
   git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
     "commit", "-m", "trusted developer block fixture");
   const mainSha = git("rev-parse", "HEAD");
+  await f.store.appendTaskEvent("fixture", "A-10", {
+    operationId: "developer.original.dispatch." + (++sequence),
+    eventType: "controller_dispatch", actorType: "controller_ai",
+    actorId: "controller", sessionId: "controller-session"
+  });
   const claim = await change(f.store, "A-10", {
     status: "开发中", assignee: "developer", sessionWindowName: "developer",
     sessionId: "dev-session"
@@ -607,7 +682,7 @@ async function verifiedDeveloperBlockFixture(t, { kind = "blocked", dispatch = t
   return { ...f, blocked };
 }
 
-test("trusted dispatched developer blocks recover once only after related published fixes", async (t) => {
+test("originally authorized developer blocks recover once after published fixes", async (t) => {
   for (const kind of ["blocked", "developer_c06_blocked",
     "developer_r3_runner_timeout_blocked",
     "developer_d07_checkpoint_unauthorized_dependency_block"]) {
@@ -624,12 +699,12 @@ test("trusted dispatched developer blocks recover once only after related publis
   }
 });
 
-test("developer block recovery rejects missing QA, delivery, dispatch, STOP and false failure proofs", async (t) => {
+test("developer block recovery rejects missing QA, delivery, STOP and false failure proofs", async (t) => {
   for (const options of [
     { missingPredecessor: true }, { missingPredecessor: true, forgedGenericNote: true },
     { missingRootQA: true }, { missingRootDelivery: true },
     { wrongPublishedSha: true }, { wrongCandidateSha: true },
-    { dispatch: false }, { stopped: true },
+    { stopped: true },
     { unfinishedDependency: true }, { kind: "developer_c06_blocked", missingRelatedDelivery: true },
     { kind: "developer_r3_runner_timeout_blocked", wrongMetadata: true },
     { kind: "developer_d07_checkpoint_unauthorized_dependency_block", wrongMetadata: true },
