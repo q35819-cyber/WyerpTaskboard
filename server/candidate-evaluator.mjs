@@ -234,6 +234,37 @@ function reasonFor(task, eligibleRole, blockers) {
   return "当前阶段不进入认领候选";
 }
 
+export function nextRoleCandidate(candidates, { role, actorId, sessionId, attemptedTaskIds = [] } = {}) {
+  if (!["developer_ai", "test_ai", "controller_ai"].includes(role) ||
+    !String(actorId || "").trim() || !String(sessionId || "").trim())
+    return { state: "blocked", candidate: null, reason: "role_actor_session_required" };
+  const attempted = new Set(attemptedTaskIds);
+  const own = candidates.filter((item) => item.eligible_role === role &&
+    !(role === "developer_ai" && item.status === "待交付") &&
+    (!item.eligible_actor_id || item.eligible_actor_id === actorId) &&
+    (!item.eligible_session_id || item.eligible_session_id === sessionId) &&
+    !(role === "developer_ai" && item.status === "测试失败待修复" &&
+      item.original_developer_actor_id && item.original_developer_actor_id !== actorId));
+  const ready = own.filter((item) => item.eligible && !attempted.has(item.task_id));
+  const priorityRank = { P0: 0, P1: 1, P2: 2 };
+  const group = (item) => item.track === "bugfix" ?
+    (item.auto_unblocked_bug ? 0 : 1) : item.status === "测试失败待修复" ? 2 : 3;
+  ready.sort((a, b) =>
+    (role === "developer_ai" ? group(a) - group(b) : 0) ||
+    Number(Boolean(b.user_urgent)) - Number(Boolean(a.user_urgent)) ||
+    Number(b.unlocks_count || 0) - Number(a.unlocks_count || 0) ||
+    (priorityRank[a.priority] ?? 9) - (priorityRank[b.priority] ?? 9) ||
+    String(a.task_updated_at || "").localeCompare(String(b.task_updated_at || "")) ||
+    String(a.task_id).localeCompare(String(b.task_id)));
+  const blocked = own.filter((item) => !item.eligible).slice(0, 8).map((item) => ({
+    taskId: item.task_id, reasons: item.blockers || []
+  }));
+  return ready.length
+    ? { state: "ready", candidate: ready[0], reason: "guard_preclaim_claim_required" }
+    : { state: "exhausted", candidate: null, blocked,
+        reason: blocked.length ? "all_candidates_blocked_or_attempted" : "no_eligible_role_task" };
+}
+
 export class CandidateEvaluator {
   constructor(rootDir, { taskStore, requirementStore, clock = () => Date.now() } = {}) {
     this.rootDir = rootDir;

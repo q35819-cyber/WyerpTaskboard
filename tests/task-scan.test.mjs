@@ -9,11 +9,77 @@ import { makeFixture, registryText } from "./helpers.mjs";
 import { TaskStore } from "../server/task-store.mjs";
 import { RequirementStore } from "../server/requirement-store.mjs";
 import { ScanStore } from "../server/scan-store.mjs";
-import { CandidateEvaluator } from "../server/candidate-evaluator.mjs";
+import { CandidateEvaluator, nextRoleCandidate } from "../server/candidate-evaluator.mjs";
 import { TaskScanner } from "../server/task-scanner.mjs";
 
 const execFileAsync = promisify(execFile);
 const TASK_SCAN_CLI = path.resolve(import.meta.dirname, "..", "cli", "task-scan.mjs");
+
+test("D09 returns eligible next task in priority order, excluding STOP, other roles and other owners", () => {
+  const c = (task_id, priority, eligible, status = "待开发") =>
+    ({ task_id, priority, eligible, status, eligible_role: "developer_ai", track: "product" });
+  const list = [
+    c("P1-READY", "P1", true),
+    { ...c("P0-STOP", "P0", false), blockers: ["stop_request"] },
+    c("P0-READY", "P0", true),
+    { ...c("OTHER-FAIL", "P0", true, "测试失败待修复"), original_developer_actor_id: "other" },
+    { ...c("QA", "P0", true), eligible_role: "test_ai" }
+  ];
+  const me = { role: "developer_ai", actorId: "developer", sessionId: "wc_sess_developer" };
+  assert.equal(nextRoleCandidate(list, me).candidate.task_id, "P0-READY");
+  assert.equal(nextRoleCandidate(list, { ...me, attemptedTaskIds: ["P0-READY"] }).candidate.task_id, "P1-READY");
+  assert.equal(nextRoleCandidate(list, { ...me, attemptedTaskIds: ["P0-READY", "P1-READY"] }).state, "exhausted");
+  assert.equal(nextRoleCandidate(list, { role: "developer_ai" }).state, "blocked");
+  assert.equal(nextRoleCandidate(list, { ...me, role: "test_ai" }).candidate.task_id, "QA");
+  assert.equal(nextRoleCandidate([{...c("BLOCKED", "P0", false), blockers: ["STOP"]}], me).reason,
+    "all_candidates_blocked_or_attempted");
+});
+
+test("D09 awake-role lookup only returns a candidate and never claims or wakes others", async (t) => {
+  const fixture = await fixtureWithLedger(t);
+  const scanner = await new TaskScanner(fixture.boardRoot).init();
+  const me = { projectId: "fixture", role: "developer_ai", actorId: "dev-next", sessionId: "wc_sess_devnext" };
+  const next = await scanner.nextForAwakeRole(me);
+  assert.equal(next.state, "ready");
+  assert.equal(next.candidate.task_id, "A-10");
+  assert.equal((await scanner.nextForAwakeRole({ ...me, attemptedTaskIds: ["A-10"] })).state, "exhausted");
+  assert.equal((await scanner.taskStore.getTask("fixture", "A-10")).task.status, "待开发");
+});
+
+test("D09 preserves 409 rejection and requires visible reporting before another formal claim", async (t) => {
+  const fixture = await fixtureWithLedger(t);
+  const rows = [
+    ["DEV-A","F-A","product","P0","待开发","开发AI","—","—","—","—",
+      "first","测试计划.md","cp/DEV-A.md"],
+    ["DEV-B","F-B","product","P1","待开发","开发AI","—","—","—","—",
+      "second","测试计划.md","cp/DEV-B.md"]
+  ];
+  await fs.writeFile(fixture.registryPath, registryText(rows), "utf8");
+  const scanner = await new TaskScanner(fixture.boardRoot).init();
+  const me = { projectId: "fixture", actorId: "developer", sessionId: "session-developer" };
+  let calls = 0;
+  const claimCandidate = async (candidate) => {
+    calls++;
+    if (candidate.task_id === "DEV-A")
+      throw Object.assign(Error("race"), { status: 409, code: "TASK_ALREADY_OCCUPIED" });
+    const snapshot = await scanner.taskStore.snapshot("fixture");
+    return scanner.taskStore.updateTask("fixture", "DEV-B", {
+      status: "开发中", assignee: "developer", sessionWindowName: "dev", sessionId: me.sessionId
+    }, { expectedRevision: snapshot.registryRevision, operationId: "role.next.fixture.claim.001",
+      eventType: "claim", actorType: "developer_ai", actorId: me.actorId, sessionId: me.sessionId });
+  };
+  const blocked = await scanner.claimNextForAwakeDeveloper({ ...me, reportedTaskId: "DEV-A", claimCandidate });
+  assert.equal(blocked.state, "report_required");
+  assert.equal(blocked.taskId, "DEV-B");
+  assert.equal(calls, 1);
+  const claimed = await scanner.claimNextForAwakeDeveloper({
+    ...me, reportedTaskId: "DEV-B", attemptedTaskIds: ["DEV-A"], claimCandidate
+  });
+  assert.equal(claimed.state, "claimed");
+  assert.equal(claimed.taskId, "DEV-B");
+  assert.equal((await scanner.claimNextForAwakeDeveloper({ ...me, reportedTaskId: "DEV-A", claimCandidate })).state, "busy");
+});
+
 
 async function fixtureWithLedger(t) {
   const fixture = await makeFixture();
