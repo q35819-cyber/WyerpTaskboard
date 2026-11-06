@@ -25,12 +25,12 @@ async function setup(t, rows) {
   return { ...fixture, store, evaluator };
 }
 
-async function change(store, id, patch, eventType, metadata = {}, actorType = "system", sessionId = "") {
+async function change(store, id, patch, eventType, metadata = {}, actorType = "system", sessionId = "", actorId = "fixture-actor") {
   const { snapshot } = await store.getTask("fixture", id);
   return store.updateTask("fixture", id, patch, {
     expectedRevision: snapshot.registryRevision,
     operationId: "autounblock.fixture." + (++sequence),
-    eventType, actorType, actorId: "fixture-actor", sessionId, metadata
+    eventType, actorType, actorId, sessionId, metadata
   });
 }
 
@@ -158,18 +158,18 @@ test("published D09 fix and fresh dispatch recover a real old D09 cursor block o
 });
 
 test("D09 recovery denies missing/forged proof, stale dispatch, unpublished fix and STOP", async (t) => {
-  for (const options of [
+  await Promise.all([
     { release: false }, { qaPass: false }, { published: false },
     { dispatch: false }, { dispatchBeforeRelease: true },
     { stopped: true }, { untrustedNote: true }, { unfinished: true },
     { unmetHardDependency: true }
-  ]) {
+  ].map(async (options) => {
     const { store, evaluator } = await blockedD09(t, options);
     await evaluator.evaluateProject("fixture");
     assert.equal(await status(store, "A-10"), "阻断", JSON.stringify(options));
     assert.equal((await store.taskHistory("fixture", "A-10", { all: true }))
       .filter((event) => event.event_type === "auto_unblock").length, 0);
-  }
+  }));
 });
 
 test("D01 missing-dispatch block recovers only after a new authentic controller dispatch", async (t) => {
@@ -510,16 +510,21 @@ test("registry-written interruption replays exactly one recovery event on next s
 const RECOVERY_FIX = "WTB-P0-BLOCKED-DEV-RECOVERY-GATE-20261106-T1";
 const RUNNER_STEP_FIX = "WTB-P0-TEST-RUNNER-STEP-CHECKPOINT-TIMEOUT-20261106-T1";
 const MODERN_D01_FIX = "WTB-P0-DELIVERY-REWORK-D01-CHECKPOINT-20261106-T1";
+const TAKEOVER_D01_FIX = "WTB-P0-TAKEOVER-D01-PREDECESSOR-GATE-20261106-T1";
 
 async function verifiedDeveloperBlockFixture(t, { kind = "blocked", dispatch = true,
   missingPredecessor = false, missingRootQA = false, missingRootDelivery = false,
   missingRelatedDelivery = false, unrelatedFixPending = false, wrongPublishedSha = false,
   wrongCandidateSha = false,
   stopped = false, wrongMetadata = false, unfinishedDependency = false,
-  forgedGenericNote = false } = {}) {
+  forgedGenericNote = false, takeover = false, missingSuspicion = false,
+  fakeUser = false, emptyQuote = false, wrongSuspicionLink = false, wrongTakeoverLink = false,
+  wrongAllowedSession = false, wrongTask = false, revoked = false,
+  badTakeoverFailure = false, wrongBlockedActor = false,
+  dispatchBeforeRelease = false } = {}) {
   const relatedFix = ["developer_c06_blocked", "developer_r3_runner_timeout_blocked"].includes(kind)
     ? RUNNER_STEP_FIX : kind === "developer_d07_checkpoint_unauthorized_dependency_block"
-      ? MODERN_D01_FIX : null;
+      ? MODERN_D01_FIX : kind === "blocked" && takeover ? TAKEOVER_D01_FIX : null;
   const fixes = [RECOVERY_FIX, ...(relatedFix ? [relatedFix] : [])];
   const f = await setup(t, [
     row("A-10", "待开发"),
@@ -533,16 +538,53 @@ async function verifiedDeveloperBlockFixture(t, { kind = "blocked", dispatch = t
   git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
     "commit", "-m", "trusted developer block fixture");
   const mainSha = git("rev-parse", "HEAD");
-  const claim = await change(f.store, "A-10", {
+  let claim = await change(f.store, "A-10", {
     status: "开发中", assignee: "developer", sessionWindowName: "developer",
     sessionId: "dev-session"
   }, "claim", {}, "developer_ai", "dev-session");
+  if (takeover) {
+    const suspicionOp = "developer.takeover.suspect." + (++sequence);
+    const authorizationOp = "developer.takeover.allow." + (++sequence);
+    if (!missingSuspicion) await f.store.appendTaskEvent("fixture", "A-10", {
+      operationId: suspicionOp, eventType: "suspected_disconnect",
+      actorType: "developer_ai", actorId: "new-developer", sessionId: "new-session"
+    });
+    await f.store.appendTaskEvent("fixture", wrongTask ? RECOVERY_FIX : "A-10", {
+      operationId: authorizationOp, eventType: "takeover_allowed",
+      actorType: "developer_ai", actorId: "new-developer",
+      sessionId: wrongAllowedSession ? "wrong-session" : "new-session",
+      metadata: {
+        explicitUserOverride: !fakeUser,
+        authorizationSource: fakeUser ? "developer_note" : "chat_user_instruction_cooperative",
+        authorizationScope: "task", authorizationQuote: emptyQuote ? "" : "异常接管",
+        authorizationForwardedBy: "new-developer", authorizationForwardingSessionId: "new-session",
+        authorizedFromStatus: "开发中", authorizedFromSessionId: "dev-session",
+        suspicionOperationId: wrongSuspicionLink ? "invalid-suspicion" : suspicionOp
+      }
+    });
+    if (revoked) await f.store.appendTaskEvent("fixture", "A-10", {
+      operationId: "developer.takeover.revoke." + (++sequence),
+      eventType: "takeover_revoked", actorType: "developer_ai",
+      actorId: "new-developer", sessionId: "new-session"
+    });
+    claim = await change(f.store, "A-10", {
+      status: "开发中", assignee: "new-developer",
+      sessionWindowName: "new-developer", sessionId: "new-session"
+    }, "takeover", {
+      authorizationOperationId: wrongTakeoverLink ? "invalid-authorization" : authorizationOp,
+      previousSessionId: "dev-session"
+    }, "developer_ai", "new-session", "new-developer");
+  }
   if (kind === "blocked" && !missingPredecessor) {
     await f.store.appendTaskEvent("fixture", "A-10", {
       operationId: "developer.predecessor.fail." + (++sequence),
-      eventType: "developer_claim_checkpoint_predecessor_blocked",
-      actorType: "developer_ai", actorId: "fixture-actor", sessionId: "dev-session",
-      note: "D01_CLAIM CHECKPOINT_PREDECESSOR_REQUIRED " + claim.eventId
+      eventType: takeover ? "developer_takeover_d01_gate_verified_block" :
+        "developer_claim_checkpoint_predecessor_blocked",
+      actorType: "developer_ai",
+      actorId: takeover ? "new-developer" : "fixture-actor",
+      sessionId: takeover ? "new-session" : "dev-session",
+      note: "D01_CLAIM " + (badTakeoverFailure ? "UNRELATED_ERROR" :
+        "CHECKPOINT_PREDECESSOR_REQUIRED") + " " + claim.eventId
     });
   }
   const metadata = kind === "developer_r3_runner_timeout_blocked" ? {
@@ -556,7 +598,8 @@ async function verifiedDeveloperBlockFixture(t, { kind = "blocked", dispatch = t
   } : {};
   const blocked = await change(f.store, "A-10", {
     status: "阻断", assignee: "", sessionWindowName: "", sessionId: ""
-  }, kind, metadata, "developer_ai", "dev-session");
+  }, kind, metadata, "developer_ai", takeover ? "new-session" : "dev-session",
+  wrongBlockedActor ? "impostor" : takeover ? "new-developer" : "fixture-actor");
   if (unfinishedDependency) {
     const lines = (await fs.readFile(f.registryPath, "utf8")).split(/\r?\n/);
     const index = lines.findIndex((line) => line.startsWith("| A-10 |"));
@@ -569,6 +612,11 @@ async function verifiedDeveloperBlockFixture(t, { kind = "blocked", dispatch = t
     operationId: "dev.generic.note." + (++sequence), eventType: "developer_comment",
     actorType: "developer_ai", actorId: "fixture-actor", sessionId: "dev-session",
     note: "CHECKPOINT_PREDECESSOR_REQUIRED " + claim.eventId
+  });
+  if (dispatchBeforeRelease) await f.store.appendTaskEvent("fixture", "A-10", {
+    operationId: "developer.early.dispatch." + (++sequence),
+    eventType: "controller_dispatch", actorType: "controller_ai",
+    actorId: "controller", sessionId: "controller-session"
   });
   for (const fixId of fixes) {
     const qaCommit = wrongCandidateSha && fixId === RECOVERY_FIX ? "e".repeat(40) : mainSha;
@@ -595,7 +643,7 @@ async function verifiedDeveloperBlockFixture(t, { kind = "blocked", dispatch = t
       }
     });
   }
-  if (dispatch) await f.store.appendTaskEvent("fixture", "A-10", {
+  if (dispatch && !dispatchBeforeRelease) await f.store.appendTaskEvent("fixture", "A-10", {
     operationId: "developer.new.dispatch." + (++sequence),
     eventType: "controller_dispatch", actorType: "controller_ai",
     actorId: "controller", sessionId: "controller-session"
@@ -608,9 +656,9 @@ async function verifiedDeveloperBlockFixture(t, { kind = "blocked", dispatch = t
 }
 
 test("trusted dispatched developer blocks recover once only after related published fixes", async (t) => {
-  for (const kind of ["blocked", "developer_c06_blocked",
+  await Promise.all(["blocked", "developer_c06_blocked",
     "developer_r3_runner_timeout_blocked",
-    "developer_d07_checkpoint_unauthorized_dependency_block"]) {
+    "developer_d07_checkpoint_unauthorized_dependency_block"].map(async (kind) => {
     const { store, evaluator, blocked } = await verifiedDeveloperBlockFixture(t, { kind });
     await Promise.all([evaluator.evaluateProject("fixture"), evaluator.evaluateProject("fixture")]);
     assert.equal(await status(store, "A-10"), "待开发", kind);
@@ -621,11 +669,43 @@ test("trusted dispatched developer blocks recover once only after related publis
     assert.equal((await store.transactions.read(events[0].operation_id))?.state, "committed");
     const scanned = await evaluator.evaluateProject("fixture");
     assert.equal(scanned.candidates.find((item) => item.task_id === "A-10")?.eligible, true);
-  }
+  }));
+});
+
+test("authorized developer takeover D01 block restores once after both official fixes", async (t) => {
+  const { store, evaluator, blocked } = await verifiedDeveloperBlockFixture(t, { takeover: true });
+  await Promise.all([evaluator.evaluateProject("fixture"), evaluator.evaluateProject("fixture")]);
+  assert.equal(await status(store, "A-10"), "待开发");
+  const events = (await store.taskHistory("fixture", "A-10", { all: true }));
+  const recovered = events.filter((entry) => entry.event_type === "auto_unblock");
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].metadata.blockedEventId, blocked.eventId);
+  assert.equal((await store.transactions.read(recovered[0].operation_id))?.state, "committed");
+  assert.ok(events.some((entry) => entry.event_type === "takeover_allowed"));
+  assert.ok(events.some((entry) => entry.event_type === "developer_takeover_d01_gate_verified_block"));
+  await evaluator.evaluateProject("fixture");
+  assert.equal((await store.taskHistory("fixture", "A-10", { all: true }))
+    .filter((entry) => entry.event_type === "auto_unblock").length, 1);
+});
+
+test("takeover block recovery rejects forged authority, stale proof, missing release and STOP", async (t) => {
+  await Promise.all([
+    { missingSuspicion: true }, { fakeUser: true }, { wrongSuspicionLink: true },
+    { wrongTakeoverLink: true }, { wrongAllowedSession: true },
+    { revoked: true }, { emptyQuote: true }, { missingRelatedDelivery: true },
+    { dispatchBeforeRelease: true }
+  ].map(async (options) => {
+    const { store, evaluator } = await verifiedDeveloperBlockFixture(t,
+      { takeover: true, ...options });
+    await evaluator.evaluateProject("fixture");
+    assert.equal(await status(store, "A-10"), "阻断", JSON.stringify(options));
+    assert.equal((await store.taskHistory("fixture", "A-10", { all: true }))
+      .filter((entry) => entry.event_type === "auto_unblock").length, 0);
+  }));
 });
 
 test("developer block recovery rejects missing QA, delivery, dispatch, STOP and false failure proofs", async (t) => {
-  for (const options of [
+  await Promise.all([
     { missingPredecessor: true }, { missingPredecessor: true, forgedGenericNote: true },
     { missingRootQA: true }, { missingRootDelivery: true },
     { wrongPublishedSha: true }, { wrongCandidateSha: true },
@@ -634,11 +714,11 @@ test("developer block recovery rejects missing QA, delivery, dispatch, STOP and 
     { kind: "developer_r3_runner_timeout_blocked", wrongMetadata: true },
     { kind: "developer_d07_checkpoint_unauthorized_dependency_block", wrongMetadata: true },
     { kind: "developer_d07_checkpoint_unauthorized_dependency_block", unrelatedFixPending: true }
-  ]) {
+  ].map(async (options) => {
     const { store, evaluator } = await verifiedDeveloperBlockFixture(t, options);
     await evaluator.evaluateProject("fixture");
     assert.equal(await status(store, "A-10"), "阻断", JSON.stringify(options));
     assert.equal((await store.taskHistory("fixture", "A-10", { all: true }))
       .filter((event) => event.event_type === "auto_unblock").length, 0);
-  }
+  }));
 });
