@@ -209,6 +209,16 @@ const TEMPORARY_RESTORE = new Map([
   ["待独测", "待独测"], ["独测中", "待独测"],
   ["待复测", "待复测"], ["复测中", "待复测"]
 ]);
+const VERIFIED_DEV_BLOCK_FIXES = {
+  blocked: ["WTB-P0-BLOCKED-DEV-RECOVERY-GATE-20261106-T1"],
+  developer_c06_blocked: ["WTB-P0-BLOCKED-DEV-RECOVERY-GATE-20261106-T1",
+    "WTB-P0-TEST-RUNNER-STEP-CHECKPOINT-TIMEOUT-20261106-T1"],
+  developer_r3_runner_timeout_blocked: ["WTB-P0-BLOCKED-DEV-RECOVERY-GATE-20261106-T1",
+    "WTB-P0-TEST-RUNNER-STEP-CHECKPOINT-TIMEOUT-20261106-T1"],
+  developer_d07_checkpoint_unauthorized_dependency_block: [
+    "WTB-P0-BLOCKED-DEV-RECOVERY-GATE-20261106-T1",
+    "WTB-P0-DELIVERY-REWORK-D01-CHECKPOINT-20261106-T1"]
+};
 async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) {
   if (task.status !== "阻断" || task.assignee || task.sessionId) return null;
   const history = await store.events.listTaskEvents(projectId, task.id, { all: true });
@@ -217,6 +227,68 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
   const developerPause = blocked?.event_type === "developer_paused_for_independent_full_suite_gate";
   const d01Blocked = blocked?.event_type === "developer_d01_missing_controller_dispatch_block";
   const d09Blocked = blocked?.event_type === "developer_step_cursor_blocked";
+  const verifiedDevBlock = Object.hasOwn(VERIFIED_DEV_BLOCK_FIXES, blocked?.event_type || "");
+  if (verifiedDevBlock) {
+    const blockIndex = history.indexOf(blocked);
+    const claim = history.slice(0, blockIndex).findLast((event) =>
+      ["claim", "takeover"].includes(event.event_type) && event.actor_type === "developer_ai"
+      && event.new_status === "开发中" && event.actor_id && event.session_id);
+    const dispatch = history.slice(blockIndex + 1).find((event) =>
+      event.event_type === "controller_dispatch" && event.actor_type === "controller_ai"
+      && event.actor_id && event.session_id);
+    if (blocked.old_status !== "开发中" || blocked.actor_type !== "developer_ai"
+      || !claim || claim.actor_id !== blocked.actor_id || claim.session_id !== blocked.session_id
+      || !dispatch || history.slice(blockIndex + 1).some((event) =>
+        ["claim", "takeover"].includes(event.event_type) && event.actor_type === "developer_ai")) return null;
+    if (blocked.event_type === "blocked") {
+      const failure = history.slice(history.indexOf(claim) + 1, blockIndex).find((event) =>
+        event.event_type === "developer_claim_checkpoint_predecessor_blocked"
+        && event.actor_type === "developer_ai" && event.actor_id === claim.actor_id
+        && event.session_id === claim.session_id
+        && event.note?.includes("CHECKPOINT_PREDECESSOR_REQUIRED")
+        && event.note?.includes(claim.event_id));
+      if (claim.event_type !== "claim" || !failure) return null;
+    }
+    if (blocked.event_type === "developer_r3_runner_timeout_blocked"
+      && (blocked.metadata?.failureStage !== "D07_TEST_3"
+        || blocked.metadata?.failureCode !== "TEST_RUNNER_30S_SPAWNSYNC_ETIMEDOUT"
+        || blocked.metadata?.blockerCategory !== "test_runner"
+        || !GIT_SHA.test(blocked.metadata?.candidateSha || ""))) return null;
+    if (blocked.event_type === "developer_d07_checkpoint_unauthorized_dependency_block"
+      && (blocked.metadata?.reasonCode !== "CHECKPOINT_STEP_ORDER"
+        || blocked.metadata?.blockedByWriteScope !== "server/task-step-checkpoint.mjs"
+        || blocked.metadata?.candidateWipPreserved !== true
+        || !GIT_SHA.test(blocked.metadata?.candidateSha || ""))) return null;
+    for (const fixId of VERIFIED_DEV_BLOCK_FIXES[blocked.event_type]) {
+      const fix = tasks.find((item) => item.id === fixId && item.status === "已完成");
+      if (!fix) return null;
+      const releases = await store.events.listTaskEvents(projectId, fixId, { all: true });
+      const delivered = releases.findLast((event) =>
+        event.event_type === "delivery_complete" && event.actor_type === "controller_ai"
+        && event.actor_id && event.session_id);
+      const proof = delivered?.metadata || {};
+      const qa = releases.find((event) =>
+        event.event_id === proof.independentPassEventId && event.event_type === "test_result"
+        && event.actor_type === "test_ai" && event.actor_id && event.session_id
+        && event.metadata?.atomicLifecycle === true && event.metadata?.testResult === "pass");
+      if (!qa || releases.indexOf(qa) >= releases.indexOf(delivered)
+        || proof.deliveryVerified !== true || proof.postMergeRegressionResult !== "PASS"
+        || !GIT_SHA.test(proof.mergeCommitSha || "")
+        || !GIT_SHA.test(proof.candidateCommitSha || "")
+        || proof.candidateCommitSha !== qa.metadata.commitSha
+        || proof.remoteMainSha !== proof.mergeCommitSha) return null;
+      try {
+        if ((await runGit(context.rootRealPath,
+          ["merge-base", "--is-ancestor", proof.mergeCommitSha, "HEAD"])).code !== 0
+          || (await runGit(context.rootRealPath,
+            ["merge-base", "--is-ancestor", proof.candidateCommitSha, proof.mergeCommitSha])).code !== 0) return null;
+      } catch { return null; }
+    }
+    const messages = await store.userMessageState(projectId, task.id, {
+      actorType: "scanner", actorId: "task-scan", sessionId: "task-scan"
+    });
+    if (messages.requiresAcknowledgement || messages.messages?.at(-1)?.replies?.length === 0) return null;
+  }
   if (d09Blocked) {
     const blockIndex = history.indexOf(blocked);
     const claimIndex = history.findLastIndex((event, index) => index < blockIndex
@@ -291,14 +363,14 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
       event.actor_id === blocked.actor_id && event.session_id === blocked.session_id &&
       event.new_status === "开发中");
     if (!claim || !blocked.session_id) return null;
-  } else if (!d01Blocked && !d09Blocked
+  } else if (!d01Blocked && !d09Blocked && !verifiedDevBlock
     && (blocked?.event_type !== "temporary_block" || blocked.actor_type !== "system")) return null;
   const target = blocked.old_status === "待准备"
     ? "待开发" : TEMPORARY_RESTORE.get(blocked.old_status);
-  const conditions = d01Blocked || d09Blocked ? [] : developerPause
+  const conditions = d01Blocked || d09Blocked || verifiedDevBlock ? [] : developerPause
     ? [{ kind: "dependency_completed", taskId: blocked.metadata?.requiredTask }]
     : blocked.metadata?.conditions;
-  if (!target || !Array.isArray(conditions) || (!d01Blocked && !d09Blocked && !conditions.length)
+  if (!target || !Array.isArray(conditions) || (!d01Blocked && !d09Blocked && !verifiedDevBlock && !conditions.length)
     || conditions.length > 8) return null;
   if ((await store.stopState(projectId, task.id)).stopRequested) return null;
   const lastFailure = history.findLastIndex((event) =>
@@ -345,7 +417,7 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
       hardDependencyBlockers(task, byId).length) return null;
     try {
       await assertDeveloperClaimExclusive(store, projectId, context, { tasks }, task,
-        "task-scan", "auto-unblock", false, !(d01Blocked || d09Blocked));
+        "task-scan", "auto-unblock", false, !(d01Blocked || d09Blocked || verifiedDevBlock));
     } catch (error) {
       if (["CLAIM_WRITE_CONFLICT", "CLAIM_DEVELOPER_BUSY"].includes(error.code)) return null;
       throw error;
