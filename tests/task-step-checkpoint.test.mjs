@@ -1529,6 +1529,87 @@ test("portable flow paths stay relative and published template matches canonical
   assert.match(await fs.readFile(path.join(root,"00_统一入口.md"),"utf8"),/相对路径强制规则/);
 });
 
+async function v2AuthorizedDeveloperTakeover(t, { dispatch = "fresh", grant = "valid",
+  link = true, stop = false } = {}) {
+  const { f, taskStore } = await fixture(t);
+  const cp = await new TaskStepCheckpoint(f.boardRoot, { taskStore }).init();
+  const appendDispatch = () => taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.d01.reentry.dispatch." + String(sequence++).padStart(8, "0"),
+    eventType: "controller_dispatch", actorType: "controller_ai",
+    actorId: "controller", sessionId: "controller-session"
+  });
+  if (dispatch === "stale") await appendDispatch();
+  const original = await claimDev(taskStore);
+  if (dispatch === "fresh") await appendDispatch();
+  const allowOperation = "fixture.d01.reentry.allow." + String(sequence++).padStart(8, "0");
+  if (grant !== "missing") await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: allowOperation, eventType: "takeover_allowed",
+    actorType: "developer_ai", actorId: "new-developer", sessionId: "new-dev-session",
+    metadata: {
+      explicitUserOverride: grant !== "unapproved",
+      authorizationSource: grant === "forged" ? "developer_note" : "chat_user_instruction_cooperative",
+      authorizationScope: "task", authorizationForwardedBy: "new-developer",
+      authorizationForwardingSessionId: "new-dev-session",
+      authorizedFromStatus: "开发中", authorizedFromSessionId: "developer_ai.session"
+    }
+  });
+  const takeover = await taskStore.updateTask("fixture", "A-10", {
+    status: "开发中", assignee: "new-developer", sessionWindowName: "new-dev",
+    sessionId: "new-dev-session"
+  }, {
+    expectedRevision: (await taskStore.snapshot("fixture")).registryRevision,
+    operationId: "fixture.d01.reentry.takeover." + String(sequence++).padStart(8, "0"),
+    eventType: "takeover", actorType: "developer_ai",
+    actorId: "new-developer", sessionId: "new-dev-session",
+    metadata: {
+      authorizationOperationId: link ? allowOperation : "fixture.mismatched.allow",
+      previousSessionId: "developer_ai.session"
+    }
+  });
+  if (dispatch === "late") await appendDispatch();
+  if (stop) await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.d01.reentry.stop." + String(sequence++).padStart(8, "0"),
+    eventType: "stop_request", actorType: "user", note: "停止本任务"
+  });
+  return { cp, taskStore, original, takeover };
+}
+
+test("v2 D01 accepts a freshly dispatched, user-authorized, server-linked takeover", async (t) => {
+  const { cp, original, takeover } = await v2AuthorizedDeveloperTakeover(t);
+  const before = await cp.show("fixture", "A-10");
+  assert.equal(before.state.cursors.developer_ai, "D01_CLAIM");
+  await assert.rejects(step(cp, "developer_ai", "D01_CLAIM", {
+    eventId: original.eventId
+  }), (e) => e.code === "CHECKPOINT_SESSION_MISMATCH");
+  assert.equal((await cp.show("fixture", "A-10")).sha256, before.sha256);
+  const admitted = await step(cp, "developer_ai", "D01_CLAIM", {
+    eventId: takeover.eventId, actorId: "new-developer", sessionId: "new-dev-session"
+  });
+  assert.equal(admitted.state.cursors.developer_ai, "D02_WORKTREE");
+  assert.equal(admitted.state.records.filter(r => r.stepId === "D01_CLAIM" && r.result === "PASS").length, 1);
+  await step(cp, "developer_ai", "D02_WORKTREE", {
+    actorId: "new-developer", sessionId: "new-dev-session"
+  });
+});
+
+test("v2 D01 never retroactively accepts late/stale dispatch or untrusted takeover authorizations", async (t) => {
+  for (const scenario of [
+    { dispatch: "missing" }, { dispatch: "stale" }, { dispatch: "late" },
+    { grant: "missing" }, { grant: "unapproved" }, { grant: "forged" }, { link: false },
+    { stop: true }
+  ]) {
+    const { cp, takeover } = await v2AuthorizedDeveloperTakeover(t, scenario);
+    const before = await cp.show("fixture", "A-10");
+    await assert.rejects(step(cp, "developer_ai", "D01_CLAIM", {
+      eventId: takeover.eventId, actorId: "new-developer", sessionId: "new-dev-session"
+    }), (e) => ["CHECKPOINT_PREDECESSOR_REQUIRED", "CHECKPOINT_FORMAL_EVENT_REQUIRED"].includes(e.code),
+    JSON.stringify(scenario));
+    const after = await cp.show("fixture", "A-10");
+    assert.equal(after.sha256, before.sha256, "failed admission cannot write a checkpoint");
+    assert.equal(after.state.attempts, before.state.attempts);
+  }
+});
+
 test("v2 C00 PASS requires fresh, scoped evidence events before any scan", async (t) => {
   const { f, taskStore } = await fixture(t);
   const cp = await new TaskStepCheckpoint(f.boardRoot, { taskStore }).init();

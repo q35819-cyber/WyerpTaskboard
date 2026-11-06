@@ -530,13 +530,40 @@ export class TaskStepCheckpoint {
       const [index] = [steps.indexOf(stepId)];
       if (actorType === "developer_ai" && stepId === "D01_CLAIM"
         && state.cursors.controller_ai !== null) {
-        const claimIndex = history.findIndex((entry) =>
-          entry.event_id === eventId && entry.event_type === "claim"
+        const authorityIndex = history.findIndex((entry) =>
+          entry.event_id === eventId && ["claim", "takeover"].includes(entry.event_type)
           && entry.actor_type === "developer_ai" && entry.actor_id === actorId
           && entry.session_id === sessionId);
-        const dispatch = history.slice(0, Math.max(0, claimIndex)).some((entry) =>
-          entry.actor_type === "controller_ai" && /^controller_dispatch(?:_[a-z0-9_]+)?$/i.test(entry.event_type));
-        if (!dispatch || task.sessionId !== sessionId
+        const authorityEvent = history[authorityIndex];
+        const priorDeveloperIndex = history.findLastIndex((entry, index) =>
+          index < authorityIndex && entry.actor_type === "developer_ai"
+          && ["claim", "takeover"].includes(entry.event_type));
+        const dispatchIndex = history.findLastIndex((entry, index) =>
+          index < authorityIndex && entry.actor_type === "controller_ai"
+          && /^controller_dispatch(?:_[a-z0-9_]+)?$/i.test(entry.event_type));
+        let authorizedTakeover = authorityEvent?.event_type !== "takeover";
+        if (authorityEvent?.event_type === "takeover") {
+          const allowedIndex = history.findIndex((entry, index) =>
+            index > dispatchIndex && index < authorityIndex
+            && entry.event_type === "takeover_allowed"
+            && entry.operation_id === authorityEvent.metadata?.authorizationOperationId
+            && entry.actor_type === "developer_ai" && entry.actor_id === actorId
+            && entry.session_id === sessionId
+            && entry.metadata?.explicitUserOverride === true
+            && entry.metadata?.authorizationSource === "chat_user_instruction_cooperative"
+            && ["task", "project"].includes(entry.metadata?.authorizationScope)
+            && entry.metadata?.authorizationForwardedBy === actorId
+            && entry.metadata?.authorizationForwardingSessionId === sessionId
+            && entry.metadata?.authorizedFromSessionId === authorityEvent.metadata?.previousSessionId
+            && entry.metadata?.authorizedFromStatus === authorityEvent.old_status);
+          authorizedTakeover = priorDeveloperIndex >= 0 && allowedIndex >= 0
+            && dispatchIndex > priorDeveloperIndex
+            && history[priorDeveloperIndex].session_id === authorityEvent.metadata?.previousSessionId
+            && authorityEvent.old_status === authorityEvent.new_status
+            && ["开发中", "修复中"].includes(authorityEvent.old_status);
+        }
+        if (authorityEvent?.event_id !== currentClaim?.event_id
+          || dispatchIndex < 0 || !authorizedTakeover || task.sessionId !== sessionId
           || !["开发中", "修复中"].includes(task.status)
           || (await this.taskStore.stopState(projectId, taskId)).stopRequested
           || !(await hardDependenciesCompleted(this.taskStore, projectId, task))) {
