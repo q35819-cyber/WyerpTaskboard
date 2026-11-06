@@ -506,3 +506,139 @@ test("registry-written interruption replays exactly one recovery event on next s
   assert.equal((await store.taskHistory("fixture", "A-10", { all: true }))
     .filter((event) => event.event_type === "auto_unblock").length, 1);
 });
+
+const RECOVERY_FIX = "WTB-P0-BLOCKED-DEV-RECOVERY-GATE-20261106-T1";
+const RUNNER_STEP_FIX = "WTB-P0-TEST-RUNNER-STEP-CHECKPOINT-TIMEOUT-20261106-T1";
+const MODERN_D01_FIX = "WTB-P0-DELIVERY-REWORK-D01-CHECKPOINT-20261106-T1";
+
+async function verifiedDeveloperBlockFixture(t, { kind = "blocked", dispatch = true,
+  missingPredecessor = false, missingRootQA = false, missingRootDelivery = false,
+  missingRelatedDelivery = false, unrelatedFixPending = false, wrongPublishedSha = false,
+  wrongCandidateSha = false,
+  stopped = false, wrongMetadata = false, unfinishedDependency = false,
+  forgedGenericNote = false } = {}) {
+  const relatedFix = ["developer_c06_blocked", "developer_r3_runner_timeout_blocked"].includes(kind)
+    ? RUNNER_STEP_FIX : kind === "developer_d07_checkpoint_unauthorized_dependency_block"
+      ? MODERN_D01_FIX : null;
+  const fixes = [RECOVERY_FIX, ...(relatedFix ? [relatedFix] : [])];
+  const f = await setup(t, [
+    row("A-10", "待开发"),
+    ...fixes.map((id) => row(id, unrelatedFixPending && id === relatedFix ? "待交付" : "已完成")),
+    ...(unfinishedDependency ? [row("PENDING", "待开发")] : [])
+  ]);
+  const git = (...args) => execFileSync("git", ["-C", f.projectRoot, ...args],
+    { encoding: "utf8", windowsHide: true }).trim();
+  git("init", "-b", "main");
+  git("add", "tasks.md");
+  git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+    "commit", "-m", "trusted developer block fixture");
+  const mainSha = git("rev-parse", "HEAD");
+  const claim = await change(f.store, "A-10", {
+    status: "开发中", assignee: "developer", sessionWindowName: "developer",
+    sessionId: "dev-session"
+  }, "claim", {}, "developer_ai", "dev-session");
+  if (kind === "blocked" && !missingPredecessor) {
+    await f.store.appendTaskEvent("fixture", "A-10", {
+      operationId: "developer.predecessor.fail." + (++sequence),
+      eventType: "developer_claim_checkpoint_predecessor_blocked",
+      actorType: "developer_ai", actorId: "fixture-actor", sessionId: "dev-session",
+      note: "D01_CLAIM CHECKPOINT_PREDECESSOR_REQUIRED " + claim.eventId
+    });
+  }
+  const metadata = kind === "developer_r3_runner_timeout_blocked" ? {
+    failureStage: "D07_TEST_3", failureCode: wrongMetadata ? "UNRELATED_ERROR" :
+      "TEST_RUNNER_30S_SPAWNSYNC_ETIMEDOUT",
+    blockerCategory: "test_runner", candidateSha: "c".repeat(40)
+  } : kind === "developer_d07_checkpoint_unauthorized_dependency_block" ? {
+    reasonCode: wrongMetadata ? "UNRELATED_ERROR" : "CHECKPOINT_STEP_ORDER",
+    blockedByWriteScope: "server/task-step-checkpoint.mjs",
+    candidateWipPreserved: true, candidateSha: "d".repeat(40)
+  } : {};
+  const blocked = await change(f.store, "A-10", {
+    status: "阻断", assignee: "", sessionWindowName: "", sessionId: ""
+  }, kind, metadata, "developer_ai", "dev-session");
+  if (unfinishedDependency) {
+    const lines = (await fs.readFile(f.registryPath, "utf8")).split(/\r?\n/);
+    const index = lines.findIndex((line) => line.startsWith("| A-10 |"));
+    const cells = lines[index].split("|");
+    cells[14] = " PENDING完成 ";
+    lines[index] = cells.join("|");
+    await fs.writeFile(f.registryPath, lines.join("\n"));
+  }
+  if (forgedGenericNote) await f.store.appendTaskEvent("fixture", "A-10", {
+    operationId: "dev.generic.note." + (++sequence), eventType: "developer_comment",
+    actorType: "developer_ai", actorId: "fixture-actor", sessionId: "dev-session",
+    note: "CHECKPOINT_PREDECESSOR_REQUIRED " + claim.eventId
+  });
+  for (const fixId of fixes) {
+    const qaCommit = wrongCandidateSha && fixId === RECOVERY_FIX ? "e".repeat(40) : mainSha;
+    const qa = !missingRootQA || fixId !== RECOVERY_FIX
+      ? await f.store.appendTaskEvent("fixture", fixId, {
+        operationId: "developer.fix.qa." + (++sequence), eventType: "test_result",
+        actorType: "test_ai", actorId: "qa", sessionId: "qa-session",
+        metadata: { atomicLifecycle: true, testResult: "pass", commitSha: qaCommit }
+      }) : null;
+    if ((fixId === RECOVERY_FIX && missingRootDelivery)
+      || (fixId === relatedFix && (missingRelatedDelivery || unrelatedFixPending))) continue;
+    await f.store.appendTaskEvent("fixture", fixId, {
+      operationId: "developer.fix.delivery." + (++sequence),
+      eventType: "delivery_complete", actorType: "controller_ai",
+      actorId: "controller", sessionId: "controller-session",
+      metadata: {
+        independentPassEventId: qa?.event.event_id || "evt_forged_qa",
+        deliveryVerified: true, postMergeRegressionResult: "PASS",
+        candidateCommitSha: qaCommit,
+        mergeCommitSha: wrongPublishedSha && fixId === RECOVERY_FIX
+          ? "b".repeat(40) : mainSha,
+        remoteMainSha: wrongPublishedSha && fixId === RECOVERY_FIX
+          ? "b".repeat(40) : mainSha
+      }
+    });
+  }
+  if (dispatch) await f.store.appendTaskEvent("fixture", "A-10", {
+    operationId: "developer.new.dispatch." + (++sequence),
+    eventType: "controller_dispatch", actorType: "controller_ai",
+    actorId: "controller", sessionId: "controller-session"
+  });
+  if (stopped) await f.store.appendTaskEvent("fixture", "A-10", {
+    operationId: "developer.stop." + (++sequence), eventType: "stop_request",
+    actorType: "user", actorId: "user", sessionId: "user-session"
+  });
+  return { ...f, blocked };
+}
+
+test("trusted dispatched developer blocks recover once only after related published fixes", async (t) => {
+  for (const kind of ["blocked", "developer_c06_blocked",
+    "developer_r3_runner_timeout_blocked",
+    "developer_d07_checkpoint_unauthorized_dependency_block"]) {
+    const { store, evaluator, blocked } = await verifiedDeveloperBlockFixture(t, { kind });
+    await Promise.all([evaluator.evaluateProject("fixture"), evaluator.evaluateProject("fixture")]);
+    assert.equal(await status(store, "A-10"), "待开发", kind);
+    const events = (await store.taskHistory("fixture", "A-10", { all: true }))
+      .filter((event) => event.event_type === "auto_unblock");
+    assert.equal(events.length, 1, kind);
+    assert.equal(events[0].metadata.blockedEventId, blocked.eventId, kind);
+    assert.equal((await store.transactions.read(events[0].operation_id))?.state, "committed");
+    const scanned = await evaluator.evaluateProject("fixture");
+    assert.equal(scanned.candidates.find((item) => item.task_id === "A-10")?.eligible, true);
+  }
+});
+
+test("developer block recovery rejects missing QA, delivery, dispatch, STOP and false failure proofs", async (t) => {
+  for (const options of [
+    { missingPredecessor: true }, { missingPredecessor: true, forgedGenericNote: true },
+    { missingRootQA: true }, { missingRootDelivery: true },
+    { wrongPublishedSha: true }, { wrongCandidateSha: true },
+    { dispatch: false }, { stopped: true },
+    { unfinishedDependency: true }, { kind: "developer_c06_blocked", missingRelatedDelivery: true },
+    { kind: "developer_r3_runner_timeout_blocked", wrongMetadata: true },
+    { kind: "developer_d07_checkpoint_unauthorized_dependency_block", wrongMetadata: true },
+    { kind: "developer_d07_checkpoint_unauthorized_dependency_block", unrelatedFixPending: true }
+  ]) {
+    const { store, evaluator } = await verifiedDeveloperBlockFixture(t, options);
+    await evaluator.evaluateProject("fixture");
+    assert.equal(await status(store, "A-10"), "阻断", JSON.stringify(options));
+    assert.equal((await store.taskHistory("fixture", "A-10", { all: true }))
+      .filter((event) => event.event_type === "auto_unblock").length, 0);
+  }
+});
