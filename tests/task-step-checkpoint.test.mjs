@@ -1530,7 +1530,7 @@ test("portable flow paths stay relative and published template matches canonical
 });
 
 async function v2AuthorizedDeveloperTakeover(t, { dispatch = "fresh", grant = "valid",
-  link = true, stop = false } = {}) {
+  link = true, stop = false, suspicion = "valid", revoked = false, quote = "异常接管" } = {}) {
   const { f, taskStore } = await fixture(t);
   const cp = await new TaskStepCheckpoint(f.boardRoot, { taskStore }).init();
   const appendDispatch = () => taskStore.appendTaskEvent("fixture", "A-10", {
@@ -1541,6 +1541,11 @@ async function v2AuthorizedDeveloperTakeover(t, { dispatch = "fresh", grant = "v
   if (dispatch === "stale") await appendDispatch();
   const original = await claimDev(taskStore);
   if (dispatch === "fresh") await appendDispatch();
+  const suspicionOperation = "fixture.d01.reentry.suspect." + String(sequence++).padStart(8, "0");
+  if (suspicion !== "missing") await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: suspicionOperation, eventType: "suspected_disconnect",
+    actorType: "developer_ai", actorId: "new-developer", sessionId: "new-dev-session"
+  });
   const allowOperation = "fixture.d01.reentry.allow." + String(sequence++).padStart(8, "0");
   if (grant !== "missing") await taskStore.appendTaskEvent("fixture", "A-10", {
     operationId: allowOperation, eventType: "takeover_allowed",
@@ -1550,8 +1555,15 @@ async function v2AuthorizedDeveloperTakeover(t, { dispatch = "fresh", grant = "v
       authorizationSource: grant === "forged" ? "developer_note" : "chat_user_instruction_cooperative",
       authorizationScope: "task", authorizationForwardedBy: "new-developer",
       authorizationForwardingSessionId: "new-dev-session",
-      authorizedFromStatus: "开发中", authorizedFromSessionId: "developer_ai.session"
+      authorizedFromStatus: "开发中", authorizedFromSessionId: "developer_ai.session",
+      authorizationQuote: quote,
+      suspicionOperationId: suspicion === "wrong" ? "fixture.nonmatching.suspect" : suspicionOperation
     }
+  });
+  if (revoked) await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.d01.reentry.revoke." + String(sequence++).padStart(8, "0"),
+    eventType: "takeover_revoked", actorType: "developer_ai",
+    actorId: "new-developer", sessionId: "new-dev-session"
   });
   const takeover = await taskStore.updateTask("fixture", "A-10", {
     status: "开发中", assignee: "new-developer", sessionWindowName: "new-dev",
@@ -1596,6 +1608,7 @@ test("v2 D01 never retroactively accepts late/stale dispatch or untrusted takeov
   for (const scenario of [
     { dispatch: "missing" }, { dispatch: "stale" }, { dispatch: "late" },
     { grant: "missing" }, { grant: "unapproved" }, { grant: "forged" }, { link: false },
+    { suspicion: "missing" }, { suspicion: "wrong" }, { quote: "" }, { revoked: true },
     { stop: true }
   ]) {
     const { cp, takeover } = await v2AuthorizedDeveloperTakeover(t, scenario);
