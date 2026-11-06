@@ -15,8 +15,8 @@ const els=Object.fromEntries([
   "projectRegistryInput","refreshBtn","aiSettingsBtn","aiSettingsDialog","aiSettingsForm","closeAiSettingsBtn","cancelAiSettingsBtn","developerModel","developerReasoning","testModel","testReasoning","scanIntervalMinutes","maxRequestsPerChat","contextWarningAt","timeoutRetryLimit","anomalyWindowMinutes","anomalyLimit","roleSwitchLimit","appVersion","projectHealth","projectService","projectServiceStatus","projectStartRestartBtn","projectStopServiceBtn","scanStatus","summary","searchInput","planFilter","trackFilter",
   "priorityFilter","statusFilter","archiveFilter","boardViewBtn","listViewBtn","boardView","listView","taskTableBody",
   "planDialog","planDialogTitle","planDialogPath","planNavigator","planLocationStatus","planIndexList","planDocumentContent","closePlanDialogBtn",
-  "taskDialog","closeDialogBtn","detailTaskId","detailTitle","dependencyBackBtn","dependencyTrail","userMessagePanel","userMessageCount","userMessageList",
-  "taskPlanList","responsibilityText","currentProgressText","userAssistanceText","traceabilityText","readDependenciesText","relatedTasksText","writeTargetsText","relatedArtifactsText","detailMeta",
+  "taskDialog","closeDialogBtn","detailTaskId","detailTitle","dependencyBackBtn","dependencyTrail","blockerEvidencePanel","blockerEvidenceText","userMessagePanel","userMessageCount","userMessageList",
+  "taskPlanList","responsibilityText","currentProgressText","userAssistanceText","traceabilityText","readDependenciesText","writeTargetsText","relatedArtifactsText","detailMeta",
   "sessionInfo","testResourceSummary","testResourceList","prioritySelect","savePriorityBtn","stopBtn","resumeBtn","suspectDisconnectBtn","allowTakeoverBtn",
   "revokeTakeoverBtn","reviewNote","commentBtn","userAcceptanceActions","acceptBtn","rejectReason","rejectBtn","reloadHistoryBtn","historyList"
 ].map(id=>[id,$(id)]));
@@ -524,6 +524,7 @@ function taskCard(task){
     }
     card.append(row);
   }
+  if(task.blockerEvidence){const evidence=document.createElement("div");evidence.className="blocker-evidence-summary";evidence.textContent="阻断依据："+task.blockerEvidence.summary;card.append(evidence)}
   const candidate=developerCandidateFor(task);
   if(candidate?.blockers?.length||(task.status==="待执行"&&!isReadyTask(task))){const why=document.createElement("div");why.className="task-user-assistance";why.textContent="暂不能执行："+(candidate?.blockers?.length?candidate.blockers.join("；"):"缺少有效的最新准入扫描结果");card.append(why);}
   const assistanceText=task.presentation?.userAssistance||"";
@@ -790,6 +791,22 @@ async function openTask(taskId,nested=false){
     if(!(p.plans||[]).length)els.taskPlanList.textContent="未绑定主计划";
     els.responsibilityText.textContent=p.responsibility||data.boundary||"未填写";
     els.currentProgressText.textContent=p.currentProgress||statusLabel(data.status);
+    const evidence=data.blockerEvidence;
+    els.blockerEvidencePanel.hidden=!evidence;
+    if(evidence)els.blockerEvidenceText.textContent=[
+      evidence.summary,
+      "来源："+(evidence.source==="machine_scan"?"新鲜机器扫描":evidence.source==="lifecycle_event"?"历史状态事件":"待核验"),
+      "事件ID："+(evidence.eventId||"未取得"),
+      "时间："+formatTime(evidence.eventAt),
+      "事件类型："+(evidence.eventType||"未知"),
+      evidence.machineScanAt?"扫描时间："+formatTime(evidence.machineScanAt):"当前机器依据：未核验",
+      evidence.reportPath?"独测失败报告："+evidence.reportPath:"独测失败报告：未取得可信报告路径",
+      ...(evidence.failureItems?.length?["独测失败项：",...evidence.failureItems.map(item=>"· "+item)]:[]),
+      "事件原始备注："+(evidence.originalNote||"无公开备注"),
+      "恢复条件："+evidence.recovery,
+      evidence.qualification
+    ].join("\n");
+    else els.blockerEvidenceText.textContent="";
     els.userAssistanceText.textContent=p.userAssistance||"当前无需你操作";
     els.traceabilityText.textContent=p.traceability||data.traceability||"—";
     renderTaskDependencies(data);
