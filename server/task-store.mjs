@@ -13,7 +13,7 @@ import { EventStore } from "./event-store.mjs";
 import { TransactionStore } from "./transaction-store.mjs";
 import { ScanStore } from "./scan-store.mjs";
 import { RequirementStore } from "./requirement-store.mjs";
-import { hardDependencyBlockers, provisionalClaimAuthorization, latestAuthorizedTestExecution } from "./candidate-evaluator.mjs";
+import { hardDependencyBlockers, provisionalClaimAuthorization, latestAuthorizedTestExecution, deliveryEvidence } from "./candidate-evaluator.mjs";
 
 function assertOperationId(id) {
   if (typeof id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(id)) {
@@ -625,6 +625,75 @@ export function deliveryTakeoverAuthority(events, evidence) {
   return { event: current, metadata: meta, authorization };
 }
 
+async function verifyDeliveryMergeConflictRework(store, projectId, context, task, events, patch, {
+  actorType, actorId, sessionId, metadata
+}) {
+  if (task.status !== "交付中" || patch?.status !== "待开发") {
+    throw new TaskboardError("只能由交付中因真实合并冲突退原开发", {
+      code: "DELIVERY_REWORK_STAGE_REQUIRED", status: 409
+    });
+  }
+  if (actorType !== "controller_ai" || !actorId || !sessionId ||
+    sessionId !== task.sessionId || !task.assignee ||
+    (await store.stopState(projectId, task.id)).stopRequested) {
+    throw new TaskboardError("必须由当前正式总控Session操作且无STOP", {
+      code: "DELIVERY_REWORK_CONTROLLER_REQUIRED", status: 409
+    });
+  }
+  const independent = deliveryEvidence(events, context.workflow);
+  if (!independent.valid || !independent.developerActorId || !independent.developerSessionId) {
+    throw new TaskboardError("缺少有效固定SHA的独立测试PASS", {
+      code: "DELIVERY_REWORK_INDEPENDENT_PASS_REQUIRED", status: 409
+    });
+  }
+  const latest = independent.latestResult;
+  const latestIndex = events.indexOf(latest);
+  const claimIndex = events.findLastIndex((event, index) => index > latestIndex &&
+    event.event_type === "claim" && event.new_status === "交付中" &&
+    event.actor_type === "controller_ai" && event.actor_id === actorId &&
+    event.session_id === sessionId);
+  const failure = events.findLast((event, index) => index > claimIndex && claimIndex >= 0 &&
+    event.event_type === "delivery_attempt_failed" &&
+    event.actor_type === "controller_ai" && event.actor_id === actorId &&
+    event.session_id === sessionId && event.metadata?.failureStage === "merge" &&
+    event.metadata?.candidateSha === latest.metadata.commitSha);
+  if (!failure) throw new TaskboardError("必须先由正式交付总控登记真实merge失败", {
+    code: "DELIVERY_REWORK_FAILURE_EVIDENCE_REQUIRED", status: 409
+  });
+  const candidateSha = String(latest.metadata.commitSha).toLowerCase();
+  const mainSha = String(metadata?.mainSha || "").toLowerCase();
+  if (!GIT_SHA.test(mainSha) || !GIT_SHA.test(String(metadata?.candidateSha || "")) ||
+    String(metadata.candidateSha).toLowerCase() !== candidateSha ||
+    !(await verifiedRemoteTakeoverCandidate(context.rootRealPath, latest.metadata))) {
+    throw new TaskboardError("合并冲突的候选SHA/远端证据不可信", {
+      code: "DELIVERY_REWORK_CANDIDATE_MISMATCH", status: 409
+    });
+  }
+  const mainRef = await runGit(context.rootRealPath, ["ls-remote", "origin", "refs/heads/main"]);
+  if (mainRef.code !== 0 ||
+    String(mainRef.stdout).trim().split(/\s+/)[0]?.toLowerCase() !== mainSha) {
+    throw new TaskboardError("远端main已变化或提供了过期SHA", {
+      code: "DELIVERY_REWORK_MAIN_STALE", status: 409
+    });
+  }
+  const merge = await runGit(context.rootRealPath, ["merge-tree", "--write-tree", mainSha, candidateSha]);
+  if (merge.code !== 1 || !/^CONFLICT \([^)]+\):/m.test(merge.stdout)) {
+    throw new TaskboardError("未取得真实Git内容冲突，不能退回开发", {
+      code: "DELIVERY_REWORK_CONFLICT_NOT_VERIFIED", status: 409
+    });
+  }
+  const conflictFiles = [...merge.stdout.matchAll(/^CONFLICT \([^)]+\):.*? in ([^\r\n]+)/gm)]
+    .map((match) => match[1].slice(0, 240)).slice(0, 24);
+  return {
+    ...(metadata || {}), mergeConflictVerified: true, invalidatesTestEvidence: true,
+    requiresIndependentRetest: true, independentPassEventId: latest.event_id,
+    deliveryFailureEventId: failure.event_id, candidateSha, mainSha, conflictFiles,
+    originalDeveloperActorId: independent.developerActorId,
+    originalDeveloperSessionId: independent.developerSessionId,
+    originalControllerActorId: actorId, originalControllerSessionId: sessionId
+  };
+}
+
 async function verifyDeliveryCompletion(context, task, events, patch, { actorType, actorId, sessionId, metadata }) {
   if (task.status !== "交付中" || patch?.status !== "已完成") {
     throw new TaskboardError("只有交付中的任务可以提交合并完成", { code: "DELIVERY_STAGE_REQUIRED", status: 409 });
@@ -1069,6 +1138,18 @@ export class TaskStore {
       let provisional = null;
       const dependencyBlockers = hardDependencyBlockers(currentTask,
         new Map(parsed.tasks.map((item) => [item.id, item])));
+      if (eventType === "claim" && actorType === "developer_ai" && currentTask.status === "待开发") {
+        const history = await this.events.listTaskEvents(projectId, taskId, { all: true });
+        const rework = history.findLast((event) => event.event_type === "delivery_merge_conflict_rework");
+        if (rework && !history.slice(history.indexOf(rework) + 1).some((event) =>
+          event.event_type === "claim" && event.actor_type === "developer_ai") &&
+          (actorId !== rework.metadata?.originalDeveloperActorId ||
+            sessionId === rework.metadata?.originalDeveloperSessionId)) {
+          throw new TaskboardError("交付冲突仅原开发以新Session重新认领", {
+            code: "DELIVERY_REWORK_ORIGINAL_DEVELOPER_REQUIRED", status: 409
+          });
+        }
+      }
       if (eventType === "claim" && actorType === "developer_ai") {
         if (dependencyBlockers.length) {
           provisional = await provisionalClaimAuthorization(this, projectId, currentTask,
@@ -1118,6 +1199,16 @@ export class TaskStore {
           });
         }
         effectiveMetadata = { ...(effectiveMetadata || {}), acceptanceScope };
+      }
+      if (eventType === "delivery_merge_conflict_rework") {
+        const history = await this.events.listTaskEvents(projectId, taskId, { all: true });
+        effectiveMetadata = await verifyDeliveryMergeConflictRework(
+          this, projectId, context, currentTask, history, patch,
+          { actorType, actorId, sessionId, metadata });
+        effectivePatchInput = {
+          status: "待开发", plannedRole: "开发AI",
+          assignee: "", sessionWindowName: "", sessionId: ""
+        };
       }
       if (eventType === "delivery_complete") {
         const history = await this.events.listTaskEvents(projectId, taskId, { all: true });
