@@ -34,6 +34,7 @@ async function cardRenderer() {
     source.slice(source.indexOf("function trackLabel("),source.indexOf("\n",source.indexOf("function trackLabel("))),
     source.slice(source.indexOf("function statusLabel("),source.indexOf("\n",source.indexOf("function statusLabel("))),
     source.slice(source.indexOf("function badge("),source.indexOf("\n",source.indexOf("function badge("))),
+    source.slice(source.indexOf("function applyFilters("),source.indexOf("function sameProject(")),
     source.slice(source.indexOf("function taskDependencies("),source.indexOf("function columnPageKey(")),
     source.slice(source.indexOf("function renderList("),source.indexOf("function renderRequirements("))
   ];
@@ -45,14 +46,16 @@ async function cardRenderer() {
   });
   const context={
     document:{createElement:makeElement},
-    state:{projectId:"demo",projectEpoch:1,filtered:[],dependencyTrail:[],snapshot:{tasks:[]}},
-    els:{taskTableBody:{rows:[],replaceChildren(...rows){this.rows=rows}},readDependenciesText:makeElement("p"),dependencyTrail:makeElement("nav"),dependencyBackBtn:makeElement("button")},
-    taskTitle:t=>t.id,priorityLabel:t=>t,mainPlan:()=>null,planName:()=>"",
+    state:{projectId:"demo",projectEpoch:1,detailEpoch:0,filtered:[],dependencyTrail:[],selectedTask:null,columnPages:{},view:"list",snapshot:{tasks:[]}},
+    els:{taskTableBody:{rows:[],replaceChildren(...rows){this.rows=rows}},readDependenciesText:makeElement("p"),dependencyTrail:makeElement("nav"),dependencyBackBtn:makeElement("button"),
+      taskDialog:{open:false,close(){this.open=false}},searchInput:{value:""},planFilter:{value:""},trackFilter:{value:""},priorityFilter:{value:""},statusFilter:{value:""},archiveFilter:{value:"all"}},
+    taskTitle:t=>t.id,priorityLabel:t=>t,mainPlan:t=>t.presentation?.mainPlan||null,planName:()=>"",
     developerCandidateFor:()=>null,isReadyTask:()=>false,roleLabel:()=>"",
     sameProject:(projectId,epoch)=>projectId===context.state.projectId&&epoch===context.state.projectEpoch,
     navCalls:[],openTask:(id,nested)=>{context.navCalls.push({id,nested});return Promise.resolve()},formatTime:()=>"",
+    renderCount:0,render:()=>{context.renderCount++},
   };
-  vm.runInNewContext(blocks.join("\n")+"\nthis.renderCard=taskCard;this.renderList=renderList;this.statusText=statusLabel;this.renderDeps=renderTaskDependencies;this.renderTrail=renderDependencyTrail;this.nextTrail=dependencyTrailFor;",context);
+  vm.runInNewContext(blocks.join("\n")+"\nthis.renderCard=taskCard;this.renderList=renderList;this.statusText=statusLabel;this.renderDeps=renderTaskDependencies;this.renderTrail=renderDependencyTrail;this.nextTrail=dependencyTrailFor;this.runFilter=applyFilters;",context);
   return context;
 }
 
@@ -105,13 +108,22 @@ test("R1 multiple registered predecessors show on both card and detail, with dir
   ctx.state.snapshot={tasks};
   const card=ctx.renderCard(tasks[0]);
   const pending=card.children.find(item=>item.className==="dependency-card-row");
-  assert.equal(pending.children[0].textContent,"前置 1 项");
+  assert.equal(pending.children[0].textContent,"前置 2 项","completed dependencies remain on the card");
   const link=pending.children[1];
   assert.equal(link.textContent,ids[1]);
+  ctx.els.planFilter.value="other";ctx.els.trackFilter.value="bugfix";ctx.els.statusFilter.value="阻断";ctx.els.archiveFilter.value="active";
+  ctx.state.columnPages={old:3};ctx.state.view="list";ctx.els.taskDialog.open=true;ctx.state.selectedTask=tasks[0];
   let stopped=false;link.listeners.click({stopPropagation(){stopped=true}});
   assert.equal(stopped,true);
-  assert.deepEqual(ctx.navCalls,[{id:ids[1],nested:true}]);
-  assert.equal(ctx.state.dependencyTrail.join("|"),ids[0],"card entry must retain its parent as breadcrumb root");
+  assert.equal(ctx.els.searchInput.value,ids[1]);
+  assert.equal(ctx.state.view,"board");
+  assert.equal(Object.keys(ctx.state.columnPages).length,0);
+  assert.equal(ctx.els.archiveFilter.value,"all");
+  assert.equal(ctx.els.planFilter.value+ctx.els.trackFilter.value+ctx.els.statusFilter.value,"");
+  assert.equal(ctx.els.taskDialog.open,false,"dependency must close old detail");
+  assert.equal(ctx.state.selectedTask,null);
+  assert.deepEqual(ctx.state.filtered.map(t=>t.id),[ids[1]]);
+  assert.equal(ctx.navCalls.length,0,"dependency must never open another detail");
   ctx.renderDeps(tasks[0]);
   const detail=ctx.els.readDependenciesText.children;
   assert.equal(detail.length,3,"one link for each predecessor and one plain path");
@@ -119,25 +131,47 @@ test("R1 multiple registered predecessors show on both card and detail, with dir
   assert.equal(detail[1].children[0].textContent,ids[4],"completed registered predecessor remains clickable");
   assert.equal(detail[2].textContent,"docs/archive.md");
   detail[1].children[0].listeners.click({stopPropagation(){}});
-  assert.equal(ctx.navCalls.at(-1).nested,true);
+  assert.equal(ctx.els.searchInput.value,ids[4]);
+  assert.deepEqual(ctx.state.filtered.map(t=>t.id),[ids[4]],"completed target must be visible");
+  for(const index of [1,2]){
+    const next=ctx.renderCard(tasks[index]).children.find(item=>item.className==="dependency-card-row").children[1];
+    next.listeners.click({stopPropagation(){}});
+    assert.equal(ctx.els.searchInput.value,ids[index+1],"consecutive clicks replace search query");
+  }
+  assert.equal(ctx.navCalls.length,0);
 });
 
-test("R1 A→B→C→D breadcrumbs allow ancestors, backward navigation and branching",async()=>{
+test("R2 dependency click exactly matches manual full-ID board search, including linked descriptions",async()=>{
   const ctx=await cardRenderer();
-  const A="WTB-A-20261106-T1",B="WTB-B-20261106-T1",C="WTB-C-20261106-T1",D="WTB-D-20261106-T1",E="WTB-E-20261106-T1";
-  let path=ctx.nextTrail([],A,false);
-  for(const id of [B,C,D])path=ctx.nextTrail(path,id,true);
-  assert.deepEqual([...path],[A,B,C,D]);
-  ctx.state.dependencyTrail=path;
+  const A="WTB-A-20261106-T1",B="WTB-B-20261106-T1",OTHER="WTB-OTHER-20261106-T1";
+  const tasks=[
+    {id:A,status:"待开发",track:"product",priority:"P1",readDependencies:B+"完成"},
+    {id:B,status:"已完成",track:"bugfix",priority:"P0"},
+    {id:OTHER,status:"待准备",track:"infrastructure",priority:"P1",boundary:"关联 "+B}
+  ];
+  ctx.state.snapshot={tasks};
+  ctx.els.searchInput.value=B;ctx.runFilter();
+  const manual=ctx.state.filtered.map(task=>task.id);
+  assert.deepEqual(manual,[B,OTHER],"manual search includes related descriptions");
+  ctx.els.searchInput.value="different";
+  ctx.els.trackFilter.value="product";ctx.els.priorityFilter.value="P1";ctx.els.archiveFilter.value="active";
+  ctx.renderCard(tasks[0]).children.find(node=>node.className==="dependency-card-row").children[1].listeners.click({stopPropagation(){}});
+  assert.equal(ctx.els.searchInput.value,B);
+  assert.deepEqual(ctx.state.filtered.map(task=>task.id),manual);
+  assert.equal(ctx.navCalls.length,0);
+});
+
+test("R1 legacy trail links now search the board rather than open nested details",async()=>{
+  const ctx=await cardRenderer();
+  const ids=["WTB-A-20261106-T1","WTB-B-20261106-T1","WTB-C-20261106-T1","WTB-D-20261106-T1"];
+  ctx.state.snapshot={tasks:ids.map(id=>({id,status:"待开发",priority:"P1",track:"product"}))};
+  ctx.state.dependencyTrail=[...ids];
   ctx.renderTrail();
   assert.equal(ctx.els.dependencyBackBtn.hidden,false);
-  assert.deepEqual(ctx.els.dependencyTrail.children.map(x=>x.textContent),[...path]);
   ctx.els.dependencyTrail.children[1].listeners.click();
-  assert.deepEqual(ctx.navCalls.at(-1),{id:B,nested:true});
-  path=ctx.nextTrail(path,B,true);
-  assert.deepEqual([...path],[A,B]);
-  path=ctx.nextTrail(path,E,true);
-  assert.deepEqual([...path],[A,B,E],"branch from B should drop old C/D");
+  assert.equal(ctx.els.searchInput.value,ids[1]);
+  assert.equal(ctx.state.dependencyTrail.length,0);
+  assert.equal(ctx.navCalls.length,0);
 });
 
 test("R2 invalid references, self-loops and stale project do not navigate",async()=>{
@@ -159,7 +193,8 @@ test("R2 invalid references, self-loops and stale project do not navigate",async
   const link=ctx.renderCard(Btask).children.find(n=>n.className==="dependency-card-row").children[1];
   ctx.state.projectEpoch++;
   link.listeners.click({stopPropagation(){}});
-  assert.equal(ctx.navCalls.length,0,"stale button after project epoch change cannot navigate");
+  assert.equal(ctx.els.searchInput.value,"","stale button after project epoch change cannot search");
+  assert.equal(ctx.renderCount,0);
   assert.deepEqual([...ctx.nextTrail([A,B],A,true)],[A],"cycle goes back to existing breadcrumb");
   assert.deepEqual([...ctx.nextTrail([A,B],B,true)],[A,B],"same task never piles duplicate path");
 });
@@ -176,7 +211,7 @@ test("R3 mobile breadcrumb and close cleanup contract are visible",async()=>{
   assert.match(app,/if\(!els\.taskDialog\.open\)els\.taskDialog\.showModal\(\)/);
 });
 
-test("R2 actual async openTask supports four-level drilldown, back, branches, close and stale requests",async()=>{
+test("R2 ordinary task detail still opens, closes and rejects stale async replies",async()=>{
   const source=await fs.readFile("web/app.js","utf8");
   const helpers=source.slice(source.indexOf("function taskDependencies("),source.indexOf("function taskCard("));
   const opener=source.slice(source.indexOf("async function openTask("),source.indexOf("async function loadHistory("));
@@ -212,15 +247,8 @@ test("R2 actual async openTask supports four-level drilldown, back, branches, cl
   assert.equal(state.selectedTask.id,ids[3],"registered predecessor opens even when filtered out");
   assert.equal(state.dependencyTrail.join("|"),ids.slice(0,4).join("|"));
   assert.equal(els.dependencyBackBtn.hidden,false);
-  els.dependencyBackBtn.listeners.click();
-  await new Promise(resolve=>setImmediate(resolve));
-  assert.equal(state.selectedTask.id,ids[2]);
-  assert.equal(state.dependencyTrail.join("|"),ids.slice(0,3).join("|"));
-  els.dependencyTrail.children[0].listeners.click();
-  await new Promise(resolve=>setImmediate(resolve));
-  assert.equal(state.dependencyTrail.join("|"),ids[0]);
   await ctx.navigate(ids[4],true);
-  assert.equal(state.dependencyTrail.join("|"),ids[0]+"|"+ids[4],"branch switched after ancestor click");
+  assert.equal(state.selectedTask.id,ids[4],"ordinary programmatic detail navigation still works");
   els.taskDialog.close();
   assert.equal(state.dependencyTrail.length,0,"close clears the whole path");
   await ctx.navigate(ids[1]);
@@ -249,7 +277,7 @@ test("R1 long identifiers occupy separate lines with visual-only ellipsis and ve
   assert.match(css,/#taskDialog \.dialog-head \.icon-btn\{[^}]*min-height:40px/);
 });
 
-test("R2 long IDs retain full click, tooltip, aria and four-level return path",async()=>{
+test("R2 long IDs retain full search values, tooltip and aria",async()=>{
   const ctx=await cardRenderer();
   const ids=["WTB-P0-DELIVERY-REWORK-D01-CHECKPOINT-20261106-T1",
     "WTB-P0-DELIVERY-MERGE-CONFLICT-REWORK-20261106-T1",
@@ -267,17 +295,16 @@ test("R2 long IDs retain full click, tooltip, aria and four-level return path",a
   for(let index=1;index<3;index++){
     assert.equal(links[index].textContent,ids[index]);
     assert.equal(links[index].title,ids[index]+" · 待开发");
-    assert.equal(links[index].attributes["aria-label"],"查看前置任务："+ids[index]);
+    assert.equal(links[index].attributes["aria-label"],"搜索前置任务："+ids[index]);
   }
   links[1].listeners.click({stopPropagation(){}});
-  assert.deepEqual(ctx.navCalls,[{id:ids[1],nested:true}],"navigation uses full ID, not ellipsis text");
-  let trail=ctx.nextTrail([],ids[0],false);
-  for(const id of ids.slice(1,4))trail=ctx.nextTrail(trail,id,true);
-  ctx.state.dependencyTrail=trail;
+  assert.equal(ctx.els.searchInput.value,ids[1],"search uses full ID, not ellipsis text");
+  assert.equal(ctx.navCalls.length,0);
+  ctx.state.dependencyTrail=ids.slice(0,4);
   ctx.renderTrail();
   assert.deepEqual(ctx.els.dependencyTrail.children.map(x=>x.textContent),ids.slice(0,4));
   assert.equal(ctx.els.dependencyTrail.children[2].attributes["aria-label"],"查看访问路径任务："+ids[2]);
   ctx.els.dependencyTrail.children[1].listeners.click();
-  assert.deepEqual(ctx.navCalls.at(-1),{id:ids[1],nested:true});
-  assert.deepEqual([...ctx.nextTrail(trail,ids[4],true)],ids.slice(0,4).concat(ids[4]));
+  assert.equal(ctx.els.searchInput.value,ids[1]);
+  assert.equal(ctx.navCalls.length,0);
 });
