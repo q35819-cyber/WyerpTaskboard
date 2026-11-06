@@ -19,6 +19,40 @@ import { AutomationControlStore } from "./automation-control.mjs";
 import { ChatgptMcpExecutor } from "./chatgpt-mcp-executor.mjs";
 import { SystemEventLog } from "./system-event-log.mjs";
 import { TaskStatusEvents } from "./task-status-events.mjs";
+import { blockerEvidence, qaFailReportPath } from "./blocker-evidence.mjs";
+import { resolveProjectPath } from "./core/path-safety.mjs";
+
+
+
+async function verifiedScanCandidates(scanStore, systemEventLog) {
+  try { return await scanStore.list(); }
+  catch (error) {
+    await systemEventLog.append({
+      level: "warning", component: "blocker-evidence", event: "scan_candidates_unavailable",
+      operation: "scanStore.list", result: "failed", error_source: "scan_store",
+      error_code: error.code || "SCAN_READ_FAILED",
+      error_message: String(error.message || error)
+    });
+    return [];
+  }
+}
+
+async function verifiedBlockerDetails(task, events, snapshot, { projectId, scanCandidates, projectContext }) {
+  const reportPath = qaFailReportPath(task, events);
+  let reportText = "";
+  if (reportPath && projectContext?.rootRealPath) {
+    try {
+      const safePath = await resolveProjectPath(projectContext.rootRealPath, reportPath, {
+        mustExist: true, rejectReparse: true
+      });
+      const stat = await fs.stat(safePath);
+      if (stat.isFile() && stat.size <= 1024 * 1024) reportText = await fs.readFile(safePath, "utf8");
+    } catch { /* LOG-IGNORE: unverified, missing or unsafe QA report must never be read or inferred */ }
+  }
+  return blockerEvidence(task, events, snapshot.tasks, {
+    projectId, registryRevision: snapshot.registryRevision, scanCandidates, reportText
+  });
+}
 
 // A mention of a historical PASS is not an independent QA verdict.
 // Preserve delivery authority only with an explicit affirmative conclusion and
@@ -1036,7 +1070,19 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         return;
       }
       params = routeMatch(url.pathname, "/api/projects/:projectId/tasks");
-      if (req.method === "GET" && params) return send(res, 200, await taskStore.snapshot(params.projectId));
+      if (req.method === "GET" && params) {
+        const snapshot = await taskStore.snapshot(params.projectId);
+        const scanCandidates = await verifiedScanCandidates(scanStore, systemEventLog);
+        const projectContext = await taskStore.projects.context(params.projectId);
+        const tasks = await Promise.all(snapshot.tasks.map(async task => {
+          if (!["阻断", "HOLD", "测试失败待修复"].includes(task.status)) return task;
+          const history = await taskStore.taskHistory(params.projectId, task.id, { all: true });
+          return { ...task, blockerEvidence: await verifiedBlockerDetails(task, history, snapshot, {
+            projectId: params.projectId, scanCandidates, projectContext
+          }) };
+        }));
+        return send(res, 200, { ...snapshot, tasks });
+      }
       if (req.method === "POST" && params) {
         const body = await readJson(req);
         requireOperation(body);
@@ -1093,6 +1139,15 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         const pair = await taskStore.getTask(params.projectId, params.taskId);
         return send(res, 200, {
           ...pair.task, registryRevision: pair.snapshot.registryRevision,
+          blockerEvidence: ["阻断", "HOLD", "测试失败待修复"].includes(pair.task.status)
+            ? await verifiedBlockerDetails(pair.task,
+                await taskStore.taskHistory(params.projectId, params.taskId, { all: true }),
+                pair.snapshot, {
+                  projectId: params.projectId,
+                  scanCandidates: await verifiedScanCandidates(scanStore, systemEventLog),
+                  projectContext: await taskStore.projects.context(params.projectId)
+                })
+            : null,
           stop: await taskStore.stopState(params.projectId, params.taskId),
           takeover: await taskStore.takeoverState(params.projectId, params.taskId),
 
