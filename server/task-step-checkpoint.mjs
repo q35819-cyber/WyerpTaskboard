@@ -343,7 +343,7 @@ export class TaskStepCheckpoint {
           && !(await this.taskStore.stopState(projectId, taskId)).stopRequested
           && await hardDependenciesCompleted(this.taskStore, projectId, task)) {
           const reworkIndex = history.findLastIndex((entry, i) => i < currentClaimIndex
-            && entry.event_type === "delivery_merge_conflict_rework");
+            && ["delivery_merge_conflict_rework", "controller_rework_requeue"].includes(entry.event_type));
           const rework = history[reworkIndex];
           const qaIndex = history.findLastIndex((entry, i) => i < reworkIndex
             && entry.event_type === "test_result" && entry.actor_type === "test_ai");
@@ -361,9 +361,58 @@ export class TaskStepCheckpoint {
           const failure = history.slice(qaIndex + 1, reworkIndex).findLast((entry) =>
             entry.event_type === "delivery_attempt_failed"
             && entry.actor_type === "controller_ai"
-            && entry.actor_id === rework?.actor_id && entry.session_id === rework?.session_id
+            && entry.actor_id === (rework?.event_type === "controller_rework_requeue"
+              ? controllerClaim?.actor_id : rework?.actor_id)
+            && entry.session_id === (rework?.event_type === "controller_rework_requeue"
+              ? controllerClaim?.session_id : rework?.session_id)
             && entry.metadata?.failureStage === "merge"
             && entry.metadata?.candidateSha === qaPass?.metadata?.commitSha);
+          // Only a verified failed controller merge may requeue a blocked D09 task to fresh D01.
+          const conflictBlocked = history.slice(qaIndex + 1, reworkIndex).findLast((e) =>
+            e.event_type === "controller_c04_candidate_new_main_merge_conflict"
+            && e.actor_type === "controller_ai" && e.old_status === "交付中"
+            && e.new_status === "阻断" && e.metadata?.failureEventId === failure?.event_id
+            && e.metadata?.failureCode === "GIT_MERGE_CONFLICT"
+            && e.metadata?.candidateSha === qaPass?.metadata?.commitSha
+            && e.actor_id === controllerClaim?.actor_id && e.session_id === controllerClaim?.session_id);
+          const ready = conflictBlocked && history.slice(history.indexOf(conflictBlocked) + 1, reworkIndex)
+            .findLast((e) => e.event_type === "controller_rework_ready"
+              && e.actor_type === "controller_ai" && e.actor_id === rework?.actor_id
+              && e.session_id === rework?.session_id && e.old_status === "阻断"
+              && e.new_status === "阻断");
+          if (rework?.event_type === "controller_rework_requeue"
+            && rework.old_status === "阻断" && rework.new_status === "待开发"
+            && rework.actor_type === "controller_ai" && rework.actor_id && rework.session_id
+            && meta.requiresIndependentRetest === true && meta.reasonCode === "GIT_MERGE_CONFLICT"
+            && meta.priorCandidateSha === qaPass?.metadata?.commitSha
+            && /^[a-f0-9]{40}$/i.test(String(qaPass?.metadata?.commitSha || ""))
+            && qaPass?.metadata?.atomicLifecycle === true && qaPass.metadata.testResult === "pass"
+            && qaPass.old_status === "独测中" && qaPass.new_status === "待交付"
+            && Boolean(String(qaPass.metadata.reportPath || "").trim())
+            && qaPass.actor_id === qaClaim?.actor_id && qaPass.session_id === qaClaim?.session_id
+            && history.findLastIndex((e) => e.event_type === "test_result"
+              && e.actor_type === "test_ai") === qaIndex
+            && oldDevClaim?.actor_id === oldHandoff?.actor_id
+            && oldDevClaim?.session_id === oldHandoff?.session_id
+            && oldDevClaim?.session_id !== sessionId
+            && history.indexOf(oldHandoff) > history.indexOf(oldDevClaim)
+            && controllerClaim?.actor_id === failure?.actor_id
+            && controllerClaim?.session_id === failure?.session_id
+            && failure?.metadata?.failureStage === "merge"
+            && failure?.metadata?.failureCode === "GIT_MERGE_CONFLICT"
+            && failure?.metadata?.candidateSha === qaPass.metadata.commitSha
+            && history.indexOf(failure) < history.indexOf(conflictBlocked)
+            && conflictBlocked && ready && reworkIndex > history.indexOf(ready)
+            && !history.slice(reworkIndex + 1, currentClaimIndex)
+              .some((e) => e.old_status && e.new_status && e.old_status !== e.new_status)
+            && state.records.some((e) => e.attempt === state.attempts
+              && e.stepId === "D08_HANDOFF" && e.result === "PASS")
+            && state.records.some((e) => e.attempt === state.attempts
+              && e.stepId === "Q03_RESULT" && e.result === "PASS" && e.verdict === "pass")) {
+            state.attempts += 1;
+            state.cursors.developer_ai = "D01_CLAIM";
+            state.cursors.test_ai = "Q01_ADMISSION";
+          }
           if (rework?.old_status === "交付中" && rework.new_status === "待开发"
             && rework.actor_type === "controller_ai" && controllerClaim
             && controllerClaim.actor_id === rework.actor_id
