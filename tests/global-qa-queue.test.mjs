@@ -20,17 +20,33 @@ test("R1 cross-project QA panel is read-only and uses registered projects", () =
   assert.match(app, /await loadGlobalQaQueue\(\)/);
 });
 
-test("R2 only the current task's real developer handoff supplies candidate SHA", () => {
+test("R1 real code_published SHA remains visible when handoff lacks commitSha", () => {
   const ctx = vm.createContext({});
   vm.runInContext(helpers + "\nthis.readSha=qaCandidateSha;", ctx);
-  const id = "a".repeat(40);
+  const sha = "250470ffc2b6e2565aa756c1892c7987925ac63c";
+  const developer = "wtb-dev-cross-project-qa-view-20261106-5acbc19f";
   assert.equal(ctx.readSha([
-    { event_type: "test_result", actor_type: "test_ai", metadata: { commitSha: "b".repeat(40) } },
-    { event_type: "handoff", actor_type: "developer_ai", metadata: { commitSha: id } }
-  ]), id);
-  assert.equal(ctx.readSha([{ event_type: "handoff", actor_type: "developer_ai", metadata: { commitSha: "fake" } }]), "待核验");
-  assert.equal(ctx.readSha([{ event_type: "handoff", actor_type: "test_ai", metadata: { commitSha: id } }]), "待核验");
-  assert.equal(ctx.readSha([]), "待核验");
+    { event_type:"code_published", actor_type:"developer_ai", actor_id:developer,
+      metadata:{commitSha:sha,branch:"feat/WTB-P1-CROSS-PROJECT-QA-VIEW-20261104-T1",remoteVerified:true}},
+    { event_type:"handoff", actor_type:"developer_ai", actor_id:developer, metadata:{atomicLifecycle:true}}
+  ]),sha);
+});
+test("R2 fake, mismatched and unverified code_published cannot supply candidate SHA", () => {
+  const ctx = vm.createContext({});
+  vm.runInContext(helpers + "\nthis.readSha=qaCandidateSha;", ctx);
+  const sha = "a".repeat(40), handoff = {event_type:"handoff",actor_type:"developer_ai",actor_id:"dev-a"};
+  const proof = {event_type:"code_published",actor_type:"developer_ai",actor_id:"dev-a",
+    metadata:{commitSha:sha,branch:"fix/candidate",remoteVerified:true}};
+  assert.equal(ctx.readSha([proof,handoff]),sha);
+  assert.equal(ctx.readSha([handoff,proof]),"待核验","proof after handoff must not validate earlier candidate");
+  assert.equal(ctx.readSha([{...proof,actor_id:"other-dev"},handoff]),"待核验");
+  assert.equal(ctx.readSha([{...proof,actor_type:"controller_ai"},handoff]),"待核验");
+  assert.equal(ctx.readSha([{...proof,metadata:{...proof.metadata,remoteVerified:false}},handoff]),"待核验");
+  assert.equal(ctx.readSha([{...proof,metadata:{...proof.metadata,commitSha:"fake"}},handoff]),"待核验");
+  assert.equal(ctx.readSha([{...proof,metadata:{...proof.metadata,branch:" "}},handoff]),"待核验");
+  assert.equal(ctx.readSha([proof,{...handoff,actor_type:"test_ai"}]),"待核验");
+  assert.equal(ctx.readSha([{event_type:"test_result",actor_type:"test_ai",metadata:{commitSha:sha}},handoff]),"待核验");
+  assert.equal(ctx.readSha([]),"待核验");
 });
 
 test("R2 simultaneous projects retain project identity and show multiple QA occupancies", () => {

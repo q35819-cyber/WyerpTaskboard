@@ -163,8 +163,14 @@ async function loadProjects(){
 // Read-only: never infer a candidate SHA from a different task or another project.
 function qaCandidateSha(events){
   const handoff=[...(events||[])].reverse().find(e=>e.event_type==="handoff"&&e.actor_type==="developer_ai");
-  const sha=handoff?.metadata?.commitSha;
-  return /^[a-f0-9]{40}$/i.test(String(sha||""))?sha:"待核验";
+  if(!handoff)return "待核验";
+  const published=[...(events||[])].slice(0,(events||[]).lastIndexOf(handoff)).reverse().find(e=>e.event_type==="code_published"
+    && e.actor_type==="developer_ai"&&e.actor_id===handoff.actor_id
+    && e.metadata?.remoteVerified===true
+    && typeof e.metadata?.branch==="string"&&e.metadata.branch.trim()
+    && /^[a-f0-9]{40}$/i.test(String(e.metadata?.commitSha||"")));
+  const sha=published?.metadata?.commitSha;
+  return sha?sha.toLowerCase():"待核验";
 }
 async function loadGlobalQaQueue(){
   const request=++state.qaLoadEpoch,projects=state.projects.slice();
