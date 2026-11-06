@@ -126,6 +126,13 @@ export const wyerpAiFlowV1 = {
         });
       }
       const meta = metadata && typeof metadata === "object" ? metadata : {};
+      if (actorType === "developer_ai" && ["开发中","修复中"].includes(task.status) && targetStatus === "阻断"
+        && (sessionId !== task.sessionId
+          || meta.externalIssueVerified !== true || !meta.externalIssueEventId)) {
+        throw new TaskboardError("可自行修复的开发问题必须留原任务；外部暂停须提交可信问题事件", {
+          code: "DEVELOPER_SELF_REPAIR_REQUIRED", status: 409
+        });
+      }
       const atomicHandoff = (task.status === "开发中" && targetStatus === "待独测")
         || (task.status === "修复中" && targetStatus === "待复测");
       if (atomicHandoff && (eventType !== "handoff" || actorType !== "developer_ai"

@@ -99,7 +99,7 @@ async function externalStatusChange(root, projectId, operationId, patch) {
     const before = await store.getTask(project, "B-10");
     const result = await store.updateTask(project, "B-10", JSON.parse(process.argv[4]), {
       expectedRevision: before.snapshot.registryRevision, operationId: process.argv[3],
-      eventType: "temporary_block", actorType: "developer_ai",
+      eventType: "temporary_block", actorType: "controller_ai",
       actorId: "external-worker", sessionId: "external-session",
       metadata: { conditions: [{ kind: "required_file_exists", path: "read/B-10.md" }] }
     });
@@ -110,6 +110,37 @@ async function externalStatusChange(root, projectId, operationId, patch) {
   assert.match(result.stdout, /evt_[a-f0-9]+/);
 }
 
+test("developer block requires recorded external issue instead of a bare note", async t => {
+  const fixture = await makeFixture();
+  t.after(() => fs.rm(fixture.boardRoot, { recursive: true, force: true }));
+  const store = await new TaskStore(fixture.boardRoot).init();
+  const expectedRevision = (await store.snapshot("fixture")).registryRevision;
+  const base = { expectedRevision, actorType: "developer_ai", actorId: "worker", sessionId: "wc_sess_test" };
+  await assert.rejects(store.updateTask("fixture", "B-10", { status: "阻断" }, {
+    ...base, operationId: "dev.bare.block.001", eventType: "status_change"
+  }), e => e.code === "DEVELOPER_SELF_REPAIR_REQUIRED");
+  await assert.rejects(store.updateTask("fixture", "B-10", { status: "阻断" }, {
+    ...base, operationId: "dev.forged.block.001", eventType: "developer_external_pause",
+    metadata: { evidenceEventId: "evt_fake", externalIssueVerified: true }
+  }), e => e.code === "DEVELOPER_SELF_REPAIR_REQUIRED");
+  const still = (await store.getTask("fixture", "B-10")).task;
+  assert.equal(still.status, "开发中");
+  assert.equal(still.sessionId, "wc_sess_test");
+  const issue = await store.appendTaskEvent("fixture", "B-10", {
+    operationId: "dev.issue.001", eventType: "developer_external_issue_reported",
+    actorType: "developer_ai", actorId: "worker", sessionId: "wc_sess_test",
+    metadata: { errorCode: "EXTERNAL_FIX_NOT_RELEASED", relatedTaskId: "A-10",
+      resumeCondition: "A-10正式发布后复核", reportPath: "reports/B-10/report.md" }
+  });
+  const result = await store.updateTask("fixture", "B-10", { status: "阻断" }, {
+    ...base, operationId: "dev.external.pause.001", eventType: "developer_external_pause",
+    metadata: { evidenceEventId: issue.event.event_id }
+  });
+  assert.equal(result.after.status, "阻断");
+  assert.equal(result.after.sessionId, "");
+  const events = await store.events.listTaskEvents("fixture", "B-10", { all: true });
+  assert.equal(events.at(-1).metadata.externalIssueEventId, issue.event.event_id);
+});
 test("R1 committed cross-process task status sends only matching project's SSE refresh", async t => {
   const { base, fixture, streams } = await start(t, true);
   const first = await connect(t, base, "fixture", streams);

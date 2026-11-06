@@ -554,9 +554,16 @@ async function verifiedDeveloperBlockFixture(t, { kind = "blocked", dispatch = t
     blockedByWriteScope: "server/task-step-checkpoint.mjs",
     candidateWipPreserved: true, candidateSha: "d".repeat(40)
   } : {};
+  const reported = await f.store.appendTaskEvent("fixture", "A-10", {
+    operationId: "developer.external.issue." + (++sequence),
+    eventType: "developer_external_issue_reported",
+    actorType: "developer_ai", actorId: "fixture-actor", sessionId: "dev-session",
+    metadata: { errorCode: kind, relatedTaskId: RECOVERY_FIX,
+      resumeCondition: "正式发布后机器复核", reportPath: "reports/A-10/block.md" }
+  });
   const blocked = await change(f.store, "A-10", {
     status: "阻断", assignee: "", sessionWindowName: "", sessionId: ""
-  }, kind, metadata, "developer_ai", "dev-session");
+  }, kind, { ...metadata, evidenceEventId: reported.event.event_id }, "developer_ai", "dev-session");
   if (unfinishedDependency) {
     const lines = (await fs.readFile(f.registryPath, "utf8")).split(/\r?\n/);
     const index = lines.findIndex((line) => line.startsWith("| A-10 |"));
