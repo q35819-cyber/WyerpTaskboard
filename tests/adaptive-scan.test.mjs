@@ -5,6 +5,11 @@ import os from "node:os";
 import path from "node:path";
 import { ScanStore } from "../server/scan-store.mjs";
 import { TaskScanner } from "../server/task-scanner.mjs";
+import { TaskStore } from "../server/task-store.mjs";
+import { RequirementStore } from "../server/requirement-store.mjs";
+import { TaskStepCheckpoint } from "../server/task-step-checkpoint.mjs";
+import { makeFixture, registryText } from "./helpers.mjs";
+import crypto from "node:crypto";
 
 async function root(t) {
   const value = await fs.mkdtemp(path.join(os.tmpdir(), "wyerp-adaptive-scan-"));
@@ -197,22 +202,23 @@ test("a rearm arriving during a scan remains pending for a follow-up one-shot", 
   assert.equal((await scanStore.scheduledDecision()).reason, "rearm");
 });
 
-test("scanner promotes dispatched ready preparation exactly once, never without dispatch or with STOP", async (t) => {
+test("scanner promotes eligible preparation without dispatch once, but refuses STOP/provisional", async (t) => {
   const dir = await root(t);
   const scanStore = await new ScanStore(dir).init();
-  const task = { id: "PRE", status: "待准备", updatedAt: "2026-11-06T00:00:00Z", assignee: "", sessionId: "" };
-  let dispatched = false, stop = false, provisional = false, writes = 0;
+  const task = { id: "PRE", status: "待准备", plannedRole: "开发AI", plan: "plan.md",
+    writeTargets: "src/PRE.mjs", updatedAt: "2026-11-06T00:00:00Z", assignee: "", sessionId: "" };
+  let stop = true, provisional = false, rejected = false, writes = 0;
   const taskStore = {
     projects: { list: () => [{ id: "fixture" }] },
-    taskHistory: async () => dispatched ? [{ event_id: "evt_dispatch", event_type: "controller_dispatch",
-      actor_type: "controller_ai", old_status: "待准备", new_status: "待准备" }] : [],
+    taskHistory: async () => [],
     getTask: async () => ({ task: { ...task }, snapshot: { registryRevision: "rev1" } }),
     stopState: async () => ({ stopRequested: stop }),
     updateTask: async (_project, _id, patch, opts) => {
       assert.equal(opts.eventType, "auto_preparation_ready");
       assert.equal(opts.actorType, "system");
-      assert.equal(opts.metadata.controllerDispatchEventId, "evt_dispatch");
+      assert.equal(opts.metadata.preparationUpdatedAt, task.updatedAt);
       assert.equal(patch.status, "待开发");
+      if (rejected) throw Object.assign(new Error("changed eligibility"), { code: "AUTO_PREPARATION_NOT_READY" });
       writes++; task.status = patch.status; return { idempotentReplay: false };
     }
   };
@@ -229,17 +235,117 @@ test("scanner promotes dispatched ready preparation exactly once, never without 
       blockers: [], track: "bugfix", priority: "P0" }]
   }) };
   await scanner.scanOnce({ trigger: "test" });
-  assert.equal(task.status, "待准备"); assert.equal(writes, 0, "scan flag alone is not proof");
-  dispatched = true; stop = true;
-  await scanner.scanOnce({ trigger: "test" });
   assert.equal(task.status, "待准备"); assert.equal(writes, 0, "STOP forbids promotion");
   stop = false; provisional = true;
   await scanner.scanOnce({ trigger: "test" });
   assert.equal(writes, 0, "provisional developer approval is not preparation completion");
-  provisional = false;
+  provisional = false; rejected = true;
+  const skipped = await scanner.scanOnce({ trigger: "test" });
+  assert.equal(skipped.projects[0].status, "ok", "eligibility race must not mark the project unavailable");
+  assert.equal(task.status, "待准备");
+  rejected = false;
   const completed = await scanner.scanOnce({ trigger: "test" });
   assert.equal(task.status, "待开发"); assert.equal(writes, 1);
   assert.equal(completed.projects[0].candidates[0].status, "待开发");
   await scanner.scanOnce({ trigger: "test" });
   assert.equal(writes, 1, "already promoted tasks never emit duplicate transition");
+});
+
+const readyRow = (status = "待准备") =>
+  ["AUT-10", "F-AUT", "bugfix", "P0", status, "开发AI", "—", "—", "—", "—",
+    "自动准备条件", "plan.md", "trace/AUT-10", "", "src/AUT-10.mjs", "cp/AUT-10.md"];
+
+async function actualReadyFixture(t) {
+  const f = await makeFixture();
+  t.after(() => fs.rm(f.boardRoot, { recursive: true, force: true }));
+  await fs.writeFile(f.registryPath, registryText([readyRow()]), "utf8");
+  await fs.writeFile(path.join(f.projectRoot, "plan.md"), "# authorized minimal plan\n", "utf8");
+  const taskStore = await new TaskStore(f.boardRoot).init();
+  const requirementStore = await new RequirementStore(f.boardRoot).init();
+  return { ...f, taskStore, requirementStore };
+}
+
+test("real scan without controller dispatch commits ready transaction and permits first D01 claim", async (t) => {
+  const f = await actualReadyFixture(t);
+  const scanStore = await new ScanStore(f.boardRoot).init();
+  const scanner = await new TaskScanner(f.boardRoot, {
+    taskStore: f.taskStore, requirementStore: f.requirementStore, scanStore,
+    wakeBridge: { notifyCandidate: async () => ({ state: "no_candidate" }) },
+    chatBrowserWake: { readState: async () => ({ acked: {} }),
+      publicStatus: () => ({ enabled: false }) },
+    aiExecutionSettings: { get: async () => ({ scan_interval_minutes: 10, idle_scan_interval_seconds: 10 }) }
+  }).init();
+  const first = await scanner.scanOnce({ trigger: "test" });
+  assert.equal((await f.taskStore.getTask("fixture", "AUT-10")).task.status, "待开发");
+  assert.equal(first.projects[0].candidates[0].status, "待开发");
+  await scanner.scanOnce({ trigger: "test" });
+  const history = await f.taskStore.taskHistory("fixture", "AUT-10", { all: true });
+  assert.equal(history.filter(e => e.event_type === "controller_dispatch").length, 0);
+  const ready = history.filter(e => e.event_type === "auto_preparation_ready");
+  assert.equal(ready.length, 1, "repeat scans cannot duplicate the trusted promotion");
+  const journal = await f.taskStore.transactions.read(ready[0].operation_id);
+  assert.equal(journal.state, "committed");
+  assert.equal(journal.result.eventId, ready[0].event_id);
+  const { snapshot } = await f.taskStore.getTask("fixture", "AUT-10");
+  const claim = await f.taskStore.updateTask("fixture", "AUT-10", {
+    status: "开发中", assignee: "developer", sessionWindowName: "developer", sessionId: "dev-session"
+  }, { expectedRevision: snapshot.registryRevision, operationId: "readyauto.claim.001",
+    eventType: "claim", actorType: "developer_ai", actorId: "developer", sessionId: "dev-session" });
+  const checkpoint = await new TaskStepCheckpoint(f.boardRoot, {
+    taskStore: f.taskStore, flowVersion: "role-steps-v2"
+  }).init();
+  const before = await checkpoint.show("fixture", "AUT-10");
+  const recorded = await checkpoint.record("fixture", "AUT-10", {
+    operationId: "readyauto.d01.001", expectedSha256: before.sha256,
+    stepId: "D01_CLAIM", result: "PASS", actorType: "developer_ai",
+    actorId: "developer", sessionId: "dev-session", eventId: claim.eventId,
+    evidence: "real committed auto readiness and developer claim"
+  });
+  assert.equal(recorded.state.cursors.developer_ai, "D02_WORKTREE");
+});
+
+test("fake system identity and pending requirements cannot promote preparation", async (t) => {
+  const f = await actualReadyFixture(t);
+  const before = await f.taskStore.getTask("fixture", "AUT-10");
+  const key = "auto_preparation_ready." + crypto.createHash("sha256")
+    .update("fixture|AUT-10|" + before.task.updatedAt).digest("hex");
+  const options = { expectedRevision: before.snapshot.registryRevision,
+    operationId: key, eventType: "auto_preparation_ready", actorType: "system",
+    actorId: "task-scan", metadata: { preparationUpdatedAt: before.task.updatedAt } };
+  await assert.rejects(
+    f.taskStore.updateTask("fixture", "AUT-10", { status: "待开发" },
+      { ...options, actorId: "forged-scan" }),
+    error => error.code === "AUTO_PREPARATION_NOT_READY"
+  );
+  await f.requirementStore.create("fixture", { operationId: "readyauto.requirement.001",
+    text: "尚未拆解的用户需求" });
+  await assert.rejects(
+    f.taskStore.updateTask("fixture", "AUT-10", { status: "待开发" }, options),
+    error => error.code === "AUTO_PREPARATION_NOT_READY"
+  );
+  assert.equal((await f.taskStore.getTask("fixture", "AUT-10")).task.status, "待准备");
+  assert.equal((await f.taskStore.taskHistory("fixture", "AUT-10", { all: true }))
+    .filter(e => e.event_type === "auto_preparation_ready").length, 0);
+});
+
+test("unready P0 BUG without a real plan does not deadlock an eligible ordinary claim", async (t) => {
+  const f = await makeFixture();
+  t.after(() => fs.rm(f.boardRoot, { recursive: true, force: true }));
+  const row = (id, track, status, plan) =>
+    [id, "F-" + id, track, "P0", status, "开发AI", "—", "—", "—", "—",
+      "queue admission", plan, "trace/" + id, "", "src/" + id + ".mjs", "cp/" + id + ".md"];
+  await fs.writeFile(f.registryPath, registryText([
+    row("BUG-WAIT", "bugfix", "待准备", "missing-plan.md"),
+    row("NORMAL-10", "product", "待开发", "plan.md")
+  ]), "utf8");
+  await fs.writeFile(path.join(f.projectRoot, "plan.md"), "# valid normal task\n", "utf8");
+  const store = await new TaskStore(f.boardRoot).init();
+  const { snapshot } = await store.getTask("fixture", "NORMAL-10");
+  const claim = await store.updateTask("fixture", "NORMAL-10", {
+    status: "开发中", assignee: "developer", sessionWindowName: "developer", sessionId: "session-1"
+  }, { expectedRevision: snapshot.registryRevision, operationId: "readyauto.normal.claim.001",
+    eventType: "claim", actorType: "developer_ai", actorId: "developer", sessionId: "session-1" });
+  assert.ok(claim.eventId);
+  assert.equal((await store.getTask("fixture", "NORMAL-10")).task.status, "开发中");
+  assert.equal((await store.getTask("fixture", "BUG-WAIT")).task.status, "待准备");
 });

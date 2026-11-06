@@ -68,6 +68,25 @@ async function hardDependenciesCompleted(taskStore, projectId, task) {
   return ids.every((id) => snapshot.tasks.some((entry) =>
     entry.id === id && entry.status === "已完成"));
 }
+async function committedAutoPreparation(store, projectId, taskId, history, claimIndex) {
+  if (claimIndex < 0 || history.slice(0, claimIndex).some((event) =>
+    event.actor_type === "developer_ai" && ["claim", "takeover"].includes(event.event_type))) return false;
+  const ready = history.slice(0, claimIndex).findLast((event) =>
+    event.event_type === "auto_preparation_ready" && event.actor_type === "system"
+    && event.actor_id === "task-scan" && event.old_status === "待准备"
+    && event.new_status === "待开发" && typeof event.metadata?.preparationUpdatedAt === "string");
+  if (!ready) return false;
+  const readyIndex = history.indexOf(ready);
+  if (history.slice(readyIndex + 1, claimIndex).some((event) =>
+    event.old_status !== event.new_status)) return false;
+  const operationId = "auto_preparation_ready." + SHA(projectId + "|" + taskId + "|" + ready.metadata.preparationUpdatedAt);
+  if (ready.operation_id !== operationId) return false;
+  const transaction = await store.transactions.read(operationId);
+  return transaction?.state === "committed" && transaction.result?.eventId === ready.event_id
+    && transaction.event?.event_type === "auto_preparation_ready"
+    && transaction.event?.actor_type === "system" && transaction.event?.actor_id === "task-scan"
+    && transaction.event?.metadata?.preparationUpdatedAt === ready.metadata.preparationUpdatedAt;
+}
 function emptyState(projectId, taskId, flowVersion) {
   return {
     version: 1, projectId, taskId, flowVersion,
@@ -562,8 +581,10 @@ export class TaskStepCheckpoint {
             && authorityEvent.old_status === authorityEvent.new_status
             && ["开发中", "修复中"].includes(authorityEvent.old_status);
         }
+        const machineReady = authorityEvent?.event_type === "claim"
+          && await committedAutoPreparation(this.taskStore, projectId, taskId, history, authorityIndex);
         if (authorityEvent?.event_id !== currentClaim?.event_id
-          || dispatchIndex < 0 || !authorizedTakeover || task.sessionId !== sessionId
+          || (dispatchIndex < 0 && !machineReady) || !authorizedTakeover || task.sessionId !== sessionId
           || !["开发中", "修复中"].includes(task.status)
           || (await this.taskStore.stopState(projectId, taskId)).stopRequested
           || !(await hardDependenciesCompleted(this.taskStore, projectId, task))) {
