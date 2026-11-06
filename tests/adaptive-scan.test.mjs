@@ -88,7 +88,7 @@ test("one shared ready column derives developer eligibility and keeps QA and del
     renderBoard();
     assert.equal(els.boardView.children.length,6,"six actual DOM columns");
     const shared=els.boardView.children.find(col=>
-      col.children[0]?.children[0]?.textContent===flow.boardColumns.find(c=>c.id==="qa_pending").title);
+      col.children[0]?.children[0]?.textContent==="待执行");
     assert.ok(shared);
     assert.equal(shared.children.filter(child=>child.tag==="article").length,
       Math.min(3,get("qa_pending").length),"pagination never changes full role counts");

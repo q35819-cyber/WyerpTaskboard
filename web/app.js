@@ -439,6 +439,7 @@ function renderBoard(){
     const columnTitle=document.createElement("span");columnTitle.textContent=column.title.replace(/HOLD/g,"暂停");
     const columnCount=document.createElement("span");columnCount.className="count";columnCount.textContent=tasks.length+"项";
     if(column.id==="qa_pending"){
+      columnTitle.textContent="待执行";
       const developers=tasks.filter(isReadyTask).length;
       const bugs=tasks.filter(task=>task.track==="bugfix").length;
       columnCount.textContent="开发 "+developers+" 项 · 测试 "+(tasks.length-developers)+" 项 · BUG "+bugs+" 项";
