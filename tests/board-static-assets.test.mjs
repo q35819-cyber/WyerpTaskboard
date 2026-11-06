@@ -170,7 +170,7 @@ test("R3 mobile breadcrumb and close cleanup contract are visible",async()=>{
   const app=await fs.readFile("web/app.js","utf8");
   assert.match(html,/id="dependencyBackBtn"/);
   assert.match(html,/id="dependencyTrail"[^>]*aria-label="任务访问路径"/);
-  assert.match(css,/\.dependency-trail\{[^}]*overflow-x:auto/);
+  assert.match(css,/#taskDialog \.dependency-trail\{[^}]*overflow-y:auto;overflow-x:hidden/);
   assert.match(css,/\.dependency-link[^}]*min-height:40px/);
   assert.match(app,/els\.taskDialog\.addEventListener\("close",[\s\S]*?state\.dependencyTrail=\[\]/);
   assert.match(app,/if\(!els\.taskDialog\.open\)els\.taskDialog\.showModal\(\)/);
@@ -231,4 +231,53 @@ test("R2 actual async openTask supports four-level drilldown, back, branches, cl
   state.projectEpoch++;
   resolveLater(tasks[2]);await inflight;
   assert.equal(state.dependencyTrail.join("|"),ids[1],"a previous-project reply cannot pollute the navigation path");
+});
+
+
+test("R1 long identifiers occupy separate lines with visual-only ellipsis and vertical breadcrumb scrolling",async()=>{
+  const css=await fs.readFile("web/styles.css","utf8");
+  const html=await fs.readFile("web/index.html","utf8");
+  assert.match(html,/class="task-dialog-heading"><div id="detailTaskId"/);
+  assert.match(css,/#taskDialog \.task-dialog-heading\{[^}]*min-width:0/);
+  assert.match(css,/#taskDialog #detailTaskId\{[^}]*white-space:nowrap;overflow:hidden;text-overflow:ellipsis/);
+  assert.match(css,/#taskDialog #detailTitle\{[^}]*overflow-wrap:anywhere/);
+  assert.match(css,/\.dependency-card-row\{[^}]*display:grid;grid-template-columns:minmax\(0,1fr\)/);
+  assert.match(css,/#taskDialog \.dependency-navigation\{[^}]*flex-direction:column/);
+  assert.match(css,/#taskDialog \.dependency-trail\{[^}]*flex-direction:column;[^}]*max-height:175px;overflow-y:auto;overflow-x:hidden/);
+  assert.match(css,/#taskDialog \.dependency-trail strong\{[^}]*text-overflow:ellipsis/);
+  assert.match(css,/@media\(max-width:700px\)\{#taskDialog \.dialog-head\{padding:15px 13px 12px/);
+  assert.match(css,/#taskDialog \.dialog-head \.icon-btn\{[^}]*min-height:40px/);
+});
+
+test("R2 long IDs retain full click, tooltip, aria and four-level return path",async()=>{
+  const ctx=await cardRenderer();
+  const ids=["WTB-P0-DELIVERY-REWORK-D01-CHECKPOINT-20261106-T1",
+    "WTB-P0-DELIVERY-MERGE-CONFLICT-REWORK-20261106-T1",
+    "WTB-P0-LEGACY-D09-REBLOCK-AFTER-AUTO-UNBLOCK-20261106-T1",
+    "WTB-P1-BOARD-DEPENDENCY-LONG-ID-LAYOUT-20261106-T1",
+    "WTB-P1-ONBOARD-COMMAND-VERIFY-20261104-T1"];
+  const tasks=ids.map(id=>({id,track:"bugfix",priority:"P0",status:"待开发"}));
+  tasks[0].readDependencies=ids.slice(1,3).map(id=>id+"完成").join(";");
+  ctx.state.snapshot={tasks};
+  const card=ctx.renderCard(tasks[0]);
+  assert.equal(card.children.find(x=>x.className==="task-id").title,ids[0]);
+  const links=card.children.find(x=>x.className==="dependency-card-row").children;
+  assert.equal(links.length,3);
+  assert.equal(links[0].textContent,"前置 2 项");
+  for(let index=1;index<3;index++){
+    assert.equal(links[index].textContent,ids[index]);
+    assert.equal(links[index].title,ids[index]+" · 待开发");
+    assert.equal(links[index].attributes["aria-label"],"查看前置任务："+ids[index]);
+  }
+  links[1].listeners.click({stopPropagation(){}});
+  assert.deepEqual(ctx.navCalls,[{id:ids[1],nested:true}],"navigation uses full ID, not ellipsis text");
+  let trail=ctx.nextTrail([],ids[0],false);
+  for(const id of ids.slice(1,4))trail=ctx.nextTrail(trail,id,true);
+  ctx.state.dependencyTrail=trail;
+  ctx.renderTrail();
+  assert.deepEqual(ctx.els.dependencyTrail.children.map(x=>x.textContent),ids.slice(0,4));
+  assert.equal(ctx.els.dependencyTrail.children[2].attributes["aria-label"],"查看访问路径任务："+ids[2]);
+  ctx.els.dependencyTrail.children[1].listeners.click();
+  assert.deepEqual(ctx.navCalls.at(-1),{id:ids[1],nested:true});
+  assert.deepEqual([...ctx.nextTrail(trail,ids[4],true)],ids.slice(0,4).concat(ids[4]));
 });

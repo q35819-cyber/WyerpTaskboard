@@ -421,7 +421,7 @@ function renderDependencyTrail(){
     const isCurrent=index===trail.length-1;
     const item=isCurrent?document.createElement("strong"):document.createElement("button");
     if(!isCurrent){
-      item.type="button";item.className="dependency-trail-link";
+      item.type="button";item.className="dependency-trail-link";item.setAttribute("aria-label","查看访问路径任务："+taskId);
       item.addEventListener("click",()=>{if(state.dependencyTrail.length>index+1)void openTask(taskId,true)});
     }
     item.textContent=taskId;item.title=taskId;
@@ -449,7 +449,7 @@ function taskCard(task){
   if(task.presentation?.latestUserMessage?.replied){
     const stamp=document.createElement("div");stamp.className="reply-stamp";stamp.textContent="已回复";stamp.title="最新用户留言已有AI回复";card.append(stamp);
   }
-  const id=document.createElement("div");id.className="task-id";id.textContent=task.id;
+  const id=document.createElement("div");id.className="task-id";id.textContent=task.id;id.title=task.id;
   const h4=document.createElement("h4");h4.textContent=taskTitle(task);
   const badges=document.createElement("div");badges.className="badges";
   badges.append(badge(trackLabel(task.track),task.track==="bugfix"?"bugfix":undefined),badge(priorityLabel(task.priority),task.priority?.toLowerCase()),badge(statusLabel(task.status)));
@@ -728,7 +728,7 @@ async function openTask(taskId,nested=false){
     if(!sameProject(projectId,epoch)||request!==state.detailEpoch||data.id!==taskId)return;
     state.selectedTask=data;state.selectedTaskProjectId=projectId;
     state.dependencyTrail=nextTrail;renderDependencyTrail();
-    els.detailTaskId.textContent=data.id;els.detailTitle.textContent=taskTitle(data);
+    els.detailTaskId.textContent=data.id;els.detailTaskId.title=data.id;els.detailTitle.textContent=taskTitle(data);
     const p=data.presentation||{};
     els.taskPlanList.replaceChildren(...(p.plans||[]).map(plan=>planButton(data.id,plan)));
     if(!(p.plans||[]).length)els.taskPlanList.textContent="未绑定主计划";
