@@ -131,8 +131,17 @@ function actorOptions(identity, body) {
   if (identity.mode !== "session" && body.actorType === "user") throw new TaskboardError("用户身份只能由本机浏览器会话产生", {
     code: "USER_SESSION_REQUIRED", status: 403
   });
+  if(identity.mode !== "session" && body.actorType === "system")
+    throw new TaskboardError("系统身份只允许受控服务内部使用",{
+      code:"SYSTEM_ACTOR_FORBIDDEN",status:403
+    });
+  if(identity.mode!=="session" && body.actorType
+    && !["controller_ai","developer_ai","test_ai"].includes(body.actorType))
+    throw new TaskboardError("受信接口只允许正式三角色身份",{
+      code:"AI_ACTOR_TYPE_INVALID",status:403
+    });
   return {
-    actorType: identity.mode === "session" ? "user" : (body.actorType || "system"),
+    actorType: identity.mode === "session" ? "user" : (body.actorType || "developer_ai"),
     actorId: identity.mode === "session" ? identity.actorId : (body.actorId || identity.actorId),
     sessionWindowName: identity.mode === "session" ? "" : (body.sessionWindowName || ""),
     sessionId: identity.mode === "session" ? "" : (body.sessionId || ""),
@@ -1061,6 +1070,31 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         return send(res, 200, await taskStore.readTaskDocument(params.projectId, params.taskId, params.documentIndex));
       }
 
+
+      params=routeMatch(url.pathname,"/api/projects/:projectId/tasks/:taskId/rules");
+      if(req.method==="GET"&&params){
+        requireTrustedApiIdentity(identity);
+        return send(res,200,await taskStore.ruleCheckList(params.projectId,params.taskId,
+          url.searchParams.get("actorType")||"developer_ai"));
+      }
+      params=routeMatch(url.pathname,"/api/projects/:projectId/tasks/:taskId/rules/:documentIndex/:chunkIndex");
+      if(req.method==="GET"&&params){
+        requireTrustedApiIdentity(identity);
+        const actor={actorType:url.searchParams.get("actorType")||"developer_ai",
+          actorId:url.searchParams.get("actorId")||"",
+          sessionId:url.searchParams.get("sessionId")||""};
+        return send(res,200,await taskStore.ruleReadChunk(params.projectId,params.taskId,
+          actor,params.documentIndex,params.chunkIndex));
+      }
+      params=routeMatch(url.pathname,"/api/projects/:projectId/tasks/:taskId/rules/verify");
+      if(req.method==="POST"&&params){
+        requireTrustedApiIdentity(identity);
+        const body=await readJson(req);
+        const actor={actorType:body.actorType||"developer_ai",
+          actorId:String(body.actorId||""),sessionId:String(body.sessionId||"")};
+        return send(res,200,await taskStore.ruleVerify(params.projectId,params.taskId,actor,body.answers));
+      }
+
       params = routeMatch(url.pathname, "/api/projects/:projectId/tasks/:taskId/history");
       if (req.method === "GET" && params) {
         const limit = Math.min(500, Math.max(1, Number(url.searchParams.get("limit") || 200)));
@@ -1080,6 +1114,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           taskId: params.taskId, status: pair.task.status,
           registryRevision: pair.snapshot.registryRevision,
           preclaimReport,
+          ruleRead:await taskStore.ruleStatus(params.projectId,params.taskId,actorContext),
           ...(await taskStore.stopState(params.projectId, params.taskId)),
           takeover: await taskStore.takeoverState(params.projectId, params.taskId),
 
@@ -1607,6 +1642,8 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
             details: preclaimReport
           });
         }
+        const rules=await taskStore.ruleStatus(params.projectId,params.taskId,{actorType,actorId,sessionId:body.sessionId});
+        if(!rules.valid)throw new TaskboardError("本Session未完整读取和验证当前权威规则",{code:"RULE_READ_REQUIRED",status:409,details:rules});
         const result = await taskStore.updateTask(params.projectId, params.taskId, {
           status: target,
           assignee: body.assignee,

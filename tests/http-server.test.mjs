@@ -2334,3 +2334,117 @@ test("project removal is browser-only, blocks active work/resources, and never d
   const projects = await (await fetch(base + "/api/projects", { headers: { Cookie: cookie } })).json();
   assert.equal(projects.projects.some((item) => item.id === "safe-remove"), false);
 });
+
+
+async function prepareRuleDocuments(projectRoot) {
+  const files=[
+    "流程文档/00_流程与重大更新日志.md",
+    "流程文档/00_统一入口.md",
+    "流程文档/开发/00_角色入口.md",
+    "流程文档/独测/00_角色入口.md",
+    "流程文档/总控/00_角色入口.md",
+    "流程文档/07_全软件BUG强制修复与闭环续接规范.md",
+    "流程文档/02_增删改操作日志规范.md",
+    "流程文档/04_逐步聊天汇报与证据校验规范.md",
+    "流程文档/05_BUG修复三问与关联任务验收规范.md",
+    "流程文档/06_全任务依赖审计与阻断优先调度规范.md",
+    "流程文档/开发/D01_CLAIM_正式领取任务.md",
+    ".agents/skills/ponytail/SKILL.md",
+    "data/taskboard/checkpoints/00_跨角色共享待办_总控维护.md"
+  ];
+  for(const name of files){
+    const filename=path.join(projectRoot,name);
+    await fs.mkdir(path.dirname(filename),{recursive:true});
+    await fs.writeFile(filename,"# 必读规则 "+name+"\n"+"重要规则内容\n".repeat(350),"utf8");
+  }
+  return files;
+}
+const RULE_ANSWERS_HTTP={
+  parallel_different_tasks:"allow_isolated",parallel_same_task:"deny_duplicate",
+  stale_takeover:"revoke_old_session",incomplete_dependency_or_stop:"deny_claim",
+  independent_qa:"unique_qa_only",final_merge:"controller_after_qa_pass",
+  green_completed_dependency:"skip_green_check_workflow",
+  missing_or_cyclic_dependency:"deny_unresolved",role_duty:"develop_only_own_task"
+};
+
+test("server checks full rule chunks and scenarios before claim, rejecting forged events, other session and stale docs",async(t)=>{
+  const {fixture,base,secret}=await startFixture(t);
+  const rules=await prepareRuleDocuments(fixture.projectRoot);
+  const task="A-10",actorId="dev-rule",sessionId="wc_sess_rules";
+  const route=base+"/api/projects/fixture/tasks/"+task;
+  const headers={Authorization:"Bearer "+secret,"Content-Type":"application/json"};
+  const request=(suffix,body)=>fetch(route+suffix,{method:"POST",headers,body:JSON.stringify(body)});
+  await recordPreclaim(base,secret,task,{actorId,sessionId});
+  const before=await (await fetch(route,{headers})).json();
+  const claim={operationId:"rule.claim.negative.0001",expectedRevision:before.registryRevision,
+    assignee:"dev-rule",sessionWindowName:"dev-rule",sessionId,actorType:"developer_ai",actorId};
+  const denied=await request("/claim",claim);
+  assert.equal(denied.status,409);
+  assert.equal((await denied.json()).error.code,"RULE_READ_REQUIRED");
+  assert.equal((await (await fetch(route,{headers})).json()).status,"待开发");
+  const list=await (await fetch(route+"/rules?actorType=developer_ai",{headers})).json();
+  assert.ok(list.documents.length>=rules.length-2);
+  const verify=(answers,who=sessionId)=>request("/rules/verify",{actorType:"developer_ai",actorId,sessionId:who,answers});
+  const early=await verify(RULE_ANSWERS_HTTP);
+  assert.equal(early.status,409);
+  assert.equal((await early.json()).error.code,"RULE_READ_INCOMPLETE");
+  for(const d of list.documents){
+    for(let index=0;index<d.chunks;index++){
+      const params=new URLSearchParams({actorType:"developer_ai",actorId,sessionId});
+      const chunk=await fetch(route+"/rules/"+d.index+"/"+index+"?"+params,{headers});
+      assert.equal(chunk.status,200,d.path);
+      const body=await chunk.json();
+      assert.equal(body.path,d.path);
+      assert.equal(body.index,index);
+      assert.ok(body.content);
+    }
+  }
+  const wrong=await verify({...RULE_ANSWERS_HTTP,parallel_same_task:"allow"});
+  assert.equal(wrong.status,409);
+  assert.equal((await wrong.json()).error.code,"RULE_READ_SCENARIO_FAILED");
+  const other=await verify(RULE_ANSWERS_HTTP,"wc_sess_unauthorized");
+  assert.equal(other.status,409);
+  const passed=await verify(RULE_ANSWERS_HTTP);
+  assert.equal(passed.status,200);
+  assert.equal((await passed.json()).valid,true);
+  const forged=await request("/events",{operationId:"rule.forged.0001",
+    eventType:"rule_read_verified",actorType:"developer_ai",actorId,sessionId,
+    metadata:{fingerprint:list.fingerprint}});
+  assert.equal(forged.status,409);
+  assert.equal((await forged.json()).error.code,"RULE_READ_SERVER_ROUTE_REQUIRED");
+  const systemSpoof=await request("/events",{
+    operationId:"rule.spoof.system.0001",eventType:"controller_dispatch",
+    actorType:"system",actorId:"task-scan",sessionId:"fake-session"
+  });
+  assert.equal(systemSpoof.status,403);
+  assert.equal((await systemSpoof.json()).error.code,"SYSTEM_ACTOR_FORBIDDEN");
+  const unknownSpoof=await request("/events",{
+    operationId:"rule.spoof.unknown.0001",eventType:"controller_dispatch",
+    actorType:"unrecognized_ai",actorId:"fake",sessionId:"fake-session"
+  });
+  assert.equal(unknownSpoof.status,403);
+  assert.equal((await unknownSpoof.json()).error.code,"AI_ACTOR_TYPE_INVALID");
+  const different=await(await fetch(route+"/guard?actorType=developer_ai&actorId="+actorId
+    +"&sessionId=wc_sess_unauthorized",{headers})).json();
+  assert.equal(different.ruleRead.valid,false);
+  const goodGuard=await(await fetch(route+"/guard?actorType=developer_ai&actorId="+actorId
+    +"&sessionId="+sessionId,{headers})).json();
+  assert.equal(goodGuard.ruleRead.valid,true);
+  const doc=path.join(fixture.projectRoot,"流程文档/00_统一入口.md");
+  await fs.appendFile(doc,"\n# 规则已修改\n");
+  const stale=await(await fetch(route+"/guard?actorType=developer_ai&actorId="+actorId
+    +"&sessionId="+sessionId,{headers})).json();
+  assert.equal(stale.ruleRead.valid,false);
+  const staleClaim=await request("/claim",{...claim,operationId:"rule.claim.stale.0001"});
+  assert.equal(staleClaim.status,409);
+  assert.equal((await staleClaim.json()).error.code,"RULE_READ_REQUIRED");
+  const refreshed=await(await fetch(route+"/rules?actorType=developer_ai",{headers})).json();
+  for(const d of refreshed.documents)for(let index=0;index<d.chunks;index++){
+    const params=new URLSearchParams({actorType:"developer_ai",actorId,sessionId});
+    assert.equal((await fetch(route+"/rules/"+d.index+"/"+index+"?"+params,{headers})).status,200);
+  }
+  assert.equal((await verify(RULE_ANSWERS_HTTP)).status,200);
+  const accepted=await request("/claim",{...claim,operationId:"rule.claim.positive.0001"});
+  assert.equal(accepted.status,200);
+  assert.equal((await accepted.json()).after.status,"开发中");
+});
