@@ -2,9 +2,69 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { createServer } from "node:http";
 import { createTaskboardServer } from "../server/http-server.mjs";
 import { makeFixture, registryText } from "./helpers.mjs";
 
+
+async function listenOnFetchSafePort(server, probe = fetch) {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    await new Promise((resolve, reject) => {
+      const fail = (error) => { server.off("error", fail); reject(error); };
+      server.once("error", fail);
+      server.listen(0, "127.0.0.1", () => { server.off("error", fail); resolve(); });
+    });
+    const base = "http://127.0.0.1:" + server.address().port;
+    try {
+      await probe(base + "/api/auth/session");
+      return base;
+    } catch (error) {
+      await new Promise((resolve) => server.close(resolve));
+      if (error?.cause?.message !== "bad port" || attempt === 9) throw error;
+    }
+  }
+  throw new Error("No safe HTTP test port available");
+}
+
+test("delivery takeover fixture retries only forbidden fetch ports and closes rejected listeners", async (t) => {
+  const makeServer = () => createServer((_req, res) => { res.writeHead(200); res.end("ok"); });
+  const server = makeServer();
+  t.after(async () => { if (server.listening) await new Promise(resolve => server.close(resolve)); });
+  let probes = 0;
+  const base = await listenOnFetchSafePort(server, async (url) => {
+    if (++probes <= 2) throw new TypeError("fetch failed", { cause: new Error("bad port") });
+    return fetch(url);
+  });
+  assert.equal(probes, 3, "two forbidden ports must be released before success");
+  assert.equal((await fetch(base)).status, 200);
+
+  const timeoutFailure = makeServer();
+  let timeoutCalls = 0;
+  await assert.rejects(listenOnFetchSafePort(timeoutFailure, async () => {
+    timeoutCalls++;
+    throw new TypeError("fetch failed", { cause: new Error("timed out") });
+  }), (error) => error.cause?.message === "timed out");
+  assert.equal(timeoutCalls, 1);
+  assert.equal(timeoutFailure.listening, false);
+
+  const networkFailure = makeServer();
+  let nonRetryCalls = 0;
+  await assert.rejects(listenOnFetchSafePort(networkFailure, async () => {
+    nonRetryCalls++;
+    throw new TypeError("fetch failed", { cause: new Error("ECONNREFUSED") });
+  }), (error) => error.cause?.message === "ECONNREFUSED");
+  assert.equal(nonRetryCalls, 1);
+  assert.equal(networkFailure.listening, false);
+
+  const exhausted = makeServer();
+  let exhaustedCalls = 0;
+  await assert.rejects(listenOnFetchSafePort(exhausted, async () => {
+    exhaustedCalls++;
+    throw new TypeError("fetch failed", { cause: new Error("bad port") });
+  }), (error) => error.cause?.message === "bad port");
+  assert.equal(exhaustedCalls, 10);
+  assert.equal(exhausted.listening, false);
+});
 
 async function createMergedGitFixture(fixture) {
   const { execFile } = await import("node:child_process");
@@ -44,15 +104,11 @@ async function setup(t, { pass = true, missingReport = false, mergedGit = true, 
       "2026-10-31T00:00:00Z", "QA PASS等候合并", "测试计划.md", "cp/D-PENDING.md"]
   ]));
   const app = await createTaskboardServer({ rootDir: fixture.boardRoot, host: "127.0.0.1", port: 0 });
-  await new Promise((ok, fail) => {
-    app.server.once("error", fail);
-    app.server.listen(0, "127.0.0.1", ok);
-  });
   t.after(async () => {
-    await new Promise((ok) => app.server.close(ok));
+    if (app.server.listening) await new Promise((ok) => app.server.close(ok));
     await fs.rm(fixture.boardRoot, { recursive: true, force: true });
   });
-  const base = "http://127.0.0.1:" + app.server.address().port;
+  const base = await listenOnFetchSafePort(app.server);
   const config = JSON.parse(await fs.readFile(path.join(fixture.boardRoot, "config/admin-secret.json"), "utf8"));
   const bearer = { Authorization: "Bearer " + config.adminSecret, "Content-Type": "application/json" };
   const browser = { Origin: base, "Content-Type": "application/json" };
