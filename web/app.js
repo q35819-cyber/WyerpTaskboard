@@ -167,12 +167,13 @@ function developerCandidateFor(task){
   return (state.scanStatus?.developerCandidates||[]).find(item=>item.projectId===state.projectId&&item.taskId===task.id)||null;
 }
 function isReadyTask(task){
-  if(!["待执行","待开发"].includes(task.status)||task.plannedRole!=="开发AI"||task.assignee||task.sessionId)return false;
+  if(!["待执行","待开发","测试失败待修复"].includes(task.status)||task.plannedRole!=="开发AI"||task.assignee||task.sessionId)return false;
   const candidate=developerCandidateFor(task),scannedAt=Date.parse(state.scanStatus?.scan?.last_scan_at||"");
   const age=Date.now()-scannedAt;
   return candidate?.status===task.status&&candidate.eligible===true&&!candidate.blockers?.length
     &&(!candidate.taskUpdatedAt||candidate.taskUpdatedAt===task.updatedAt)
     &&(!candidate.expiresAt||Date.parse(candidate.expiresAt)>Date.now())
+    &&(task.status!=="测试失败待修复"||(Boolean(task.updatedAt)&&candidate.taskUpdatedAt===task.updatedAt&&Boolean(candidate.expiresAt)))
     &&Number.isFinite(age)&&age>=0&&age<30*60*1000;
 }
 function qaCandidateFor(task){
@@ -195,6 +196,7 @@ function boardTasksForColumn(column){
     return [...new Map([...ready,...qa].map(task=>[task.id,task])).values()];
   }
   const tasks=tasksForColumn(state.filtered,column.statuses);
+  if(column.id==="blocked")return tasks.filter(task=>!isReadyTask(task));
   return column.id==="todo"?state.filtered.filter(task=>
     (column.statuses.includes(task.status)||task.status==="待执行"||["待独测","待复测"].includes(task.status))
     &&!isReadyTask(task)&&!isReadyTestTask(task)):tasks;
@@ -363,7 +365,7 @@ function renderSummary(){
     ["待用户",tasks.filter(t=>t.status==="待用户验收").length],
     ["有用户留言",tasks.filter(t=>t.presentation?.latestUserMessage).length],
     ["待拆需求",state.requirements.filter(r=>r.status==="待AI拆解").length],
-    ["阻断/暂停",tasks.filter(t=>["阻断","HOLD","测试失败待修复"].includes(t.status)).length]
+    ["阻断/暂停",tasks.filter(t=>["阻断","HOLD","测试失败待修复"].includes(t.status)&&!isReadyTask(t)).length]
   ];
   els.summary.replaceChildren(...defs.map(([label,value])=>{
     const div=document.createElement("div");div.className="summary-card";if(label==="有用户留言"&&value)div.classList.add("message-summary");
@@ -563,7 +565,7 @@ function renderBoard(){
     const columnCount=document.createElement("span");columnCount.className="count";columnCount.textContent=tasks.length+"项";
     if(column.id==="qa_pending"){
       const developers=tasks.filter(isReadyTask).length;
-      const bugs=tasks.filter(task=>task.track==="bugfix").length;
+      const bugs=tasks.filter(task=>task.track==="bugfix"&&isReadyTask(task)).length;
       columnCount.textContent="开发 "+developers+" 项 · 测试 "+(tasks.length-developers)+" 项 · BUG "+bugs+" 项";
       columnCount.classList.add("shared-ready-count");columnTitle.classList.add("shared-ready-title");
     }
