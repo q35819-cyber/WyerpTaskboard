@@ -754,11 +754,11 @@ function activeUserAction(events, task) {
   return fallback[task.status] || "当前无需你操作；如后续需要账号、权限、业务决策或页面验收，执行AI必须在这里明确写出具体事项。";
 }
 function taskVisualState(task, events, statuses) {
-  let claimed = false, owner = null, issue = null, suspected = false;
+  let owner = null, issue = null, suspected = false;
   for (const e of events) {
     if (["claim", "takeover"].includes(e.event_type) && e.actor_type === "developer_ai"
       && e.actor_id && e.session_id && ["开发中", "修复中"].includes(e.new_status)) {
-      claimed = true; owner = { actor: e.actor_id, session: e.session_id }; issue = null;
+      owner = { actor: e.actor_id, session: e.session_id }; issue = null;
     } else if (e.event_type === "developer_issue_reported" && owner
       && e.actor_type === "developer_ai" && e.actor_id === owner.actor
       && e.session_id === owner.session && e.metadata?.paused === true
@@ -795,12 +795,15 @@ function taskVisualState(task, events, statuses) {
     if (Array.isArray(last?.metadata?.rootCauseTaskIds)) last.metadata.rootCauseTaskIds.forEach(add);
   }
   const paused = Boolean(issue && ["开发中", "修复中", "阻断"].includes(task.status));
+  const running = ["开发中", "修复中", "独测中", "复测中", "交付中"].includes(task.status)
+    && Boolean(task.assignee && task.sessionId)
+    && (!["开发中", "修复中"].includes(task.status) || owner?.session === task.sessionId);
   return {
     cardStage: task.status === "已取消" ? "cancelled" : task.status === "已完成" ? "completed"
-      : paused ? "paused_by_issue" : claimed ? "running" : "not_started",
+      : paused ? "paused_by_issue" : running ? "running" : "not_started",
     developmentIssue: paused ? {eventId: issue.eventId, timestamp: issue.timestamp,
       failureCode: issue.failureCode, nextAction: issue.nextAction} : null,
-    suspectedDisconnect: suspected && claimed && !paused && task.status !== "已完成",
+    suspectedDisconnect: suspected && running && !paused,
     relatedTasks: ids.map(id => ({id, status: statuses.get(id) || null}))
   };
 }

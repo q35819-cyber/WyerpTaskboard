@@ -59,6 +59,23 @@ test("task presentation derives exclusive color from real claim, current issue a
   const standalone=await store.presentation("fixture",source);
   assert.equal(standalone.cardStage,"running");
 });
+test("historical developer claim never marks released task running", async () => {
+  const source=(await fs.readFile(new URL("../server/task-store.mjs", import.meta.url),"utf8")).replace(/\r\n/g,"\n");
+  const implementation=source.match(/function taskVisualState\(task, events, statuses\) \{[\s\S]*?\n\}/)?.[0];
+  assert.ok(implementation,"actual visual projection exists");
+  const visual=new Function("cleanHumanText",implementation+";return taskVisualState;")(x=>String(x));
+  const claim={event_type:"claim",actor_type:"developer_ai",actor_id:"dev",session_id:"sess",new_status:"开发中"};
+  const row=(status,assignee="",sessionId="")=>({id:"WTB-VISUAL-20261108-T1",status,assignee,sessionId});
+  for(const status of ["开发中","修复中","独测中","复测中","交付中"])
+    assert.equal(visual(row(status,"owner","sess"),[claim],new Map()).cardStage,"running",status);
+  const history=[claim,{event_type:"handoff",old_status:"开发中",new_status:"待独测"}];
+  for(const status of ["待独测","待复测","待交付","阻断","HOLD"])
+    assert.equal(visual(row(status),history,new Map()).cardStage,"not_started",status);
+  assert.equal(visual(row("开发中"),[claim],new Map()).cardStage,"not_started","past claim is not current ownership");
+  assert.equal(visual(row("已完成"),history,new Map()).cardStage,"completed");
+  assert.equal(visual(row("已取消"),history,new Map()).cardStage,"cancelled");
+});
+
 test("snapshot sorts product/P0 before infrastructure/P0", async (t) => {
   const f = await makeFixture(); t.after(() => fs.rm(f.boardRoot, { recursive: true, force: true }));
   const store = await new TaskStore(f.boardRoot).init();
