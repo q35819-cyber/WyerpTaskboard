@@ -26,6 +26,10 @@ function injectedCrash(phase) {
   });
 }
 
+const RULE_INTERNAL=Symbol("RULE_INTERNAL");
+const RULE_ANSWERS={parallel_different_tasks:"allow_isolated",parallel_same_task:"deny_duplicate",
+stale_takeover:"revoke_old_session",incomplete_dependency_or_stop:"deny_claim",
+independent_qa:"unique_qa_only",final_merge:"controller_after_qa_pass"};
 const USER_MESSAGE_TYPES = new Set(["user_review"]);
 const USER_DECISION_TYPES = new Set(["user_accept", "user_reject"]);
 function cleanHumanText(value = "") {
@@ -991,6 +995,7 @@ export class TaskStore {
     metadata = null,
   } = {}) {
     assertOperationId(operationId);
+    if(String(eventType).startsWith("rule_read_"))throw new TaskboardError("规则票据只能通过服务端签发",{code:"RULE_READ_SERVER_ROUTE_REQUIRED",status:409});
     const userWrite = actorType === "user";
     if (!expectedRevision && !userWrite) throw new TaskboardError("写操作必须提供expectedRevision", {
       code: "EXPECTED_REVISION_REQUIRED", status: 428,
@@ -1331,9 +1336,11 @@ export class TaskStore {
     sessionId = "",
     note = "",
     metadata = null,
-    expectedRevision = undefined
+    expectedRevision = undefined,
+    internalRuleMark = null
   } = {}) {
     assertOperationId(operationId);
+    if(String(eventType).startsWith("rule_read_")&&internalRuleMark!==RULE_INTERNAL)throw new TaskboardError("禁止伪造规则已读记录",{code:"RULE_READ_SERVER_ROUTE_REQUIRED",status:409});
     const append = async () => {
       const existing = await this.events.findByOperationId(projectId, operationId);
       if (existing) return { event: existing, idempotentReplay: true };
@@ -1562,6 +1569,92 @@ export class TaskStore {
     };
   }
 
+
+  async ruleManifest(projectId,taskId,actorType){
+    const role={developer_ai:"开发",test_ai:"独测",controller_ai:"总控"}[actorType];
+    if(!role)throw new TaskboardError("无效角色",{code:"RULE_READ_ROLE_INVALID",status:400});
+    const {task}=await this.getTask(projectId,taskId);
+    const ctx=await this.projects.context(projectId);
+    const files=["流程文档/00_流程与重大更新日志.md","流程文档/00_统一入口.md",
+      "流程文档/"+role+"/00_角色入口.md",
+      "流程文档/07_全软件BUG强制修复与闭环续接规范.md",
+      ".agents/skills/ponytail/SKILL.md",
+      "data/taskboard/checkpoints/00_跨角色共享待办_总控维护.md",
+      ...String(task.plan||"").split(";").filter(Boolean)];
+    const cp="data/taskboard/checkpoints/"+taskId+".md";
+    if(await fs.stat(path.join(ctx.rootRealPath,cp)).catch(error=>{if(error.code==="ENOENT")return undefined;throw error;}))files.push(cp);
+    const documents=[];
+    for(const relative of new Set(files)){
+      let content;
+      try{
+        const f=await resolveProjectPath(ctx.rootRealPath,relative,{mustExist:true,rejectReparse:true});
+        const st=await fs.stat(f);
+        if(!st.isFile()||st.size>1048576)throw Error("oversize");
+        content=await fs.readFile(f,"utf8");
+      }catch{throw new TaskboardError("必读文档无法安全读取: "+relative,
+        {code:"RULE_READ_DOCUMENT_INVALID",status:409,details:{path:relative}});}
+      documents.push({path:relative,content,sha:crypto.createHash("sha256").update(content).digest("hex"),
+        chunks:Math.max(1,Math.ceil(content.length/4096))});
+    }
+    const fingerprint=crypto.createHash("sha256").update(JSON.stringify([projectId,taskId,actorType,
+      task.updatedAt,documents.map(d=>[d.path,d.sha,d.chunks])])).digest("hex");
+    return {fingerprint,documents};
+  }
+  async ruleGateEnabled(projectId){
+    const ctx=await this.projects.context(projectId);
+    return Boolean((await fs.stat(path.join(ctx.rootRealPath,"流程文档")).catch(error=>{if(error.code==="ENOENT")return undefined;throw error;}))?.isDirectory());
+  }
+  async ruleCheckList(projectId,taskId,role){
+    const m=await this.ruleManifest(projectId,taskId,role);
+    return {fingerprint:m.fingerprint,documents:m.documents.map((d,i)=>({index:i,path:d.path,sha:d.sha,chunks:d.chunks})),
+      scenarios:Object.keys(RULE_ANSWERS)};
+  }
+  async ruleReadChunk(projectId,taskId,actor,docIndex,chunkIndex){
+    if(!actor.actorId||!actor.sessionId)throw new TaskboardError("Session缺失",
+      {code:"RULE_READ_IDENTITY_REQUIRED",status:400});
+    const m=await this.ruleManifest(projectId,taskId,actor.actorType);
+    const d=m.documents[Number(docIndex)],i=Number(chunkIndex);
+    if(!d||!Number.isInteger(i)||i<0||i>=d.chunks)throw new TaskboardError("无效文档分块",
+      {code:"RULE_READ_CHUNK_INVALID",status:404});
+    const e=await this.appendTaskEvent(projectId,taskId,{
+      operationId:"rule_read.chunk."+crypto.randomUUID(),eventType:"rule_read_chunk_served",
+      actorType:actor.actorType,actorId:actor.actorId,sessionId:actor.sessionId,
+      internalRuleMark:RULE_INTERNAL,
+      metadata:{fingerprint:m.fingerprint,path:d.path,sha:d.sha,index:i}
+    });
+    return {path:d.path,sha:d.sha,index:i,total:d.chunks,
+      content:d.content.slice(i*4096,(i+1)*4096),eventId:e.event.event_id};
+  }
+  async ruleVerify(projectId,taskId,actor,answers){
+    const m=await this.ruleManifest(projectId,taskId,actor.actorType);
+    const events=await this.events.listTaskEvents(projectId,taskId,{all:true});
+    for(const d of m.documents)for(let i=0;i<d.chunks;i++){
+      if(!events.some(e=>e.event_type==="rule_read_chunk_served"
+        &&e.actor_type===actor.actorType&&e.actor_id===actor.actorId&&e.session_id===actor.sessionId
+        &&e.metadata?.fingerprint===m.fingerprint&&e.metadata?.path===d.path
+        &&e.metadata?.sha===d.sha&&e.metadata?.index===i))
+        throw new TaskboardError("规则没有完整读取："+d.path,{code:"RULE_READ_INCOMPLETE",status:409});
+    }
+    if(!answers||Object.keys(RULE_ANSWERS).some(k=>answers[k]!==RULE_ANSWERS[k]))
+      throw new TaskboardError("规则场景错误",{code:"RULE_READ_SCENARIO_FAILED",status:409});
+    const e=await this.appendTaskEvent(projectId,taskId,{
+      operationId:"rule_read.verified."+crypto.randomUUID(),eventType:"rule_read_verified",
+      actorType:actor.actorType,actorId:actor.actorId,sessionId:actor.sessionId,
+      internalRuleMark:RULE_INTERNAL,metadata:{fingerprint:m.fingerprint}
+    });
+    return {valid:true,fingerprint:m.fingerprint,eventId:e.event.event_id};
+  }
+  async ruleStatus(projectId,taskId,actor){
+    if(!actor.actorId||!actor.sessionId)return {valid:false,reason:"identity_missing"};
+    if(!(await this.ruleGateEnabled(projectId)))return {valid:true,disabled:true};
+    const m=await this.ruleManifest(projectId,taskId,actor.actorType);
+    const events=await this.events.listTaskEvents(projectId,taskId,{all:true});
+    const e=events.findLast(e=>e.event_type==="rule_read_verified"
+      &&e.actor_type===actor.actorType&&e.actor_id===actor.actorId&&e.session_id===actor.sessionId);
+    return {valid:e?.metadata?.fingerprint===m.fingerprint,
+      reason:e?.metadata?.fingerprint===m.fingerprint?null:"missing_or_stale",
+      fingerprint:m.fingerprint};
+  }
   async presentation(projectId, taskId) {
     const { task } = await this.getTask(projectId, taskId);
     return task.presentation;

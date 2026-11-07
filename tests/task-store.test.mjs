@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import path from "node:path";
 import { TaskStore } from "../server/task-store.mjs";
 import { TaskStepCheckpoint } from "../server/task-step-checkpoint.mjs";
 import { makeFixture, registryText } from "./helpers.mjs";
@@ -554,4 +555,54 @@ test("modern QA and controller evidence rejects skipped steps and accepts valid 
     (error) => error.code === "CHECKPOINT_STAGE_REQUIRED");
   await save("controller_ai", "C06_CLEANUP", "C07_COMPLETE");
   await cp.assertTransitionEvidence("fixture", "A-10", controller);
+});
+
+
+test("TaskStore rule-read receipts are session-bound, cannot be forged, and expire with document edits", async(t)=>{
+  const f=await makeFixture();
+  t.after(()=>fs.rm(f.boardRoot,{recursive:true,force:true}));
+  const root=f.projectRoot;
+  const paths=["流程文档/00_流程与重大更新日志.md","流程文档/00_统一入口.md",
+    "流程文档/开发/00_角色入口.md","流程文档/独测/00_角色入口.md",
+    "流程文档/总控/00_角色入口.md","流程文档/07_全软件BUG强制修复与闭环续接规范.md",
+    ".agents/skills/ponytail/SKILL.md",
+    "data/taskboard/checkpoints/00_跨角色共享待办_总控维护.md"];
+  const filepath=(relative)=>path.join(root,relative);
+  for(const p of paths){
+    const fpath=filepath(p);
+    await fs.mkdir(path.dirname(fpath),{recursive:true});
+    await fs.writeFile(fpath,"# authoritative "+p+"\n"+"full line\n".repeat(400));
+  }
+  const store=await new TaskStore(f.boardRoot).init();
+  const actor={actorType:"developer_ai",actorId:"dev-unit",sessionId:"wc_sess_unit"};
+  assert.equal((await store.ruleStatus("fixture","A-10",actor)).valid,false);
+  const list=await store.ruleCheckList("fixture","A-10",actor.actorType);
+  assert.ok(list.documents.length>=7);
+  await assert.rejects(store.ruleVerify("fixture","A-10",actor,{}),
+    error=>error.code==="RULE_READ_INCOMPLETE");
+  await assert.rejects(store.appendTaskEvent("fixture","A-10",{
+    operationId:"rule.forged.event.0001",eventType:"rule_read_verified",
+    actorType:"developer_ai",actorId:actor.actorId,sessionId:actor.sessionId,
+    metadata:{fingerprint:list.fingerprint}
+  }),e=>e.code==="RULE_READ_SERVER_ROUTE_REQUIRED");
+  await assert.rejects(store.updateTask("fixture","A-10",{status:"开发中"},{
+    operationId:"rule.forged.update.0001",
+    expectedRevision:(await store.snapshot("fixture")).registryRevision,
+    eventType:"rule_read_verified",actorType:"developer_ai",actorId:actor.actorId
+  }),e=>e.code==="RULE_READ_SERVER_ROUTE_REQUIRED");
+  for(const d of list.documents)for(let i=0;i<d.chunks;i++){
+    const chunk=await store.ruleReadChunk("fixture","A-10",actor,d.index,i);
+    assert.equal(chunk.index,i);
+  }
+  const answers={parallel_different_tasks:"allow_isolated",parallel_same_task:"deny_duplicate",
+    stale_takeover:"revoke_old_session",incomplete_dependency_or_stop:"deny_claim",
+    independent_qa:"unique_qa_only",final_merge:"controller_after_qa_pass"};
+  await assert.rejects(store.ruleVerify("fixture","A-10",actor,
+    {...answers,final_merge:"developer_anytime"}),e=>e.code==="RULE_READ_SCENARIO_FAILED");
+  assert.equal((await store.ruleVerify("fixture","A-10",actor,answers)).valid,true);
+  assert.equal((await store.ruleStatus("fixture","A-10",actor)).valid,true);
+  assert.equal((await store.ruleStatus("fixture","A-10",
+    {...actor,sessionId:"wc_sess_else"})).valid,false);
+  await fs.appendFile(filepath("流程文档/00_统一入口.md"),"\n# changed\n");
+  assert.equal((await store.ruleStatus("fixture","A-10",actor)).valid,false);
 });
