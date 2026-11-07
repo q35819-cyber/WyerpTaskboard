@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import crypto from "node:crypto";
 import { TaskStore } from "../server/task-store.mjs";
 import { CandidateEvaluator } from "../server/candidate-evaluator.mjs";
 import { makeFixture, registryText } from "./helpers.mjs";
@@ -641,4 +642,134 @@ test("developer block recovery rejects missing QA, delivery, dispatch, STOP and 
     assert.equal((await store.taskHistory("fixture", "A-10", { all: true }))
       .filter((event) => event.event_type === "auto_unblock").length, 0);
   }
+});
+
+async function blockedD08Pending(t, { frozenMismatch = false, remoteMissing = false,
+  candidateUnverified = false, wrongActor = false, fakeQa = false } = {}) {
+  const f = await setup(t, [
+    row("A-10", fakeQa ? "测试失败待修复" : "独测中", {
+      owner: fakeQa ? "—" : "qa", session: fakeQa ? "—" : "qa-session",
+      dependencies: "B-10完成" }),
+    row("B-10", "已完成")
+  ]);
+  const git = (...args) => execFileSync("git", ["-C", f.projectRoot, ...args],
+    { encoding: "utf8", windowsHide: true }).trim();
+  git("init", "-b", "main");
+  git("add", "tasks.md");
+  git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+    "commit", "-m", "D08 fixture base");
+  const remoteDir = path.join(f.boardRoot, "remote.git");
+  execFileSync("git", ["init", "--bare", remoteDir], { windowsHide: true });
+  git("remote", "add", "origin", remoteDir);
+  git("checkout", "-b", "fix/board-d08-pending-test");
+  await fs.writeFile(path.join(f.projectRoot, "candidate.txt"), "new developer repair\n", "utf8");
+  await fs.mkdir(path.join(f.projectRoot, "reports"), { recursive: true });
+  const reportText = "verified frozen R1/R2/R3 developer report\n";
+  await fs.writeFile(path.join(f.projectRoot, "reports/d08.md"), reportText, "utf8");
+  git("add", "candidate.txt", "reports/d08.md");
+  git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+    "commit", "-m", "fresh QA repair");
+  const sha = git("rev-parse", "HEAD");
+  if (!remoteMissing) git("push", "origin", "HEAD:refs/heads/fix/board-d08-pending-test");
+  let qa = null;
+  if (!fakeQa) {
+    const { snapshot } = await f.store.getTask("fixture", "A-10");
+    qa = await f.store.updateTask("fixture", "A-10", {
+      status: "测试失败待修复", plannedRole: "开发AI",
+      assignee: "", sessionWindowName: "", sessionId: ""
+    }, {
+      expectedRevision: snapshot.registryRevision,
+      operationId: "d08.qa.fail." + (++sequence), eventType: "test_result",
+      actorType: "test_ai", actorId: "qa", sessionId: "qa-session",
+      metadata: { atomicLifecycle: true, testResult: "fail",
+        reportPath: "reports/qa-fail.md", testedFromStatus: "独测中",
+        handoffTarget: "测试失败待修复" }
+    });
+  }
+  await change(f.store, "A-10", {
+    status: "修复中", assignee: "developer", sessionWindowName: "developer",
+    sessionId: "dev-session"
+  }, "claim", {}, "developer_ai", "dev-session");
+  const published = await f.store.appendTaskEvent("fixture", "A-10", {
+    operationId: "d08.candidate." + (++sequence), eventType: "code_published",
+    actorType: "developer_ai", actorId: wrongActor ? "another-developer" : "fixture-actor",
+    sessionId: "dev-session",
+    metadata: {
+      commitSha: sha, headBranch: "fix/board-d08-pending-test",
+      reportPath: "reports/d08.md", reportSha256: crypto.createHash("sha256").update(reportText).digest("hex"),
+      remoteVerified: !candidateUnverified, previousQaFail: qa?.eventId,
+      developerSelfTests: { R1: { passes: 1, failures: 0 },
+        R2: { uiPasses: 1, failures: 0 },
+        R3: { files: 1, failedFiles: 0, exitCode: 0 } }
+    }
+  });
+  const evidence = await f.store.appendTaskEvent("fixture", "A-10", {
+    operationId: "d08.scope.failure." + (++sequence),
+    eventType: "developer_process_preflight_scope_bug",
+    actorType: "developer_ai", actorId: "fixture-actor", sessionId: "dev-session",
+    metadata: { failureCode: "REQUIREMENT_INTAKE_PENDING", candidateSha: sha }
+  });
+  const blocked = await change(f.store, "A-10", {
+    status: "阻断", assignee: "", sessionWindowName: "", sessionId: ""
+  }, "developer_d08_pending_requirement_scope_gate_blocked", {
+    failureStage: "D08_HANDOFF", failureCode: "REQUIREMENT_INTAKE_PENDING",
+    evidenceEventId: evidence.event.event_id,
+    candidateSha: frozenMismatch ? "f".repeat(40) : sha,
+    developerD07: "PASS", noQAHandoff: true
+  }, "developer_ai", "dev-session");
+  const requirementsFile = path.join(f.boardRoot, "data", "requirements", "fixture.json");
+  await fs.mkdir(path.dirname(requirementsFile), { recursive: true });
+  const requirements = async (status = null) =>
+    fs.writeFile(requirementsFile, JSON.stringify({ version: 1,
+      items: status ? [{ id: "REQ-D08", status }] : [], operations: {} }), "utf8");
+  return { ...f, sha, blocked, published, requirements };
+}
+
+test("D08 pending clears and verified post-QA developer repair auto-unblocks only once without new dispatch", async (t) => {
+  const f = await blockedD08Pending(t);
+  await f.requirements("待AI拆解");
+  await f.evaluator.evaluateProject("fixture");
+  assert.equal(await status(f.store, "A-10"), "阻断");
+  await f.requirements("待用户补充");
+  await f.evaluator.evaluateProject("fixture");
+  assert.equal(await status(f.store, "A-10"), "阻断");
+  await f.requirements();
+  const original = f.store.userMessageState.bind(f.store);
+  f.store.userMessageState = async () => ({ requiresAcknowledgement: true, messages: [] });
+  await f.evaluator.evaluateProject("fixture");
+  assert.equal(await status(f.store, "A-10"), "阻断", "unread user message must block");
+  f.store.userMessageState = original;
+  await Promise.all([f.evaluator.evaluateProject("fixture"), f.evaluator.evaluateProject("fixture")]);
+  assert.equal(await status(f.store, "A-10"), "待开发");
+  const events = await f.store.taskHistory("fixture", "A-10", { all: true });
+  const restored = events.filter((event) => event.event_type === "auto_unblock");
+  assert.equal(restored.length, 1, "concurrent scans cannot duplicate unblock");
+  assert.equal(restored[0].actor_type, "system");
+  assert.equal(restored[0].metadata.blockedEventId, f.blocked.eventId);
+  assert.equal((await f.store.transactions.read(restored[0].operation_id)).state, "committed");
+  assert.equal(events.filter((event) => event.event_type === "controller_dispatch").length, 0);
+  await change(f.store, "A-10", { status: "开发中", assignee: "developer",
+    sessionWindowName: "developer", sessionId: "new-dev-session" },
+  "claim", {}, "developer_ai", "new-dev-session");
+  assert.equal(await status(f.store, "A-10"), "开发中");
+});
+
+test("D08 auto-unblock rejects forged frozen QA proof, absent remote commit, wrong developer and STOP", async (t) => {
+  for (const options of [
+    { frozenMismatch: true }, { remoteMissing: true },
+    { candidateUnverified: true }, { wrongActor: true }, { fakeQa: true }
+  ]) {
+    const f = await blockedD08Pending(t, options);
+    await f.evaluator.evaluateProject("fixture");
+    assert.equal(await status(f.store, "A-10"), "阻断", JSON.stringify(options));
+    assert.equal((await f.store.taskHistory("fixture", "A-10", { all: true }))
+      .filter((event) => event.event_type === "auto_unblock").length, 0);
+  }
+  const f = await blockedD08Pending(t);
+  await f.store.appendTaskEvent("fixture", "A-10", {
+    operationId: "d08.stop." + (++sequence), eventType: "stop_request",
+    actorType: "user", actorId: "user", sessionId: "user-session"
+  });
+  await f.evaluator.evaluateProject("fixture");
+  assert.equal(await status(f.store, "A-10"), "阻断", "STOP must forbid automatic unblock");
 });
