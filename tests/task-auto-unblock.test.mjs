@@ -5,6 +5,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import { TaskStore } from "../server/task-store.mjs";
+import { TaskStepCheckpoint } from "../server/task-step-checkpoint.mjs";
 import { CandidateEvaluator } from "../server/candidate-evaluator.mjs";
 import { makeFixture, registryText } from "./helpers.mjs";
 
@@ -772,4 +773,135 @@ test("D08 auto-unblock rejects forged frozen QA proof, absent remote commit, wro
   });
   await f.evaluator.evaluateProject("fixture");
   assert.equal(await status(f.store, "A-10"), "阻断", "STOP must forbid automatic unblock");
+});
+
+const D01_REENTRY_FIX = "WTB-P0-REWORK-REQUEUE-D01-STEP-ORDER-20261107-T1";
+
+async function d01SecondRecoveryFixture(t, options = {}) {
+  const { wrongClaimId=false, wrongPriorUnblock=false, wrongOldResult=false,
+    missingReview=false, missingFixDelivery=false, stopped=false } = options;
+  const f = await setup(t, [
+    row("A-10","待开发",{dependencies:"B-10完成"}),row("B-10","已完成"),
+    row(RECOVERY_FIX,"已完成"),row(RUNNER_STEP_FIX,"已完成"),row(D01_REENTRY_FIX,"已完成")
+  ]);
+  const git=(...args)=>execFileSync("git",["-C",f.projectRoot,...args],
+    {encoding:"utf8",windowsHide:true}).trim();
+  git("init","-b","main");
+  git("add","tasks.md");
+  git("-c","user.name=Fixture","-c","user.email=fixture@example.com",
+    "commit","-m","trusted second D01 recovery fixture");
+  const mainSha=git("rev-parse","HEAD");
+  const publish=async(id)=>{
+    const qa=await f.store.appendTaskEvent("fixture",id,{
+      operationId:"second.qa."+(++sequence),eventType:"test_result",actorType:"test_ai",
+      actorId:"qa",sessionId:"qa-session",
+      metadata:{atomicLifecycle:true,testResult:"pass",commitSha:mainSha}
+    });
+    await f.store.appendTaskEvent("fixture",id,{
+      operationId:"second.delivery."+(++sequence),eventType:"delivery_complete",
+      actorType:"controller_ai",actorId:"controller",sessionId:"controller-session",
+      metadata:{independentPassEventId:qa.event.event_id,deliveryVerified:true,
+        postMergeRegressionResult:"PASS",candidateCommitSha:mainSha,
+        mergeCommitSha:mainSha,remoteMainSha:mainSha}
+    });
+  };
+  await f.store.appendTaskEvent("fixture","A-10",{
+    operationId:"second.initial.dispatch."+(++sequence),eventType:"controller_dispatch",
+    actorType:"controller_ai",actorId:"controller",sessionId:"controller-session"
+  });
+  const oldClaim=await change(f.store,"A-10",{
+    status:"开发中",assignee:"old",sessionWindowName:"old",sessionId:"old-session"
+  },"claim",{},"developer_ai","old-session");
+  const cp=await new TaskStepCheckpoint(f.boardRoot,{taskStore:f.store}).init();
+  const record=async(stepId,sessionId,eventId=null,result="PASS")=>{
+    const before=await cp.show("fixture","A-10");
+    return cp.record("fixture","A-10",{
+      operationId:"second.step."+(++sequence),expectedSha256:before.sha256,
+      stepId,actorType:"developer_ai",actorId:"fixture-actor",sessionId,
+      result,eventId,evidence:"Actual immutable fixture evidence for "+stepId
+    });
+  };
+  await record("D01_CLAIM","old-session",oldClaim.eventId);
+  for(const id of ["D02_WORKTREE","D03_WRITE_SCOPE","D04_IMPLEMENT","D05_TEST_1","D06_TEST_2"])
+    await record(id,"old-session");
+  await record("D07_TEST_3","old-session",null,"BLOCK");
+  const runnerBlock=await change(f.store,"A-10",{
+    status:"阻断",assignee:"",sessionId:"",sessionWindowName:""
+  },"developer_r3_runner_timeout_blocked",{
+    failureStage:"D07_TEST_3",failureCode:"TEST_RUNNER_30S_SPAWNSYNC_ETIMEDOUT",
+    blockerCategory:"test_runner",candidateSha:"a".repeat(40)
+  },"developer_ai","old-session");
+  await publish(RECOVERY_FIX);
+  await publish(RUNNER_STEP_FIX);
+  await f.store.appendTaskEvent("fixture","A-10",{
+    operationId:"second.runner.dispatch."+(++sequence),eventType:"controller_dispatch",
+    actorType:"controller_ai",actorId:"controller",sessionId:"controller-session"
+  });
+  await f.evaluator.evaluateProject("fixture");
+  assert.equal(await status(f.store,"A-10"),"待开发","first legitimate recovery");
+  const firstUnblock=(await f.store.taskHistory("fixture","A-10",{all:true}))
+    .findLast(e=>e.event_type==="auto_unblock");
+  assert.equal(firstUnblock?.metadata?.blockedEventId,runnerBlock.eventId);
+  const failedClaim=await change(f.store,"A-10",{
+    status:"开发中",assignee:"failed",sessionWindowName:"failed",sessionId:"failed-session"
+  },"claim",{},"developer_ai","failed-session");
+  await assert.rejects(record("D01_CLAIM","failed-session",failedClaim.eventId),
+    e=>e.code==="CHECKPOINT_STEP_ORDER");
+  const blocked=await change(f.store,"A-10",{
+    status:"阻断",assignee:"",sessionId:"",sessionWindowName:""
+  },"developer_d01_reentry_checkpoint_order_blocked",{
+    failureStage:"D01_CLAIM",failureCode:"CHECKPOINT_STEP_ORDER",oldStep:"D07_TEST_3",
+    oldResult:wrongOldResult?"PASS":"BLOCK",
+    newClaimEventId:wrongClaimId?"evt-missing":failedClaim.eventId,
+    autoUnblockEventId:wrongPriorUnblock?"evt-missing":firstUnblock.event_id,
+    sourceChanges:false,codeTouched:false
+  },"developer_ai","failed-session");
+  if(!missingReview) await f.store.appendTaskEvent("fixture","A-10",{
+    operationId:"second.controller.review."+(++sequence),
+    eventType:"controller_blocker_resolution_plan",actorType:"controller_ai",
+    actorId:"controller",sessionId:"controller-session",
+    metadata:{rootCauseTaskIds:[D01_REENTRY_FIX]}
+  });
+  if(!missingFixDelivery)await publish(D01_REENTRY_FIX);
+  if(stopped)await f.store.appendTaskEvent("fixture","A-10",{
+    operationId:"second.stop."+(++sequence),eventType:"stop_request",
+    actorType:"user",actorId:"user",note:"Stop"
+  });
+  return {...f,cp,blocked,record};
+}
+
+test("D01 second recovery once reaches D02 and preserves old D07 BLOCK",async(t)=>{
+  const f=await d01SecondRecoveryFixture(t);
+  await Promise.all([f.evaluator.evaluateProject("fixture"),f.evaluator.evaluateProject("fixture")]);
+  assert.equal(await status(f.store,"A-10"),"待开发");
+  const events=await f.store.taskHistory("fixture","A-10",{all:true});
+  const unblock=events.filter(e=>e.event_type==="auto_unblock");
+  assert.equal(unblock.length,2);
+  assert.equal(unblock[1].metadata.blockedEventId,f.blocked.eventId);
+  assert.equal((await f.store.transactions.read(unblock[1].operation_id))?.state,"committed");
+  const newClaim=await change(f.store,"A-10",{
+    status:"开发中",assignee:"new",sessionWindowName:"new",sessionId:"new-session"
+  },"claim",{},"developer_ai","new-session");
+  const old=await f.cp.show("fixture","A-10");
+  assert.equal(old.state.cursors.developer_ai,"D07_TEST_3");
+  const next=await f.record("D01_CLAIM","new-session",newClaim.eventId);
+  assert.equal(next.state.cursors.developer_ai,"D02_WORKTREE");
+  assert.equal(next.state.attempts,old.state.attempts+1);
+  assert.ok(next.state.records.some(r=>r.stepId==="D07_TEST_3"&&r.result==="BLOCK"));
+  await f.evaluator.evaluateProject("fixture");
+  assert.equal((await f.store.taskHistory("fixture","A-10",{all:true}))
+    .filter(e=>e.event_type==="auto_unblock").length,2);
+});
+
+test("D01 second recovery rejects forged chain, missing proof and STOP",async(t)=>{
+  for(const options of [
+    {wrongClaimId:true},{wrongPriorUnblock:true},{wrongOldResult:true},
+    {missingReview:true},{missingFixDelivery:true},{stopped:true}
+  ]){
+    const f=await d01SecondRecoveryFixture(t,options);
+    await f.evaluator.evaluateProject("fixture");
+    assert.equal(await status(f.store,"A-10"),"阻断",JSON.stringify(options));
+    assert.equal((await f.store.taskHistory("fixture","A-10",{all:true}))
+      .filter(e=>e.event_type==="auto_unblock").length,1,JSON.stringify(options));
+  }
 });
