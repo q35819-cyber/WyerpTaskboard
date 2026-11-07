@@ -281,7 +281,8 @@ try {
         expectedRevision: snapshot.registryRevision,
         task,
         ...actor(args, args["actor-type"] || "developer_ai"),
-        metadata: metadata(args, acceptanceScope ? { acceptanceScope } : {})
+        metadata: metadata(args, {...(acceptanceScope?{acceptanceScope}:{}),
+          ...(args["rule-source-task"]?{ruleReadContextTaskId:args["rule-source-task"]}:{})})
       }
     }));
   } else if (command === "get") {

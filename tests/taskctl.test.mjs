@@ -746,6 +746,11 @@ test("taskctl rules, rule-chunk, rule-verify use current server evidence rather 
   for(const p of ["流程文档/00_流程与重大更新日志.md","流程文档/00_统一入口.md",
     "流程文档/开发/00_角色入口.md","流程文档/独测/00_角色入口.md",
     "流程文档/总控/00_角色入口.md","流程文档/07_全软件BUG强制修复与闭环续接规范.md",
+    "流程文档/02_增删改操作日志规范.md",
+    "流程文档/04_逐步聊天汇报与证据校验规范.md",
+    "流程文档/05_BUG修复三问与关联任务验收规范.md",
+    "流程文档/06_全任务依赖审计与阻断优先调度规范.md",
+    "流程文档/开发/D01_CLAIM_正式领取任务.md",
     ".agents/skills/ponytail/SKILL.md",
     "data/taskboard/checkpoints/00_跨角色共享待办_总控维护.md"]){
     const filename=path.join(fixture.projectRoot,p);
@@ -767,7 +772,9 @@ test("taskctl rules, rule-chunk, rule-verify use current server evidence rather 
   }
   const answers={parallel_different_tasks:"allow_isolated",parallel_same_task:"deny_duplicate",
     stale_takeover:"revoke_old_session",incomplete_dependency_or_stop:"deny_claim",
-    independent_qa:"unique_qa_only",final_merge:"controller_after_qa_pass"};
+    independent_qa:"unique_qa_only",final_merge:"controller_after_qa_pass",
+    green_completed_dependency:"skip_green_check_workflow",
+    missing_or_cyclic_dependency:"deny_unresolved",role_duty:"develop_only_own_task"};
   const pass=JSON.parse((await taskctl(fixture.boardRoot,base,
     ["rule-verify",...projectTask,...who,"--answers",JSON.stringify(answers)])).stdout);
   assert.equal(pass.valid,true);
