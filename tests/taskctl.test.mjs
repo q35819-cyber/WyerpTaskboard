@@ -739,3 +739,39 @@ test("independent test pass defaults to system auto-close for an unscoped task",
   assert.equal(result.after.assignee, "");
   assert.equal(result.after.sessionId, "");
 });
+
+
+test("taskctl rules, rule-chunk, rule-verify use current server evidence rather than self-reported proof",async(t)=>{
+  const {fixture,base}=await startFixture(t);
+  for(const p of ["流程文档/00_流程与重大更新日志.md","流程文档/00_统一入口.md",
+    "流程文档/开发/00_角色入口.md","流程文档/独测/00_角色入口.md",
+    "流程文档/总控/00_角色入口.md","流程文档/07_全软件BUG强制修复与闭环续接规范.md",
+    ".agents/skills/ponytail/SKILL.md",
+    "data/taskboard/checkpoints/00_跨角色共享待办_总控维护.md"]){
+    const filename=path.join(fixture.projectRoot,p);
+    await fs.mkdir(path.dirname(filename),{recursive:true});
+    await fs.writeFile(filename,"# "+p+"\n"+"有效规则内容\n".repeat(30));
+  }
+  const projectTask=["--project","fixture","--task","A-10"];
+  const who=["--actor-type","developer_ai","--actor-id","rule-cli",
+    "--session-id","wc_sess_rule_cli"];
+  const list=JSON.parse((await taskctl(fixture.boardRoot,base,
+    ["rules",...projectTask,"--actor-type","developer_ai"])).stdout);
+  assert.ok(list.documents.length>=7);
+  for(const doc of list.documents)for(let index=0;index<doc.chunks;index++){
+    const chunk=JSON.parse((await taskctl(fixture.boardRoot,base,
+      ["rule-chunk",...projectTask,...who,
+        "--document-index",String(doc.index),"--chunk-index",String(index)])).stdout);
+    assert.equal(chunk.path,doc.path);
+    assert.ok(chunk.content);
+  }
+  const answers={parallel_different_tasks:"allow_isolated",parallel_same_task:"deny_duplicate",
+    stale_takeover:"revoke_old_session",incomplete_dependency_or_stop:"deny_claim",
+    independent_qa:"unique_qa_only",final_merge:"controller_after_qa_pass"};
+  const pass=JSON.parse((await taskctl(fixture.boardRoot,base,
+    ["rule-verify",...projectTask,...who,"--answers",JSON.stringify(answers)])).stdout);
+  assert.equal(pass.valid,true);
+  const guard=JSON.parse((await taskctl(fixture.boardRoot,base,
+    ["guard",...projectTask,...who])).stdout);
+  assert.equal(guard.ruleRead.valid,true);
+});

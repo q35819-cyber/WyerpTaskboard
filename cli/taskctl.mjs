@@ -224,6 +224,9 @@ try {
         "taskctl resource-preserve --project PROJECT --task WTB-TEST-001 --resource ID --resource-type process|port|fixture|browser|database --locator TEXT --purpose TEXT --handoff developer_ai --cleanup-condition TEXT --evidence PATH --actor-type test_ai --actor-id ID --session-id ID [--cleanup-by ISO --safety-status safe|isolated|risk]",
         "taskctl resource-observe --project PROJECT --task WTB-TEST-001 --resource ID --result viewed|reproduced|not_needed --note TEXT [--actor-id ID --session-id ID]",
         "taskctl resource-clean --project PROJECT --task WTB-TEST-001 --resource ID --note TEXT [--actor-type developer_ai|test_ai --actor-id ID --session-id ID]",
+        "taskctl rules --project PROJECT --task ID [--actor-type developer_ai|test_ai|controller_ai]",
+        "taskctl rule-chunk --project PROJECT --task ID --actor-id ID --session-id ID --document-index N --chunk-index N",
+        "taskctl rule-verify --project PROJECT --task ID --actor-id ID --session-id ID --answers JSON",
         "taskctl claim --project PROJECT --task WTB-TEST-001 --assignee NAME --session-name NAME --session-id ID --actor-id ID [--actor-type controller_ai|developer_ai|test_ai]",
         "taskctl release --project PROJECT --task WTB-TEST-001 --session-id ID [--note TEXT]",
         "taskctl reply-user --project PROJECT --task WTB-TEST-001 --message EVENT_ID --note TEXT [--session-id ID]",
@@ -288,6 +291,26 @@ try {
   } else if (command === "history") {
     const { project, task } = projectTask(args);
     output(await request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task) + "/history?limit=" + encodeURIComponent(args.limit || "200")));
+
+  } else if (command === "rules") {
+    const {project,task}=projectTask(args);
+    output(await request("/api/projects/"+encodeURIComponent(project)+"/tasks/"+encodeURIComponent(task)
+      +"/rules?actorType="+encodeURIComponent(args["actor-type"]||"developer_ai")));
+  } else if (command === "rule-chunk") {
+    const {project,task}=projectTask(args);
+    const query=new URLSearchParams({actorType:args["actor-type"]||"developer_ai",
+      actorId:required(args,"actor-id"),sessionId:required(args,"session-id")});
+    output(await request("/api/projects/"+encodeURIComponent(project)+"/tasks/"+encodeURIComponent(task)
+      +"/rules/"+encodeURIComponent(required(args,"document-index"))
+      +"/"+encodeURIComponent(required(args,"chunk-index"))+"?"+query));
+  } else if (command === "rule-verify") {
+    const {project,task}=projectTask(args);
+    let answers;
+    try{answers=JSON.parse(required(args,"answers"));}
+    catch{throw new Error("--answers must be a JSON object of scenario decisions");}
+    output(await request("/api/projects/"+encodeURIComponent(project)+"/tasks/"+encodeURIComponent(task)
+      +"/rules/verify",{method:"POST",body:{actorType:args["actor-type"]||"developer_ai",
+        actorId:required(args,"actor-id"),sessionId:required(args,"session-id"),answers}}));
   } else if (command === "guard") {
     const { project, task } = projectTask(args);
     const result = await guardState(project, task, args);
