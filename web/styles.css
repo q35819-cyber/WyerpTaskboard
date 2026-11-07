@@ -132,8 +132,35 @@
 .column-head .shared-ready-title{min-width:0;line-height:1.4}
 .column-head .shared-ready-count{flex-shrink:0;font-size:11px;white-space:nowrap;padding:2px 5px}
 
-.task-card.bug-card{border-left:4px solid #d92d20;background:#fff8f7}
+.task-card.bug-card{border-left-width:4px}
 .badge.bugfix{background:#b42318;color:#fff;font-weight:800}
+
+/* One mutually exclusive progress color per task; BUG and priority remain small badges. */
+.task-card.card-stage-not-started{background:#fff1f0;border:2px solid #d92d20}
+.task-card.card-stage-running{background:#fff;border:2px solid #b8c0cc}
+.task-card.card-stage-paused-by-issue{background:#fff3e4;border:2px solid #d97706}
+.task-card.card-stage-completed{background:#edfcf3;border:2px solid #039855}
+.task-card.card-stage-cancelled{background:#fff;border:1px solid #dce3ef}
+.task-card.card-stage-not-started:hover{border-color:#d92d20}
+.task-card.card-stage-running:hover{border-color:#98a2b3}
+.task-card.card-stage-paused-by-issue:hover{border-color:#d97706}
+.task-card.card-stage-completed:hover{border-color:#039855}
+.card-stage-line{font-size:12px;font-weight:800;margin:9px 0;overflow-wrap:anywhere}
+.card-stage-not-started .card-stage-line{color:#b42318}
+.card-stage-running .card-stage-line{color:#344054}
+.card-stage-paused-by-issue .card-stage-line{color:#9a3412}
+.card-stage-completed .card-stage-line{color:#027a48}
+.card-disconnect,.related-issue-note{font-size:12px;font-weight:650;margin:8px 0;overflow-wrap:anywhere}
+.related-task-row,.related-detail{display:flex;flex-direction:column;gap:5px;min-width:0;margin:8px 0}
+.related-task-status{display:block;min-width:0;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  text-align:left;box-sizing:border-box;font-size:11px;font-weight:750;padding:8px;border:1px solid transparent;border-radius:6px}
+button.related-task-status{cursor:pointer}
+.related-task-status.related-open{background:#fff1f0;color:#a52820;border-color:#f4aaa3}
+.related-task-status.related-done{background:#e8f9ef;color:#027a48;border-color:#9de4b8}
+.related-task-status.related-unknown{background:#f2f4f7;color:#475467;border-color:#d0d5dd}
+.related-task-status:focus-visible{outline:3px solid #84adff;outline-offset:2px}
+.related-more{font-size:11px;color:#475467}
+
 
 /* Keep every dependency ID on a separate line; ellipsis is visual only. */
 .task-card .task-id{display:block;max-width:100%;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}

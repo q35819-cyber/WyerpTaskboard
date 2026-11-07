@@ -70,10 +70,50 @@ test("R1 bugfix cards show prominent BUG without replacing status and priority",
     }
   }
   const css=await fs.readFile("web/styles.css","utf8");
-  assert.match(css,/\.task-card\.bug-card\{border-left:4px solid #d92d20/);
+  assert.match(css,/\.task-card\.bug-card\{border-left-width:4px/);
   assert.match(css,/\.badge\.bugfix\{background:#b42318;color:#fff/);
 });
 
+
+test("R1 four mutually exclusive card stages keep BUG as a separate badge", async () => {
+  const ctx=await cardRenderer();
+  for(const [stage,label] of [["not_started","未开工"],["running","正在执行"],
+    ["paused_by_issue","开发受阻·已报告·暂停"],["completed","已完成"]]){
+    const card=ctx.renderCard({id:"WTB-CARD-20261107-T1",track:"bugfix",priority:"P0",
+      status:stage==="completed"?"已完成":"开发中",presentation:{cardStage:stage}});
+    assert.match(card.className,new RegExp("card-stage-"+stage.replaceAll("_","-")));
+    assert.equal((card.className.match(/card-stage-/g)||[]).length,1);
+    assert.match(card.children.find(item=>item.className==="card-stage-line").textContent,new RegExp(label));
+    assert.equal(card.children.find(item=>item.className==="badges").children[0].textContent,"BUG");
+  }
+  const css=await fs.readFile("web/styles.css","utf8");
+  for(const stage of ["not-started","running","paused-by-issue","completed"])
+    assert.match(css,new RegExp("task-card\\.card-stage-"+stage));
+  assert.doesNotMatch(css,/\.task-card\.bug-card\{[^}]*background/);
+});
+
+test("R2 relationships use current registered status; unknown and cancelled never green", async () => {
+  const ctx=await cardRenderer();
+  const id="WTB-SOURCE-20261107-T1";
+  const ids=["WTB-DONE-20261107-T1","WTB-OPEN-20261107-T1",
+    "WTB-CANCEL-20261107-T1","WTB-UNKNOWN-20261107-T1"];
+  const statuses=["已完成","阻断","已取消",null];
+  const source={id,status:"开发中",track:"bugfix",priority:"P0",
+    presentation:{cardStage:"running",relatedTasks:ids.map((id,i)=>({id,status:statuses[i]}))}};
+  ctx.state.snapshot={tasks:[source,...ids.slice(0,3).map((id,i)=>({id,status:statuses[i]}))]};
+  const card=ctx.renderCard(source);
+  const related=card.children.find(item=>item.className==="related-task-row");
+  assert.equal(related.children.length,4,"three links and one view-all note");
+  assert.match(related.children[0].className,/related-done/);
+  assert.match(related.children[1].className,/related-open/);
+  assert.match(related.children[2].className,/related-unknown/);
+  let stopped=false;related.children[0].listeners.click({stopPropagation(){stopped=true}});
+  assert.equal(stopped,true);
+  assert.deepEqual(ctx.navCalls,[{id:ids[0],nested:true}]);
+  source.presentation.relatedTasks=[{id:ids[3],status:"已完成"}];
+  assert.match(ctx.renderCard(source).children.find(item=>item.className==="related-task-row")
+    .children[0].className,/related-unknown/,"unknown ID cannot rely on a claimed completed state");
+});
 test("R2 only track=bugfix is flagged, including in table categories", async () => {
   const ctx=await cardRenderer();
   const tasks=[
