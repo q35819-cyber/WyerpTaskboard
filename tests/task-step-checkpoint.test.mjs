@@ -1895,8 +1895,27 @@ async function modernDeliveryRework(t, options = {}) {
   await event("claim", "controller_ai", "controller", "controller-session", "待交付", "交付中");
   const failure = options.noFailure ? null : await event("delivery_attempt_failed", "controller_ai",
     "controller", "controller-session", "交付中", "交付中",
-    { failureStage: "merge", candidateSha: "a".repeat(40) });
-  if (!options.noRework) await event("delivery_merge_conflict_rework",
+    { failureStage: "merge", failureCode: options.wrongFailureCode ? "UNRELATED" : "GIT_MERGE_CONFLICT",
+      candidateSha: "a".repeat(40) });
+  if (!options.noRework && options.controllerRequeue) {
+    if (!options.noBlock) await event("controller_c04_candidate_new_main_merge_conflict",
+      "controller_ai", "controller", "controller-session", "交付中", "阻断", {
+        failureEventId: options.wrongFailurePointer ? "evt_fake" : failure?.event_id,
+        failureCode: "GIT_MERGE_CONFLICT",
+        candidateSha: "a".repeat(40)
+      });
+    if (!options.noReady) await event("controller_rework_ready", "controller_ai",
+      "controller-requeue", "requeue-session", "阻断", "阻断");
+    await event("controller_rework_requeue",
+      options.spoofController ? "developer_ai" : "controller_ai",
+      "controller-requeue", "requeue-session", options.wrongStatus ? "HOLD" : "阻断", "待开发", {
+        requiresIndependentRetest: !options.noConflict,
+        priorCandidateSha: options.wrongCandidate ? "c".repeat(40) : "a".repeat(40),
+        reasonCode: options.wrongReason ? "NOT_A_MERGE" : "GIT_MERGE_CONFLICT"
+      });
+    if (options.staleRequeue) await event("unrelated_reblock", "controller_ai",
+      "controller-requeue", "requeue-session", "待开发", "阻断");
+  } else if (!options.noRework) await event("delivery_merge_conflict_rework",
     options.spoofController ? "developer_ai" : "controller_ai",
     "controller", "controller-session", options.wrongStatus ? "HOLD" : "交付中", "待开发", {
       mergeConflictVerified: !options.noConflict, invalidatesTestEvidence: true,
@@ -1907,9 +1926,8 @@ async function modernDeliveryRework(t, options = {}) {
       originalDeveloperSessionId: oldSession,
       originalControllerActorId: "controller", originalControllerSessionId: "controller-session"
     });
-  const newClaim = await event("claim", "developer_ai",
-    options.wrongNewActor ? "someone-else" : oldDev, newSession,
-    "待开发", "开发中");
+  const newActor = options.wrongNewActor ? "someone-else" : options.controllerRequeue ? "new-developer" : oldDev;
+  const newClaim = await event("claim", "developer_ai", newActor, newSession, "待开发", "开发中");
   if (options.stop) await event("stop_request", "user", "user", "", "开发中", "开发中");
   const state = {
     version: 1, projectId: "fixture", taskId: "A-10", flowVersion: "role-steps-v2",
@@ -1949,6 +1967,64 @@ test("modern merge rework accepts genuine committed chain and starts new D01/D02
   }), e => e.code === "CHECKPOINT_STEP_ORDER");
 });
 
+
+test("modern controller_rework_requeue accepts real QA→merge fail→block→requeue→new claim chain", async t => {
+  const x=await modernDeliveryRework(t,{controllerRequeue:true});
+  const before=await x.cp.show("fixture","A-10");
+  const accepted=await step(x.cp,"developer_ai","D01_CLAIM",{
+    actorId:"new-developer",sessionId:x.newSession,eventId:x.newClaim.event_id
+  });
+  assert.equal(accepted.state.attempts,before.state.attempts+1);
+  assert.equal(accepted.state.cursors.developer_ai,"D02_WORKTREE");
+  assert.equal(accepted.state.cursors.test_ai,"Q01_ADMISSION");
+  assert.equal(accepted.state.records.filter(e=>e.attempt===1&&e.stepId==="Q03_RESULT").length,1);
+  assert.equal(accepted.state.records.filter(e=>e.attempt===1&&e.stepId==="D08_HANDOFF").length,1);
+  await step(x.cp,"developer_ai","D02_WORKTREE",{
+    actorId:"new-developer",sessionId:x.newSession
+  });
+  await assert.rejects(step(x.cp,"developer_ai","D01_CLAIM",{
+    actorId:"new-developer",sessionId:x.newSession,eventId:x.newClaim.event_id
+  }),e=>e.code==="CHECKPOINT_STEP_ORDER");
+});
+
+test("modern controller_rework_requeue rejects forged/stale/replayed chains without cursor changes",async t=>{
+  const cases=[
+    ["missing requeue",{noRework:true}],
+    ["not a controller",{spoofController:true}],
+    ["wrong source state",{wrongStatus:true}],
+    ["wrong root cause",{wrongReason:true}],
+    ["unproven retest",{noConflict:true}],
+    ["missing blocker",{noBlock:true}],
+    ["missing ready",{noReady:true}],
+    ["bad failure pointer",{wrongFailurePointer:true}],
+    ["missing original failure",{noFailure:true}],
+    ["wrong failure code",{wrongFailureCode:true}],
+    ["wrong candidate",{wrongCandidate:true}],
+    ["QA did not pass",{failQa:true}],
+    ["missing QA report",{noReport:true}],
+    ["missing old handoff",{noHandoff:true}],
+    ["STOP",{stop:true}],
+    ["hard dependency",{dependency:true}],
+    ["replayed session",{oldSession:true}],
+    ["stale requeue",{staleRequeue:true}]
+  ];
+  for(const [name,options] of cases){
+    const x=await modernDeliveryRework(t,{controllerRequeue:true,...options});
+    const before=await x.cp.show("fixture","A-10");
+    await assert.rejects(step(x.cp,"developer_ai","D01_CLAIM",{
+      actorId:"new-developer",sessionId:x.newSession,eventId:x.newClaim.event_id
+    }),e=>e.code==="CHECKPOINT_STEP_ORDER"||e.code==="CHECKPOINT_PREDECESSOR_REQUIRED",name);
+    const after=await x.cp.show("fixture","A-10");
+    assert.equal(after.sha256,before.sha256,name);
+    assert.equal(after.state.attempts,1,name);
+  }
+  const x=await modernDeliveryRework(t,{controllerRequeue:true});
+  const before=await x.cp.show("fixture","A-10");
+  await assert.rejects(step(x.cp,"developer_ai","D01_CLAIM",{
+    actorId:"developer",sessionId:x.newSession,eventId:x.newClaim.event_id
+  }),e=>["CHECKPOINT_STEP_ORDER","CHECKPOINT_SESSION_MISMATCH"].includes(e.code));
+  assert.equal((await x.cp.show("fixture","A-10")).sha256,before.sha256);
+});
 test("modern merge rework refuses missing or forged chain, wrong actor/session, STOP and unfinished dependencies without altering checkpoint", async t => {
   const cases = [
     ["missing event", { noRework: true }],
