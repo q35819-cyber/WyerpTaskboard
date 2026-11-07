@@ -92,6 +92,21 @@ test("R1 four mutually exclusive card stages keep BUG as a separate badge", asyn
   assert.doesNotMatch(css,/\.task-card\.bug-card\{[^}]*background/);
 });
 
+test("R2 card fallback honors live owner rather than handoff status", async () => {
+  const ctx=await cardRenderer();
+  const card=(status,assignee="",sessionId="")=>ctx.renderCard({
+    id:"WTB-CARD-HANDOFF-20261108-T1",status,assignee,sessionId,track:"bugfix",priority:"P0"
+  });
+  for(const status of ["待独测","待复测","待交付","阻断","HOLD"])
+    assert.doesNotMatch(card(status).className,/card-stage-running/,status);
+  for(const status of ["开发中","修复中","独测中","复测中","交付中"]){
+    assert.match(card(status,"owner","session").className,/card-stage-running/,status);
+    assert.doesNotMatch(card(status).className,/card-stage-running/,"unowned active status is not running");
+  }
+  assert.match(card("已完成").className,/card-stage-completed/);
+  assert.match(card("已取消").className,/card-stage-cancelled/);
+});
+
 test("R2 relationships use current registered status; unknown and cancelled never green", async () => {
   const ctx=await cardRenderer();
   const id="WTB-SOURCE-20261107-T1";

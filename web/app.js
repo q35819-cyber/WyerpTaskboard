@@ -446,7 +446,9 @@ function renderTaskDependencies(task){
 }
 function cardStage(task){
   return task.presentation?.cardStage || (task.status === "已完成" ? "completed"
-    : ["开发中", "修复中", "待独测", "待复测", "待交付", "交付中"].includes(task.status) ? "running" : "not_started");
+    : task.status === "已取消" ? "cancelled"
+    : ["开发中", "修复中", "独测中", "复测中", "交付中"].includes(task.status)
+      && task.assignee && task.sessionId ? "running" : "not_started");
 }
 const CARD_STAGE_LABELS={not_started:"未开工",running:"正在执行",
   paused_by_issue:"开发受阻·已报告·暂停｜不是失联",completed:"已完成",cancelled:"已取消"};
