@@ -675,6 +675,31 @@ test("TaskStore rule-read receipts are session-bound, cannot be forged, and expi
   assert.equal((await store.getTask("fixture","C-10")).task.status,"待开发");
   assert.equal((await store.ruleStatus("fixture","A-10",
     {...actor,sessionId:"wc_sess_else"})).valid,false);
+  await store.updateTask("fixture","A-10",{
+    status:"开发中",assignee:actor.actorId,sessionWindowName:"dev-unit",
+    sessionId:actor.sessionId
+  },{
+    operationId:"rule.current.developer.claim.0001",
+    expectedRevision:(await store.snapshot("fixture")).registryRevision,
+    eventType:"claim",actorType:actor.actorType,
+    actorId:actor.actorId,sessionId:actor.sessionId
+  });
+  assert.equal((await store.presentation("fixture","A-10")).cardStage,"running");
   await fs.appendFile(filepath("流程文档/00_统一入口.md"),"\n# changed\n");
   assert.equal((await store.ruleStatus("fixture","A-10",actor)).valid,false);
+  const priorEvents=(await store.taskHistory("fixture","A-10",{all:true})).length;
+  for(const type of ["developer_issue_reported","developer_external_issue_reported",
+    "suspected_disconnect"]){
+    await assert.rejects(store.appendTaskEvent("fixture","A-10",{
+      operationId:"rule.unread.mutation."+type+".0001",eventType:type,
+      actorType:actor.actorType,actorId:actor.actorId,sessionId:actor.sessionId,
+      metadata:{paused:true,failureCode:"EXTERNAL_REQUIRED",nextAction:"wait upstream",
+        relatedTaskIds:["C-10"]}
+    }),e=>e.code==="RULE_READ_REQUIRED",type);
+  }
+  assert.equal((await store.taskHistory("fixture","A-10",{all:true})).length,priorEvents);
+  const after=(await store.presentation("fixture","A-10"));
+  assert.equal(after.cardStage,"running");
+  assert.equal(after.developmentIssue,null);
+  assert.equal(after.suspectedDisconnect,false);
 });

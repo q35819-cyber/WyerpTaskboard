@@ -1701,8 +1701,7 @@ export class TaskStore {
   }
   async assertRuleReadForMutation(projectId, taskId, actor, eventType) {
     if (!["controller_ai", "developer_ai", "test_ai"].includes(actor.actorType)
-      || ["preclaim_report", "suspected_disconnect", "developer_issue_reported",
-        "developer_external_issue_reported"].includes(eventType)
+      || eventType === "preclaim_report"
       || String(eventType).startsWith("rule_read_")) return;
     if (!(await this.ruleGateEnabled(projectId))) return;
     const proof = await this.ruleStatus(projectId, taskId, actor);
