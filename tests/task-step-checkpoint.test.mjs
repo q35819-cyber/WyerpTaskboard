@@ -2058,3 +2058,65 @@ test("modern merge rework refuses missing or forged chain, wrong actor/session, 
     assert.equal(after.state.records.length, 3, label);
   }
 });
+
+test("step reports bind real start, completion and exception events to checkpoint SHA without chat delivery claims", async (t) => {
+  const { cp, taskStore } = await fixture(t);
+  const before = await cp.show("fixture", "A-10");
+  const args = {
+    operationId: "fixture.report." + String(sequence++).padStart(8, "0"),
+    expectedSha256: before.sha256, stepId: "C01_SCAN", actorType: "controller_ai",
+    actorId: "controller", sessionId: "controller_ai.session", result: "PROGRESS",
+    substepId: "START_C01_SCAN", evidence: "controller actually started this inspection step"
+  };
+  const started = await cp.record("fixture", "A-10", args);
+  const history = await taskStore.taskHistory("fixture", "A-10", { all: true });
+  const start = history.find((event) => event.event_type === "step_report_started"
+    && event.metadata?.stepOperationId === args.operationId);
+  assert.ok(start, "real event must be persisted before checkpoint advances");
+  assert.equal(start.metadata.expectedCheckpointSha256, started.sha256);
+  assert.equal(start.metadata.priorCheckpointSha256, before.sha256);
+  assert.equal(start.metadata.chatDeliveryStatus, "unknown");
+  assert.equal(start.actor_id, args.actorId);
+  assert.equal(start.session_id, args.sessionId);
+  const replay = await cp.record("fixture", "A-10", args);
+  assert.equal(replay.duplicate, true);
+  assert.equal((await taskStore.taskHistory("fixture", "A-10", { all: true }))
+    .filter((event) => event.metadata?.stepOperationId === args.operationId).length, 1);
+  const completed = await step(cp, "controller_ai", "C01_SCAN");
+  const blocked = await step(cp, "controller_ai", "C02_TRIAGE", { result: "BLOCK" });
+  const later = await taskStore.taskHistory("fixture", "A-10", { all: true });
+  const completeEvent = later.find((event) => event.event_type === "step_report_complete"
+    && event.metadata?.stepOperationId === completed.state.lastAction.operationId);
+  const blockedEvent = later.find((event) => event.event_type === "step_report_exception"
+    && event.metadata?.stepOperationId === blocked.state.lastAction.operationId);
+  assert.equal(completeEvent?.metadata?.expectedCheckpointSha256, completed.sha256);
+  assert.equal(blockedEvent?.metadata?.expectedCheckpointSha256, blocked.sha256);
+  assert.equal(blockedEvent?.metadata?.result, "BLOCK");
+  assert.ok(!later.some((event) => event.event_type === "user_message_ack"
+    && event.metadata?.stepOperationId), "step reporting cannot forge chat acknowledgement");
+});
+
+test("step report storage failure and forged report reuse must not advance the checkpoint", async (t) => {
+  const { cp, taskStore } = await fixture(t);
+  const before = await cp.show("fixture", "A-10");
+  const args = {
+    operationId: "fixture.failreport." + String(sequence++).padStart(8, "0"),
+    expectedSha256: before.sha256, stepId: "C01_SCAN", actorType: "controller_ai",
+    actorId: "controller", sessionId: "controller_ai.session", result: "PASS",
+    evidence: "confirmed controller step evidence before event write"
+  };
+  const original = taskStore.appendTaskEvent.bind(taskStore);
+  taskStore.appendTaskEvent = async () => { throw Object.assign(new Error("audit unavailable"), { code: "AUDIT_UNAVAILABLE" }); };
+  await assert.rejects(cp.record("fixture", "A-10", args), /audit unavailable/);
+  assert.equal((await cp.show("fixture", "A-10")).sha256, before.sha256);
+  taskStore.appendTaskEvent = original;
+  await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "step.report." + args.operationId,
+    eventType: "step_report_complete", actorType: "controller_ai",
+    actorId: "forged-controller", sessionId: args.sessionId,
+    metadata: { stepOperationId: args.operationId, expectedCheckpointSha256: "0".repeat(64) }
+  });
+  await assert.rejects(cp.record("fixture", "A-10", args),
+    (error) => error.code === "CHECKPOINT_REPORT_CONFLICT");
+  assert.equal((await cp.show("fixture", "A-10")).sha256, before.sha256);
+});

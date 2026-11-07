@@ -828,12 +828,34 @@ export class TaskStepCheckpoint {
       const absoluteFile = await this.location(projectId, taskId);
       const original = await fs.readFile(absoluteFile, "utf8").catch((e) => e.code === "ENOENT" ? "" : Promise.reject(e));
       const nextText = renderCheckpoint(original, state);
+      const reportPhase = result === "PROGRESS"
+        ? (substepId?.startsWith("START_") ? "started" : "progress")
+        : result === "PASS" ? "complete" : "exception";
+      const reportDigest = SHA(nextText);
+      // The event records the attempt; only a matching checkpoint SHA confirms persistence.
+      const report = await this.taskStore.appendTaskEvent(projectId, taskId, {
+        operationId: "step.report." + operationId,
+        eventType: "step_report_" + reportPhase, actorType, actorId, sessionId,
+        note: "步骤证据已登记；聊天送达状态未知",
+        metadata: {
+          stepId, result, substepId, attempt: item.attempt, stepOperationId: operationId,
+          priorCheckpointSha256: previous.sha256, expectedCheckpointSha256: reportDigest,
+          evidenceSha256: SHA(item.evidence), chatDeliveryStatus: "unknown"
+        }
+      });
+      if (report.event.event_type !== "step_report_" + reportPhase
+        || report.event.actor_id !== actorId || report.event.session_id !== sessionId
+        || report.event.metadata?.stepOperationId !== operationId
+        || report.event.metadata?.expectedCheckpointSha256 !== reportDigest
+        || report.event.metadata?.evidenceSha256 !== SHA(item.evidence)) {
+        throw invalid("CHECKPOINT_REPORT_CONFLICT", "步骤证据事件与实际断点操作不匹配");
+      }
       await writeFileAtomically(absoluteFile, nextText);
       const reread = await this.show(projectId, taskId);
-      if (reread.state.lastAction?.operationId !== operationId) {
+      if (reread.state.lastAction?.operationId !== operationId || reread.sha256 !== reportDigest) {
         throw invalid("CHECKPOINT_PERSIST_FAILED", "断点写入后核验失败");
       }
-      return { ...reread, duplicate: false };
+      return { ...reread, reportEventId: report.event.event_id, duplicate: false };
     });
   }
 }
