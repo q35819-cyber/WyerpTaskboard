@@ -2058,3 +2058,94 @@ test("modern merge rework refuses missing or forged chain, wrong actor/session, 
     assert.equal(after.state.records.length, 3, label);
   }
 });
+
+async function q04RequeueTakeover(t, { missingQ04 = false, noAuthorization = false,
+  stop = false, wrongPreviousSession = false, noRequeue = false } = {}) {
+  const x = await modernDeliveryRework(t, { controllerRequeue: true, noRework: noRequeue });
+  const checkpoint = await x.cp.show("fixture", "A-10");
+  const filename = path.join(x.f.projectRoot, "cp", "A-10.md");
+  const original = await fs.readFile(filename, "utf8");
+  const updated = structuredClone(checkpoint.state);
+  updated.cursors.developer_ai = null;
+  if (!missingQ04) updated.records.push({
+    stepId: "Q04_NEXT", actorType: "test_ai", actorId: "qa",
+    sessionId: "qa-session", result: "PASS", attempt: 1
+  });
+  assert.ok(original.includes(JSON.stringify(checkpoint.state, null, 2)));
+  await fs.writeFile(filename, original.replace(
+    JSON.stringify(checkpoint.state, null, 2), JSON.stringify(updated, null, 2)), "utf8");
+  const takeoverActor = "q04-takeover-developer", takeoverSession = "q04-takeover-session";
+  const oldSession = wrongPreviousSession ? "forged-old-session" : x.newSession;
+  const suspectOp = "fixture.q04.suspect." + String(sequence++).padStart(8, "0");
+  await x.taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: suspectOp, eventType: "suspected_disconnect",
+    actorType: "developer_ai", actorId: takeoverActor, sessionId: takeoverSession
+  });
+  const allowOp = "fixture.q04.allow." + String(sequence++).padStart(8, "0");
+  if (!noAuthorization) await x.taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: allowOp, eventType: "takeover_allowed",
+    actorType: "developer_ai", actorId: takeoverActor, sessionId: takeoverSession,
+    metadata: {
+      explicitUserOverride: true, authorizationSource: "chat_user_instruction_cooperative",
+      authorizationScope: "project", authorizationQuote: "异常接管",
+      authorizationForwardedBy: takeoverActor,
+      authorizationForwardingSessionId: takeoverSession,
+      authorizedFromSessionId: x.newSession, authorizedFromStatus: "开发中",
+      suspicionOperationId: suspectOp
+    }
+  });
+  const transfer = await x.taskStore.updateTask("fixture", "A-10", {
+    status: "开发中", assignee: takeoverActor,
+    sessionWindowName: takeoverActor, sessionId: takeoverSession
+  }, {
+    operationId: "fixture.q04.takeover." + String(sequence++).padStart(8, "0"),
+    expectedRevision: (await x.taskStore.snapshot("fixture")).registryRevision,
+    eventType: "takeover", actorType: "developer_ai", actorId: takeoverActor,
+    sessionId: takeoverSession, metadata: {
+      authorizationOperationId: allowOp, previousSessionId: oldSession,
+      previousAssignee: "new-developer"
+    }
+  });
+  if (stop) await x.taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.q04.stop." + String(sequence++).padStart(8, "0"),
+    eventType: "stop_request", actorType: "user", actorId: "user",
+    note: "用户STOP"
+  });
+  return { ...x, takeoverActor, takeoverSession, transfer };
+}
+
+test("modern Q04 completed and valid user-authorized takeover reopens D01 preserving previous QA", async t => {
+  const x = await q04RequeueTakeover(t);
+  const before = await x.cp.show("fixture", "A-10");
+  await assert.rejects(step(x.cp, "developer_ai", "D01_CLAIM", {
+    actorId: "new-developer", sessionId: x.newSession, eventId: x.newClaim.event_id
+  }), e => ["CHECKPOINT_STEP_ORDER", "CHECKPOINT_SESSION_MISMATCH"].includes(e.code));
+  assert.equal((await x.cp.show("fixture", "A-10")).sha256, before.sha256);
+  const accepted = await step(x.cp, "developer_ai", "D01_CLAIM", {
+    actorId: x.takeoverActor, sessionId: x.takeoverSession, eventId: x.transfer.eventId
+  });
+  assert.equal(accepted.state.attempts, 2);
+  assert.equal(accepted.state.cursors.developer_ai, "D02_WORKTREE");
+  assert.equal(accepted.state.cursors.test_ai, "Q01_ADMISSION");
+  assert.equal(accepted.state.records.filter(r =>
+    r.attempt === 1 && r.stepId === "Q04_NEXT" && r.result === "PASS").length, 1);
+  await step(x.cp, "developer_ai", "D02_WORKTREE", {
+    actorId: x.takeoverActor, sessionId: x.takeoverSession
+  });
+});
+
+test("modern Q04 takeover D01 rejects missing history, missing permission, wrong old Session and STOP", async t => {
+  for (const [name, variant] of [
+    ["no Q04", { missingQ04: true }], ["no authorization", { noAuthorization: true }],
+    ["forged old session", { wrongPreviousSession: true }],
+    ["no requeue", { noRequeue: true }], ["STOP", { stop: true }]
+  ]) {
+    const x = await q04RequeueTakeover(t, variant);
+    const before = await x.cp.show("fixture", "A-10");
+    await assert.rejects(step(x.cp, "developer_ai", "D01_CLAIM", {
+      actorId: x.takeoverActor, sessionId: x.takeoverSession, eventId: x.transfer.eventId
+    }), e => ["CHECKPOINT_STEP_ORDER", "CHECKPOINT_PREDECESSOR_REQUIRED",
+      "CHECKPOINT_SESSION_MISMATCH"].includes(e.code), name);
+    assert.equal((await x.cp.show("fixture", "A-10")).sha256, before.sha256, name);
+  }
+});
