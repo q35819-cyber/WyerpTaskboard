@@ -2,9 +2,62 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { createServer } from "node:http";
 import { createTaskboardServer } from "../server/http-server.mjs";
 import { TaskStore } from "../server/task-store.mjs";
 import { makeFixture, registryText } from "./helpers.mjs";
+
+async function listenOnFetchSafePort(server, probe = fetch) {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    await new Promise((resolve, reject) => {
+      const fail = (error) => { server.off("error", fail); reject(error); };
+      server.once("error", fail);
+      server.listen(0, "127.0.0.1", () => { server.off("error", fail); resolve(); });
+    });
+    const base = "http://127.0.0.1:" + server.address().port;
+    try {
+      await probe(base + "/api/auth/session");
+      return base;
+    } catch (error) {
+      await new Promise(resolve => server.close(resolve));
+      if (error?.cause?.message !== "bad port" || attempt === 9) throw error;
+    }
+  }
+  throw new Error("No safe multi-project fixture port available");
+}
+
+test("multi-project HTTP fixture retries only bad ports and closes rejected listeners", async t => {
+  const makeServer = () => createServer((_req, res) => { res.writeHead(200); res.end("ok"); });
+  const server = makeServer();
+  let released = 0, probes = 0;
+  server.on("close", () => released++);
+  t.after(async () => { if (server.listening) await new Promise(resolve => server.close(resolve)); });
+  const base = await listenOnFetchSafePort(server, async url => {
+    if (++probes <= 2) throw new TypeError("fetch failed", { cause: new Error("bad port") });
+    return fetch(url);
+  });
+  assert.equal(probes, 3);
+  assert.equal(released, 2, "both rejected listening ports must be closed");
+  assert.equal((await fetch(base)).status, 200);
+  const network = makeServer();
+  let networkCalls = 0;
+  await assert.rejects(listenOnFetchSafePort(network, async () => {
+    networkCalls++;
+    throw new TypeError("fetch failed", { cause: new Error("ECONNREFUSED") });
+  }), error => error.cause?.message === "ECONNREFUSED");
+  assert.equal(networkCalls, 1);
+  assert.equal(network.listening, false);
+  const exhausted = makeServer();
+  let retries = 0, exhaustedCloses = 0;
+  exhausted.on("close", () => exhaustedCloses++);
+  await assert.rejects(listenOnFetchSafePort(exhausted, async () => {
+    retries++;
+    throw new TypeError("fetch failed", { cause: new Error("bad port") });
+  }), error => error.cause?.message === "bad port");
+  assert.equal(retries, 10);
+  assert.equal(exhaustedCloses, 10);
+  assert.equal(exhausted.listening, false);
+});
 
 let serial=0;
 async function setup(t){
@@ -21,9 +74,8 @@ async function setup(t){
  }
  await fs.writeFile(configFile,JSON.stringify({...config,projects},null,2));
  const app=await createTaskboardServer({rootDir:root,host:"127.0.0.1",port:0});
- await new Promise(resolve=>app.server.listen(0,"127.0.0.1",resolve));
- t.after(async()=>{await new Promise(resolve=>app.server.close(resolve));await fs.rm(root,{recursive:true,force:true});});
- const base="http://127.0.0.1:"+app.server.address().port;
+ t.after(async()=>{if(app.server.listening)await new Promise(resolve=>app.server.close(resolve));await fs.rm(root,{recursive:true,force:true});});
+ const base=await listenOnFetchSafePort(app.server);
  const secret=JSON.parse(await fs.readFile(path.join(root,"config","admin-secret.json"),"utf8")).adminSecret;
  const headers={Authorization:"Bearer "+secret,"Content-Type":"application/json"};
  const get=async(id,task="COMMON-TASK")=>{const res=await fetch(base+"/api/projects/"+id+"/tasks/"+task,{headers});assert.equal(res.status,200);return res.json();};
