@@ -131,8 +131,17 @@ function actorOptions(identity, body) {
   if (identity.mode !== "session" && body.actorType === "user") throw new TaskboardError("用户身份只能由本机浏览器会话产生", {
     code: "USER_SESSION_REQUIRED", status: 403
   });
+  if(identity.mode !== "session" && body.actorType === "system")
+    throw new TaskboardError("系统身份只允许受控服务内部使用",{
+      code:"SYSTEM_ACTOR_FORBIDDEN",status:403
+    });
+  if(identity.mode!=="session" && body.actorType
+    && !["controller_ai","developer_ai","test_ai"].includes(body.actorType))
+    throw new TaskboardError("受信接口只允许正式三角色身份",{
+      code:"AI_ACTOR_TYPE_INVALID",status:403
+    });
   return {
-    actorType: identity.mode === "session" ? "user" : (body.actorType || "system"),
+    actorType: identity.mode === "session" ? "user" : (body.actorType || "developer_ai"),
     actorId: identity.mode === "session" ? identity.actorId : (body.actorId || identity.actorId),
     sessionWindowName: identity.mode === "session" ? "" : (body.sessionWindowName || ""),
     sessionId: identity.mode === "session" ? "" : (body.sessionId || ""),

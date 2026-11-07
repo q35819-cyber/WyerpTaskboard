@@ -2344,6 +2344,11 @@ async function prepareRuleDocuments(projectRoot) {
     "流程文档/独测/00_角色入口.md",
     "流程文档/总控/00_角色入口.md",
     "流程文档/07_全软件BUG强制修复与闭环续接规范.md",
+    "流程文档/02_增删改操作日志规范.md",
+    "流程文档/04_逐步聊天汇报与证据校验规范.md",
+    "流程文档/05_BUG修复三问与关联任务验收规范.md",
+    "流程文档/06_全任务依赖审计与阻断优先调度规范.md",
+    "流程文档/开发/D01_CLAIM_正式领取任务.md",
     ".agents/skills/ponytail/SKILL.md",
     "data/taskboard/checkpoints/00_跨角色共享待办_总控维护.md"
   ];
@@ -2357,7 +2362,9 @@ async function prepareRuleDocuments(projectRoot) {
 const RULE_ANSWERS_HTTP={
   parallel_different_tasks:"allow_isolated",parallel_same_task:"deny_duplicate",
   stale_takeover:"revoke_old_session",incomplete_dependency_or_stop:"deny_claim",
-  independent_qa:"unique_qa_only",final_merge:"controller_after_qa_pass"
+  independent_qa:"unique_qa_only",final_merge:"controller_after_qa_pass",
+  green_completed_dependency:"skip_green_check_workflow",
+  missing_or_cyclic_dependency:"deny_unresolved",role_duty:"develop_only_own_task"
 };
 
 test("server checks full rule chunks and scenarios before claim, rejecting forged events, other session and stale docs",async(t)=>{
@@ -2405,6 +2412,18 @@ test("server checks full rule chunks and scenarios before claim, rejecting forge
     metadata:{fingerprint:list.fingerprint}});
   assert.equal(forged.status,409);
   assert.equal((await forged.json()).error.code,"RULE_READ_SERVER_ROUTE_REQUIRED");
+  const systemSpoof=await request("/events",{
+    operationId:"rule.spoof.system.0001",eventType:"controller_dispatch",
+    actorType:"system",actorId:"task-scan",sessionId:"fake-session"
+  });
+  assert.equal(systemSpoof.status,403);
+  assert.equal((await systemSpoof.json()).error.code,"SYSTEM_ACTOR_FORBIDDEN");
+  const unknownSpoof=await request("/events",{
+    operationId:"rule.spoof.unknown.0001",eventType:"controller_dispatch",
+    actorType:"unrecognized_ai",actorId:"fake",sessionId:"fake-session"
+  });
+  assert.equal(unknownSpoof.status,403);
+  assert.equal((await unknownSpoof.json()).error.code,"AI_ACTOR_TYPE_INVALID");
   const different=await(await fetch(route+"/guard?actorType=developer_ai&actorId="+actorId
     +"&sessionId=wc_sess_unauthorized",{headers})).json();
   assert.equal(different.ruleRead.valid,false);
