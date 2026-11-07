@@ -385,6 +385,65 @@ export class TaskStepCheckpoint {
             state.cursors.test_ai = "Q01_ADMISSION";
           }
         }
+
+        // QA admission HOLD is not QA PASS. A genuine controller requeue grants a new developer attempt.
+        if (modern && result === "PASS" && state.cursors.developer_ai === "D09_NEXT"
+          && state.cursors.test_ai === "Q01_ADMISSION" && previouslyStarted && !alreadyRestarted
+          && currentClaim?.event_type === "claim" && currentClaim.event_id === eventId
+          && currentClaim.actor_id === actorId && currentClaim.session_id === sessionId
+          && currentClaim.old_status === "待开发" && currentClaim.new_status === "开发中"
+          && task.status === "开发中" && task.sessionId === sessionId
+          && !(await this.taskStore.stopState(projectId, taskId)).stopRequested
+          && await hardDependenciesCompleted(this.taskStore, projectId, task)) {
+          const requeueIndex = history.findLastIndex((e, i) => i < currentClaimIndex
+            && e.event_type === "controller_rework_requeue" && e.actor_type === "controller_ai"
+            && e.old_status === "HOLD" && e.new_status === "待开发" && e.actor_id && e.session_id);
+          const requeue = history[requeueIndex];
+          const dispatchIndex = history.findLastIndex((e, i) => i > requeueIndex && i < currentClaimIndex
+            && e.event_type === "controller_dispatch" && e.actor_type === "controller_ai"
+            && e.actor_id === requeue?.actor_id && e.session_id === requeue?.session_id
+            && e.old_status === "待开发" && e.new_status === "待开发");
+          const holdIndex = history.findLastIndex((e, i) => i < requeueIndex
+            && e.event_type === "qa_admission_precondition_hold" && e.actor_type === "test_ai"
+            && e.old_status === "待独测" && e.new_status === "HOLD" && e.actor_id && e.session_id);
+          const hold = history[holdIndex];
+          const rejectionIndex = history.findLastIndex((e, i) => i < holdIndex
+            && e.event_type === "qa_admission_publication_evidence_missing"
+            && e.actor_type === "test_ai" && e.old_status === "待独测"
+            && e.new_status === "待独测" && e.actor_id === hold?.actor_id
+            && e.session_id === hold?.session_id);
+          const oldHandoffIndex = history.findLastIndex((e, i) => i < rejectionIndex
+            && e.event_type === "handoff" && e.actor_type === "developer_ai"
+            && e.old_status === "开发中" && e.new_status === "待独测"
+            && e.metadata?.atomicLifecycle === true && e.metadata?.handoffTarget === "待独测");
+          const oldHandoff = history[oldHandoffIndex];
+          const oldClaimIndex = history.findLastIndex((e, i) => i < oldHandoffIndex
+            && e.event_type === "claim" && e.actor_type === "developer_ai"
+            && e.actor_id === oldHandoff?.actor_id && e.session_id === oldHandoff?.session_id);
+          const holdTransaction = hold && await this.taskStore.transactions.read(hold.operation_id);
+          const requeueTransaction = requeue && await this.taskStore.transactions.read(requeue.operation_id);
+          if (requeueIndex >= 0 && dispatchIndex > requeueIndex && dispatchIndex < currentClaimIndex
+            && holdIndex >= 0 && rejectionIndex > oldHandoffIndex && oldHandoffIndex > oldClaimIndex
+            && oldClaimIndex >= 0 && holdIndex > rejectionIndex && requeueIndex > holdIndex
+            && oldHandoff.session_id !== sessionId
+            && holdTransaction?.state === "committed" && holdTransaction.result?.eventId === hold.event_id
+            && requeueTransaction?.state === "committed"
+            && requeueTransaction.result?.eventId === requeue.event_id
+            && state.records.some((r) => r.stepId === "D08_HANDOFF" && r.result === "PASS"
+              && r.eventId === oldHandoff.event_id && r.attempt === state.attempts)
+            && !state.records.some((r) => r.stepId === "Q01_ADMISSION" && r.result === "PASS"
+              && r.attempt === state.attempts)
+            && !history.slice(oldClaimIndex, holdIndex).some((e) =>
+              (e.event_type === "code_published" && e.actor_type === "developer_ai"
+                && e.actor_id === oldHandoff.actor_id && e.session_id === oldHandoff.session_id)
+              || (e.event_type === "test_result" && e.actor_type === "test_ai"))
+            && !history.slice(requeueIndex + 1, currentClaimIndex).some((e) =>
+              e.old_status && e.new_status && e.old_status !== e.new_status)) {
+            state.attempts += 1;
+            state.cursors.developer_ai = "D01_CLAIM";
+            state.cursors.test_ai = "Q01_ADMISSION";
+          }
+        }
         // A completed legacy QA pass can leave D09 as the developer cursor.
         // A new controller dispatch and a genuinely fresh claim start a new attempt.
         if (modern && result === "PASS" && state.cursors.developer_ai === "D09_NEXT"

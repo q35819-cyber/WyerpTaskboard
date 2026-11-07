@@ -2120,3 +2120,120 @@ test("step report storage failure and forged report reuse must not advance the c
     (error) => error.code === "CHECKPOINT_REPORT_CONFLICT");
   assert.equal((await cp.show("fixture", "A-10")).sha256, before.sha256);
 });
+
+
+async function qaAdmissionHoldRequeue(t, options = {}) {
+  const f = await makeFixture();
+  t.after(() => fs.rm(f.boardRoot, {recursive:true, force:true}));
+  const store = await new TaskStore(f.boardRoot).init();
+  const cp = await new TaskStepCheckpoint(f.boardRoot, {taskStore:store, flowVersion:"role-steps-v2"}).init();
+  const oldDev="qa-hold-old-dev", oldSession="qa-hold-old-session";
+  const qa="qa-admission", qaSession="qa-session";
+  const ctrl="controller", ctrlSession="controller-session";
+  const nextDev="qa-hold-new-dev", nextSession="qa-hold-new-session";
+  const change = async (patch,type,role,actor,session,metadata={}) =>
+    store.updateTask("fixture","A-10",patch,{
+      operationId:"fixture.qa.hold."+String(sequence++).padStart(8,"0"),
+      expectedRevision:(await store.snapshot("fixture")).registryRevision,
+      eventType:type,actorType:role,actorId:actor,sessionId:session,metadata
+    });
+  const note = async (type,role,actor,session,metadata={}) =>
+    store.appendTaskEvent("fixture","A-10",{
+      operationId:"fixture.qa.hold.note."+String(sequence++).padStart(8,"0"),
+      eventType:type,actorType:role,actorId:actor,sessionId:session,metadata
+    });
+  await note("controller_dispatch","controller_ai",ctrl,ctrlSession);
+  const firstClaim=await change({status:"开发中",assignee:oldDev,sessionWindowName:oldDev,
+    sessionId:oldSession},"claim","developer_ai",oldDev,oldSession);
+  if(options.published)await note("code_published","developer_ai",oldDev,oldSession);
+  const handoff=await change({status:"待独测",assignee:"",sessionWindowName:"",
+    sessionId:""},"handoff","developer_ai",oldDev,oldSession,
+    {atomicLifecycle:true,completedFromStatus:"开发中",handoffTarget:"待独测"});
+  if(options.qaPass)await note("test_result","test_ai",qa,qaSession,
+    {atomicLifecycle:true,testResult:"pass",commitSha:"a".repeat(40),reportPath:"reports/qa-pass.md"});
+  if(!options.noRejection)await note("qa_admission_publication_evidence_missing",
+    "test_ai",options.wrongQaActor?"different-qa":qa,qaSession);
+  if(options.noHold) {
+    await change({status:"HOLD"},"other_hold","test_ai",qa,qaSession);
+  } else if(options.forgedHold) {
+    await change({status:"HOLD"},"other_hold","test_ai",qa,qaSession);
+    await store.events.append("fixture",{
+      operation_id:"fixture.qa.hold.forged."+String(sequence++).padStart(8,"0"),
+      project_id:"fixture",task_id:"A-10",event_type:"qa_admission_precondition_hold",
+      actor_type:"test_ai",actor_id:qa,session_id:qaSession,
+      old_status:"待独测",new_status:"HOLD",old_priority:"P0",new_priority:"P0",
+      old_track:"product",new_track:"product",metadata:{}
+    });
+  } else await change({status:"HOLD"},"qa_admission_precondition_hold",
+    "test_ai",qa,qaSession);
+  if(options.noRequeue) {
+    await change({status:"待开发"},"untrusted_requeue","developer_ai",nextDev,nextSession);
+  } else {
+    await change({status:"待开发"},"controller_rework_requeue",
+      options.wrongController?"developer_ai":"controller_ai",ctrl,ctrlSession);
+  }
+  if(!options.noDispatch && !options.lateDispatch)await note("controller_dispatch",
+    "controller_ai",options.wrongDispatchActor?"different-controller":ctrl,ctrlSession);
+  const claim=await change({status:"开发中",assignee:nextDev,sessionWindowName:nextDev,
+    sessionId:nextSession},"claim","developer_ai",nextDev,nextSession);
+  if(options.lateDispatch)await note("controller_dispatch","controller_ai",ctrl,ctrlSession);
+  if(options.stop)await note("stop_request","user","user","", {reason:"user stop"});
+  if (options.unmetDependency) {
+    const source = await fs.readFile(f.registryPath, "utf8");
+    await fs.writeFile(f.registryPath, source.replace("read/A-10.md", "UPSTREAM-NOT-DONE完成"), "utf8");
+  }
+
+  const state={version:1,projectId:"fixture",taskId:"A-10",flowVersion:"role-steps-v2",
+    cursors:{controller_ai:"C00_A_REQUIREMENTS",developer_ai:"D09_NEXT",
+      test_ai:"Q01_ADMISSION"},attempts:1,
+    records:[{stepId:"D01_CLAIM",actorType:"developer_ai",actorId:oldDev,
+      sessionId:oldSession,result:"PASS",attempt:1,eventId:firstClaim.eventId},
+      {stepId:"D08_HANDOFF",actorType:"developer_ai",actorId:oldDev,sessionId:oldSession,
+        result:"PASS",attempt:1,eventId:options.forgedHandoffRecord?"forged-event":handoff.eventId},
+      ...(options.qaAdmissionPassed?[{stepId:"Q01_ADMISSION",actorType:"test_ai",
+        actorId:qa,sessionId:qaSession,result:"PASS",attempt:1}]:[])],
+    lastAction:{stepId:"D08_HANDOFF",result:"PASS"}};
+  const filename=path.join(f.projectRoot,"cp","A-10.md");
+  await fs.writeFile(filename,"# 旧独测准入与开发步骤\n<!-- TASK_STEP_CHECKPOINT_START v1 -->\n"+
+    JSON.stringify(state,null,2)+"\n<!-- TASK_STEP_CHECKPOINT_END -->\n","utf8");
+  return {f,cp,store,claim,oldDev,oldSession,nextDev,nextSession};
+}
+test("QA admission HOLD trusted controller requeue starts fresh D01 and preserves old handoff", async t=>{
+  const x=await qaAdmissionHoldRequeue(t);
+  const before=await x.cp.show("fixture","A-10");
+  await assert.rejects(step(x.cp,"developer_ai","D01_CLAIM",{
+    actorId:x.oldDev,sessionId:x.oldSession,eventId:x.claim.eventId
+  }),e=>["CHECKPOINT_STEP_ORDER","CHECKPOINT_SESSION_MISMATCH"].includes(e.code));
+  assert.equal((await x.cp.show("fixture","A-10")).sha256,before.sha256);
+  const fresh=await step(x.cp,"developer_ai","D01_CLAIM",{
+    actorId:x.nextDev,sessionId:x.nextSession,eventId:x.claim.eventId
+  });
+  assert.equal(fresh.state.attempts,2);
+  assert.equal(fresh.state.cursors.developer_ai,"D02_WORKTREE");
+  assert.equal(fresh.state.cursors.test_ai,"Q01_ADMISSION");
+  assert.equal(fresh.state.records.filter(r=>r.stepId==="D08_HANDOFF"&&r.attempt===1).length,1);
+  assert.equal(fresh.state.records.some(r=>r.stepId==="Q03_RESULT"&&r.result==="PASS"),false);
+  await step(x.cp,"developer_ai","D02_WORKTREE",{
+    actorId:x.nextDev,sessionId:x.nextSession
+  });
+});
+test("QA admission HOLD D01 rejects false HOLD, forged evidence, late dispatch, STOP and incomplete prerequisites",async t=>{
+  for(const [name,variant] of [
+    ["missing QA evidence",{noRejection:true}],["wrong QA actor",{wrongQaActor:true}],
+    ["missing QA hold",{noHold:true}],["forged HOLD event",{forgedHold:true}],
+    ["wrong controller",{wrongController:true}],["missing requeue",{noRequeue:true}],
+    ["wrong dispatch actor",{wrongDispatchActor:true}],["missing dispatch",{noDispatch:true}],
+    ["late dispatch",{lateDispatch:true}],["old QA already passed",{qaPass:true}],
+    ["old publisher already verified",{published:true}],["wrong old D08 record",{forgedHandoffRecord:true}],
+    ["Q01 already PASS",{qaAdmissionPassed:true}],["unfinished hard dependency",{unmetDependency:true}],
+    ["user STOP",{stop:true}]
+  ]){
+    const x=await qaAdmissionHoldRequeue(t,variant);
+    const before=await x.cp.show("fixture","A-10");
+    await assert.rejects(step(x.cp,"developer_ai","D01_CLAIM",{
+      actorId:x.nextDev,sessionId:x.nextSession,eventId:x.claim.eventId
+    }),e=>["CHECKPOINT_STEP_ORDER","CHECKPOINT_PREDECESSOR_REQUIRED",
+      "CHECKPOINT_SESSION_MISMATCH"].includes(e.code),name);
+    assert.equal((await x.cp.show("fixture","A-10")).sha256,before.sha256,name);
+  }
+});
