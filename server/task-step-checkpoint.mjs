@@ -267,6 +267,7 @@ export class TaskStepCheckpoint {
       const currentClaim = [...history].reverse().find((entry) =>
         entry.actor_type === "developer_ai" && ["claim", "takeover"].includes(entry.event_type));
       const currentClaimIndex = history.indexOf(currentClaim);
+      let q04RequeuedTakeover = false;
       if (stepId === "D01_CLAIM" && state.cursors.developer_ai !== "D01_CLAIM") {
         const lastFailIndex = history.findLastIndex((entry) =>
           entry.event_type === "test_result" && entry.actor_type === "test_ai"
@@ -333,6 +334,49 @@ export class TaskStepCheckpoint {
           record.stepId === "D01_CLAIM" && record.result === "PASS");
         const alreadyRestarted = state.records.some((record) =>
           record.stepId === "D01_CLAIM" && record.eventId === currentClaim?.event_id);
+        // A finished QA round can be followed by a real controller requeue and an authorized developer takeover.
+        const priorDevIndex = history.findLastIndex((entry, i) => i < currentClaimIndex
+          && entry.event_type === "claim" && entry.actor_type === "developer_ai"
+          && entry.old_status === "待开发" && entry.new_status === "开发中");
+        const requeueIndex = history.findLastIndex((entry, i) => i < priorDevIndex
+          && entry.event_type === "controller_rework_requeue" && entry.actor_type === "controller_ai");
+        const requeue = history[requeueIndex];
+        const priorDev = history[priorDevIndex];
+        const qaIndex = history.findLastIndex((e,i) => i < requeueIndex
+          && e.event_type === "test_result" && e.actor_type === "test_ai"
+          && e.metadata?.atomicLifecycle === true && e.metadata?.testResult === "pass"
+          && e.old_status === "独测中" && e.new_status === "待交付");
+        q04RequeuedTakeover = modern && state.cursors.developer_ai === null
+          && qaIndex >= 0
+          && history.findLastIndex(e => e.event_type === "test_result" && e.actor_type === "test_ai") === qaIndex
+          && state.records.some((r) => r.stepId === "Q04_NEXT"
+            && r.result === "PASS" && r.attempt === state.attempts)
+          && state.records.some((r) => r.stepId === "Q03_RESULT"
+            && r.eventId === history[qaIndex].event_id && r.attempt === state.attempts)
+          && state.records.some((r) => r.stepId === "D08_HANDOFF"
+            && r.result === "PASS" && r.attempt === state.attempts)
+          && state.records.some((r) => r.stepId === "Q03_RESULT"
+            && r.result === "PASS" && r.verdict === "pass" && r.attempt === state.attempts)
+          && requeueIndex >= 0 && priorDevIndex > requeueIndex
+          && requeue.old_status === "阻断" && requeue.new_status === "待开发"
+          && priorDev?.session_id !== sessionId
+          && history.slice(requeueIndex + 1, priorDevIndex).every((e) =>
+            !e.old_status || e.old_status === e.new_status)
+          && history.slice(priorDevIndex + 1, currentClaimIndex).every((e) =>
+            !e.old_status || e.old_status === e.new_status)
+          && currentClaim?.event_type === "takeover"
+          && currentClaim?.event_id === eventId && currentClaim?.actor_id === actorId
+          && currentClaim?.session_id === sessionId
+          && currentClaim.old_status === "开发中" && currentClaim.new_status === "开发中"
+          && task.status === "开发中" && task.sessionId === sessionId
+          && previouslyStarted && !alreadyRestarted
+          && !(await this.taskStore.stopState(projectId, taskId)).stopRequested
+          && await hardDependenciesCompleted(this.taskStore, projectId, task);
+        if (q04RequeuedTakeover) {
+          state.attempts += 1;
+          state.cursors.developer_ai = "D01_CLAIM";
+          state.cursors.test_ai = "Q01_ADMISSION";
+        }
         // Reopen only a new, committed machine recovery after the prior D07 BLOCK.
         if (modern && result === "PASS" && state.cursors.developer_ai === "D07_TEST_3"
           && currentClaim?.event_id === eventId && currentClaim.actor_id === actorId
@@ -688,7 +732,7 @@ export class TaskStepCheckpoint {
           authorizedTakeover = priorDeveloperIndex >= 0 && allowedIndex >= 0
             && suspicionIndex >= 0 && !revoked
             && String(authorization?.metadata?.authorizationQuote || "").trim().length > 0
-            && dispatchIndex > priorDeveloperIndex
+            && (dispatchIndex > priorDeveloperIndex || q04RequeuedTakeover)
             && history[priorDeveloperIndex].session_id === authorityEvent.metadata?.previousSessionId
             && authorityEvent.old_status === authorityEvent.new_status
             && ["开发中", "修复中"].includes(authorityEvent.old_status);
