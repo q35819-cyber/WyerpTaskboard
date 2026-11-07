@@ -241,6 +241,39 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
   const d09Blocked = blocked?.event_type === "developer_step_cursor_blocked";
   const verifiedDevBlock = Object.hasOwn(VERIFIED_DEV_BLOCK_FIXES, blocked?.event_type || "");
   const d08PendingBlocked = blocked?.event_type === "developer_d08_pending_requirement_scope_gate_blocked";
+  const d01ReentryBlocked = blocked?.event_type === "developer_d01_reentry_checkpoint_order_blocked";
+  if (d01ReentryBlocked) {
+    const blockIndex = history.indexOf(blocked);
+    const claim = history.slice(0, blockIndex).findLast((e) =>
+      e.event_type === "claim" && e.actor_type === "developer_ai" && e.new_status === "开发中");
+    const priorUnblock = history.find((e) => e.event_id === blocked.metadata?.autoUnblockEventId);
+    const runnerBlock = history.find((e) => e.event_id === priorUnblock?.metadata?.blockedEventId);
+    const transaction = priorUnblock && await store.transactions.read(priorUnblock.operation_id);
+    if (blocked.old_status !== "开发中" || blocked.actor_type !== "developer_ai"
+      || !claim || claim.old_status !== "待开发" || claim.actor_id !== blocked.actor_id
+      || claim.session_id !== blocked.session_id || !claim.session_id
+      || blocked.metadata?.newClaimEventId !== claim.event_id
+      || blocked.metadata?.failureStage !== "D01_CLAIM"
+      || blocked.metadata?.failureCode !== "CHECKPOINT_STEP_ORDER"
+      || blocked.metadata?.oldStep !== "D07_TEST_3" || blocked.metadata?.oldResult !== "BLOCK"
+      || blocked.metadata?.sourceChanges !== false || blocked.metadata?.codeTouched !== false
+      || priorUnblock?.event_type !== "auto_unblock" || priorUnblock.actor_type !== "system"
+      || priorUnblock.actor_id !== "task-scan" || priorUnblock.old_status !== "阻断"
+      || priorUnblock.new_status !== "待开发"
+      || priorUnblock.operation_id !== autoUnblockOperationId(projectId, task.id, runnerBlock?.event_id)
+      || transaction?.state !== "committed" || transaction.result?.eventId !== priorUnblock.event_id
+      || runnerBlock?.event_type !== "developer_r3_runner_timeout_blocked"
+      || runnerBlock.metadata?.failureStage !== "D07_TEST_3"
+      || runnerBlock.metadata?.failureCode !== "TEST_RUNNER_30S_SPAWNSYNC_ETIMEDOUT"
+      || history.indexOf(runnerBlock) >= history.indexOf(priorUnblock)
+      || history.indexOf(priorUnblock) >= history.indexOf(claim)) return null;
+    const { TaskStepCheckpoint } = await import("./task-step-checkpoint.mjs");
+    const checkpoint = await new TaskStepCheckpoint(store.rootDir, { taskStore: store }).show(projectId, task.id);
+    if (!checkpoint.exists || checkpoint.state.cursors.developer_ai !== "D07_TEST_3"
+      || !checkpoint.state.records.some((r) => r.stepId === "D07_TEST_3"
+        && r.result === "BLOCK" && r.attempt === checkpoint.state.attempts
+        && r.actorId === runnerBlock.actor_id && r.sessionId === runnerBlock.session_id)) return null;
+  }
   if (d08PendingBlocked) {
     const blockIndex = history.indexOf(blocked);
     const oldClaim = history.slice(0, blockIndex).findLast((event) =>
@@ -305,14 +338,14 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
         .update(frozenReport.stdout, "utf8").digest("hex") !== report.reportSha256.toLowerCase()) return null;
     } catch { return null; }
   }
-  if (verifiedDevBlock) {
+  if (verifiedDevBlock || d01ReentryBlocked) {
     const blockIndex = history.indexOf(blocked);
     const claim = history.slice(0, blockIndex).findLast((event) =>
       ["claim", "takeover"].includes(event.event_type) && event.actor_type === "developer_ai"
       && event.new_status === "开发中" && event.actor_id && event.session_id);
     const dispatch = history.slice(blockIndex + 1).find((event) =>
-      event.event_type === "controller_dispatch" && event.actor_type === "controller_ai"
-      && event.actor_id && event.session_id);
+      event.event_type === (d01ReentryBlocked ? "controller_blocker_resolution_plan" : "controller_dispatch")
+      && event.actor_type === "controller_ai" && event.actor_id && event.session_id);
     if (blocked.old_status !== "开发中" || blocked.actor_type !== "developer_ai"
       || !claim || claim.actor_id !== blocked.actor_id || claim.session_id !== blocked.session_id
       || !dispatch || history.slice(blockIndex + 1).some((event) =>
@@ -336,7 +369,9 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
         || blocked.metadata?.blockedByWriteScope !== "server/task-step-checkpoint.mjs"
         || blocked.metadata?.candidateWipPreserved !== true
         || !GIT_SHA.test(blocked.metadata?.candidateSha || ""))) return null;
-    for (const fixId of VERIFIED_DEV_BLOCK_FIXES[blocked.event_type]) {
+    for (const fixId of d01ReentryBlocked
+      ? ["WTB-P0-REWORK-REQUEUE-D01-STEP-ORDER-20261107-T1"]
+      : VERIFIED_DEV_BLOCK_FIXES[blocked.event_type]) {
       const fix = tasks.find((item) => item.id === fixId && item.status === "已完成");
       if (!fix) return null;
       const releases = await store.events.listTaskEvents(projectId, fixId, { all: true });
@@ -440,14 +475,14 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
       event.actor_id === blocked.actor_id && event.session_id === blocked.session_id &&
       event.new_status === "开发中");
     if (!claim || !blocked.session_id) return null;
-  } else if (!d01Blocked && !d09Blocked && !verifiedDevBlock && !d08PendingBlocked
+  } else if (!d01Blocked && !d09Blocked && !verifiedDevBlock && !d01ReentryBlocked && !d08PendingBlocked
     && (blocked?.event_type !== "temporary_block" || blocked.actor_type !== "system")) return null;
   const target = d08PendingBlocked ? "待开发" : blocked.old_status === "待准备"
     ? "待开发" : TEMPORARY_RESTORE.get(blocked.old_status);
-  const conditions = d01Blocked || d09Blocked || verifiedDevBlock || d08PendingBlocked ? [] : developerPause
+  const conditions = d01Blocked || d09Blocked || verifiedDevBlock || d01ReentryBlocked || d08PendingBlocked ? [] : developerPause
     ? [{ kind: "dependency_completed", taskId: blocked.metadata?.requiredTask }]
     : blocked.metadata?.conditions;
-  if (!target || !Array.isArray(conditions) || (!d01Blocked && !d09Blocked && !verifiedDevBlock && !d08PendingBlocked && !conditions.length)
+  if (!target || !Array.isArray(conditions) || (!d01Blocked && !d09Blocked && !verifiedDevBlock && !d01ReentryBlocked && !d08PendingBlocked && !conditions.length)
     || conditions.length > 8) return null;
   if ((await store.stopState(projectId, task.id)).stopRequested) return null;
   const lastFailure = history.findLastIndex((event) =>
@@ -494,7 +529,7 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
       hardDependencyBlockers(task, byId).length) return null;
     try {
       await assertDeveloperClaimExclusive(store, projectId, context, { tasks }, task,
-        "task-scan", "auto-unblock", false, !(d01Blocked || d09Blocked || verifiedDevBlock || d08PendingBlocked));
+        "task-scan", "auto-unblock", false, !(d01Blocked || d09Blocked || verifiedDevBlock || d01ReentryBlocked || d08PendingBlocked));
     } catch (error) {
       if (["CLAIM_WRITE_CONFLICT", "CLAIM_DEVELOPER_BUSY"].includes(error.code)) return null;
       throw error;

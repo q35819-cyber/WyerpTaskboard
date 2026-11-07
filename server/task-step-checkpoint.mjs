@@ -333,6 +333,58 @@ export class TaskStepCheckpoint {
           record.stepId === "D01_CLAIM" && record.result === "PASS");
         const alreadyRestarted = state.records.some((record) =>
           record.stepId === "D01_CLAIM" && record.eventId === currentClaim?.event_id);
+        // Reopen only a new, committed machine recovery after the prior D07 BLOCK.
+        if (modern && result === "PASS" && state.cursors.developer_ai === "D07_TEST_3"
+          && currentClaim?.event_id === eventId && currentClaim.actor_id === actorId
+          && currentClaim.session_id === sessionId && currentClaim.old_status === "待开发"
+          && currentClaim.new_status === "开发中" && task.status === "开发中"
+          && task.sessionId === sessionId && previouslyStarted && !alreadyRestarted
+          && !(await this.taskStore.stopState(projectId, taskId)).stopRequested
+          && await hardDependenciesCompleted(this.taskStore, projectId, task)) {
+          const restoredIndex = history.findLastIndex((e, i) => i < currentClaimIndex
+            && e.event_type === "auto_unblock" && e.actor_type === "system"
+            && e.actor_id === "task-scan" && e.old_status === "阻断" && e.new_status === "待开发");
+          const restored = history[restoredIndex];
+          const failedBlock = history.find((e) => e.event_id === restored?.metadata?.blockedEventId
+            && e.event_type === "developer_d01_reentry_checkpoint_order_blocked");
+          const failedClaim = history.find((e) => e.event_id === failedBlock?.metadata?.newClaimEventId
+            && e.event_type === "claim" && e.actor_type === "developer_ai");
+          const initialUnblock = history.find((e) => e.event_id === failedBlock?.metadata?.autoUnblockEventId);
+          const runnerBlock = history.find((e) => e.event_id === initialUnblock?.metadata?.blockedEventId
+            && e.event_type === "developer_r3_runner_timeout_blocked");
+          const transaction = restored && await this.taskStore.transactions.read(restored.operation_id);
+          const oldD07 = state.records.findLast((r) => r.stepId === "D07_TEST_3"
+            && r.result === "BLOCK" && r.attempt === state.attempts);
+          const controllerReviewed = history.slice(history.indexOf(failedBlock) + 1, restoredIndex)
+            .some((e) => e.event_type === "controller_blocker_resolution_plan"
+              && e.actor_type === "controller_ai" && e.actor_id && e.session_id);
+          if (restored?.operation_id === "auto_unblock." + SHA(projectId + "|" + taskId + "|" + failedBlock?.event_id)
+            && transaction?.state === "committed" && transaction.result?.eventId === restored.event_id
+            && failedBlock?.old_status === "开发中" && failedBlock.new_status === "阻断"
+            && failedBlock.actor_type === "developer_ai" && failedBlock.actor_id === failedClaim?.actor_id
+            && failedBlock.session_id === failedClaim?.session_id
+            && failedBlock.metadata?.failureStage === "D01_CLAIM"
+            && failedBlock.metadata?.failureCode === "CHECKPOINT_STEP_ORDER"
+            && failedBlock.metadata?.oldStep === "D07_TEST_3" && failedBlock.metadata?.oldResult === "BLOCK"
+            && failedBlock.metadata?.sourceChanges === false && failedBlock.metadata?.codeTouched === false
+            && initialUnblock?.event_type === "auto_unblock"
+            && initialUnblock.actor_type === "system" && initialUnblock.actor_id === "task-scan"
+            && runnerBlock?.metadata?.failureStage === "D07_TEST_3"
+            && runnerBlock.metadata?.failureCode === "TEST_RUNNER_30S_SPAWNSYNC_ETIMEDOUT"
+            && oldD07?.actorId === runnerBlock.actor_id && oldD07.sessionId === runnerBlock.session_id
+            && controllerReviewed && history.indexOf(runnerBlock) < history.indexOf(initialUnblock)
+            && history.indexOf(initialUnblock) < history.indexOf(failedClaim)
+            && history.indexOf(failedClaim) < history.indexOf(failedBlock)
+            && history.indexOf(failedBlock) < restoredIndex && restoredIndex < currentClaimIndex
+            && failedClaim.old_status === "待开发" && failedClaim.new_status === "开发中"
+            && failedClaim.session_id !== sessionId
+            && !history.slice(restoredIndex + 1, currentClaimIndex)
+              .some((e) => e.old_status !== e.new_status)) {
+            state.attempts += 1;
+            state.cursors.developer_ai = "D01_CLAIM";
+            state.cursors.test_ai = "Q01_ADMISSION";
+          }
+        }
         // A completed legacy QA pass can leave D09 as the developer cursor.
         // A new controller dispatch and a genuinely fresh claim start a new attempt.
         if (modern && result === "PASS" && state.cursors.developer_ai === "D09_NEXT"
