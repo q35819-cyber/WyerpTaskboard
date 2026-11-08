@@ -703,3 +703,105 @@ test("TaskStore rule-read receipts are session-bound, cannot be forged, and expi
   assert.equal(after.developmentIssue,null);
   assert.equal(after.suspectedDisconnect,false);
 });
+
+test("BLOCK atomically clears developer ownership and rejects stale execution writes", async (t) => {
+  const f=await makeFixture(); t.after(()=>fs.rm(f.boardRoot,{recursive:true,force:true}));
+  const store=await new TaskStore(f.boardRoot).init();
+  const actor={actorType:"developer_ai",actorId:"dev-block",sessionId:"dev-block-session"};
+  const change=async (id,patch,type,operationId,metadata={}) =>
+    store.updateTask("fixture",id,patch,{
+      expectedRevision:(await store.snapshot("fixture")).registryRevision,
+      operationId,eventType:type,...actor,metadata
+    });
+  const claimed=await change("A-10",{
+    status:"开发中",assignee:"dev-block",sessionWindowName:"original",sessionId:actor.sessionId
+  },"claim","block.dev.claim.0001");
+  assert.equal(claimed.after.sessionId,actor.sessionId);
+  await store.appendTaskEvent("fixture","A-10",{
+    operationId:"block.dev.valid.publish.0001",eventType:"code_published",...actor
+  });
+  const blocked=await change("A-10",{status:"阻断"},"developer_step_cursor_blocked",
+    "block.dev.block.0001",{failureCode:"DEPENDENCY_PENDING"});
+  assert.equal(blocked.after.status,"阻断");
+  for(const field of ["assignee","sessionWindowName","sessionId"])assert.equal(blocked.after[field],"");
+  assert.equal((await store.transactions.read("block.dev.block.0001"))?.state,"committed");
+  const baseline=(await store.taskHistory("fixture","A-10",{all:true})).length;
+  for(const type of ["code_published","step_report_complete",
+    "developer_external_issue_reported","suspected_disconnect","developer_issue_resolved"]){
+    await assert.rejects(store.appendTaskEvent("fixture","A-10",{
+      operationId:"block.dev.forbidden."+type,eventType:type,...actor
+    }),e=>e.code==="BLOCKED_SESSION_REVOKED",type);
+  }
+  await assert.rejects(change("A-10",{status:"HOLD"},"developer_user_directed_bugfix_hold",
+    "block.dev.old.session.retake.0001"),e=>e.code==="BLOCKED_SESSION_REVOKED");
+  assert.equal((await store.transactions.read("block.dev.old.session.retake.0001")),null);
+  assert.equal((await store.taskHistory("fixture","A-10",{all:true})).length,baseline);
+  assert.equal((await store.getTask("fixture","A-10")).task.status,"阻断");
+  // Only a trusted controller may requeue; the old Session stays revoked after unblock.
+  await store.updateTask("fixture","A-10",{status:"待开发"},{
+    expectedRevision:(await store.snapshot("fixture")).registryRevision,
+    operationId:"block.dev.controller.requeue.0001",eventType:"controller_rework_requeue",
+    actorType:"controller_ai",actorId:"controller",sessionId:"controller-session"
+  });
+  await assert.rejects(change("A-10",{status:"开发中",assignee:"dev-block",
+    sessionWindowName:"old",sessionId:actor.sessionId},"claim",
+    "block.dev.stale.claim.0001"),e=>e.code==="BLOCKED_SESSION_REVOKED");
+  const afterRequeue=(await store.taskHistory("fixture","A-10",{all:true})).length;
+  await assert.rejects(store.appendTaskEvent("fixture","A-10",{
+    operationId:"block.dev.stale.publish.after.requeue.0001",
+    eventType:"code_published",...actor
+  }),e=>e.code==="BLOCKED_SESSION_REVOKED");
+  assert.equal((await store.taskHistory("fixture","A-10",{all:true})).length,afterRequeue);
+  const freshSession="new-dev-session";
+  const fresh=await store.updateTask("fixture","A-10",{
+    status:"开发中",assignee:"dev-block",sessionWindowName:"new",sessionId:freshSession
+  },{
+    expectedRevision:(await store.snapshot("fixture")).registryRevision,
+    operationId:"block.dev.fresh.claim.0001",eventType:"claim",
+    ...actor,sessionId:freshSession
+  });
+  assert.equal(fresh.after.sessionId,freshSession);
+  await assert.rejects(store.appendTaskEvent("fixture","A-10",{
+    operationId:"block.dev.stale.publish.after.reclaim.0001",
+    eventType:"code_published",...actor
+  }),e=>e.code==="BLOCKED_SESSION_REVOKED");
+  await store.appendTaskEvent("fixture","A-10",{
+    operationId:"block.dev.fresh.publish.0001",
+    eventType:"code_published",...actor,sessionId:freshSession
+  });
+});
+
+test("BLOCK revokes QA Session, rejects impostors, and preserves failed transition atomicity", async (t) => {
+  const f=await makeFixture();t.after(()=>fs.rm(f.boardRoot,{recursive:true,force:true}));
+  const store=await new TaskStore(f.boardRoot).init();
+  const actor={actorType:"test_ai",actorId:"qa-block",sessionId:"qa-block-session"};
+  const change=async (patch,type,operationId,metadata={},by=actor) =>
+    store.updateTask("fixture","T-01",patch,{
+      expectedRevision:(await store.snapshot("fixture")).registryRevision,
+      operationId,eventType:type,...by,metadata
+    });
+  await change({status:"独测中",assignee:"qa-block",
+    sessionWindowName:"qa-window",sessionId:actor.sessionId},"claim","block.qa.claim.0001");
+  const before=(await store.getTask("fixture","T-01")).task;
+  await assert.rejects(change({status:"阻断"},"test_result","block.qa.invalid.0001",{
+    atomicLifecycle:true,testResult:"blocked",reportPath:"reports/T-01/blocked.md"
+  },{...actor,sessionId:"fake-session"}),e=>e.code==="ATOMIC_TEST_RESULT_REQUIRED");
+  const unchanged=(await store.getTask("fixture","T-01")).task;
+  assert.equal(unchanged.status,before.status);
+  assert.equal(unchanged.sessionId,before.sessionId);
+  assert.equal((await store.transactions.read("block.qa.invalid.0001")),null);
+  const blocked=await change({status:"阻断"},"test_result","block.qa.pass.0001",{
+    atomicLifecycle:true,testResult:"blocked",reportPath:"reports/T-01/blocked.md"
+  });
+  for(const field of ["assignee","sessionWindowName","sessionId"])assert.equal(blocked.after[field],"");
+  const count=(await store.taskHistory("fixture","T-01",{all:true})).length;
+  for(const by of [actor,{...actor,actorId:"fake-qa",sessionId:"fake-session"}]){
+    await assert.rejects(store.appendTaskEvent("fixture","T-01",{
+      operationId:"block.qa.invalid.event."+by.actorId,eventType:"step_report_complete",...by
+    }),e=>e.code==="BLOCKED_SESSION_REVOKED");
+    await assert.rejects(change({priority:"P0"},"task_update",
+      "block.qa.invalid.patch."+by.actorId,{},by),e=>e.code==="BLOCKED_SESSION_REVOKED");
+  }
+  assert.equal((await store.taskHistory("fixture","T-01",{all:true})).length,count);
+  assert.equal((await store.getTask("fixture","T-01")).task.status,"阻断");
+});

@@ -1001,6 +1001,23 @@ export class TaskStore {
     }
   }
 
+  async assertNotRevokedByBlock(projectId, taskId, { actorType, sessionId }) {
+    if (!sessionId || !["developer_ai", "test_ai"].includes(actorType)) return;
+    const history = await this.events.listTaskEvents(projectId, taskId, { all: true });
+    let currentClaim = null;
+    for (const event of history) {
+      if (["claim", "takeover"].includes(event.event_type)
+        && ["developer_ai", "test_ai"].includes(event.actor_type)) currentClaim = event;
+      if (event.new_status === "阻断" && event.old_status !== event.new_status
+        && (currentClaim?.session_id === sessionId
+          || (event.actor_type === actorType && event.session_id === sessionId))) {
+        throw new TaskboardError("阻断时已撤销旧执行Session，须用全新合法会话领取", {
+          code: "BLOCKED_SESSION_REVOKED", status: 409
+        });
+      }
+    }
+  }
+
   async snapshot(projectId) {
     const context = await this.projects.context(projectId);
     const parsed = await context.adapter.readMarkdownTaskRegistry(context.registryPath, context.project);
@@ -1139,6 +1156,14 @@ export class TaskStore {
 
       const currentTask = parsed.tasks.find((item) => item.id === taskId);
       if (!currentTask) throw new TaskboardError("未知任务ID: " + taskId, { code: "TASK_NOT_FOUND", status: 404 });
+      if (["developer_ai", "test_ai"].includes(actorType)) {
+        if (currentTask.status === "阻断" && actorType === "test_ai") {
+          throw new TaskboardError("阻断后的旧独测Session不再具备写入资格", {
+            code: "BLOCKED_SESSION_REVOKED", status: 409
+          });
+        }
+        await this.assertNotRevokedByBlock(projectId, taskId, { actorType, sessionId });
+      }
       if (eventType === "auto_unblock") {
         const allowed = await eligibleTemporaryUnblock(this, projectId, currentTask, parsed.tasks, context);
         if (actorType !== "system" || !allowed || patch.status !== allowed.target ||
@@ -1480,6 +1505,18 @@ export class TaskStore {
       const existing = await this.events.findByOperationId(projectId, operationId);
       if (existing) return { event: existing, idempotentReplay: true };
       const { task, snapshot } = await this.getTask(projectId, taskId);
+      const protectedExecutionEvent = ["code_published", "step_report_complete",
+        "developer_issue_resolved", "developer_external_issue_reported",
+        "suspected_disconnect", "test_result", "handoff"].includes(eventType)
+        || eventType.startsWith("developer_step_");
+      if (protectedExecutionEvent && ["developer_ai", "test_ai"].includes(actorType)) {
+        if (task.status === "阻断") {
+          throw new TaskboardError("阻断后的旧执行Session无权提交正式执行事件", {
+            code: "BLOCKED_SESSION_REVOKED", status: 409
+          });
+        }
+        await this.assertNotRevokedByBlock(projectId, taskId, { actorType, sessionId });
+      }
       await this.assertRuleReadForMutation(projectId, taskId, { actorType, actorId, sessionId }, eventType);
       if (expectedRevision !== undefined && expectedRevision !== null && snapshot.registryRevision !== expectedRevision) {
         throw new TaskboardError("任务注册表revision已变化，拒绝追加过期的任务事件", {
@@ -1536,7 +1573,13 @@ export class TaskStore {
       if (!appended.duplicate) await this.rearmScanner("task_event", { projectId, taskId, eventType });
       return { event: appended.event, idempotentReplay: appended.duplicate };
     };
-    return expectedRevision === undefined || expectedRevision === null
+    const protectedExecutionEvent = ["code_published", "step_report_complete",
+      "developer_issue_resolved", "developer_external_issue_reported",
+      "suspected_disconnect", "test_result", "handoff"].includes(eventType)
+      || String(eventType).startsWith("developer_step_");
+    // step_report_complete is already serialized by TaskStepCheckpoint.
+    return ((expectedRevision === undefined || expectedRevision === null)
+      && (!protectedExecutionEvent || eventType === "step_report_complete"))
       ? append()
       : withProjectLock(this.rootDir, projectId, operationId, append);
   }
