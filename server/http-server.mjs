@@ -1,10 +1,12 @@
 import http from "node:http";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { URL } from "node:url";
 import { TaskboardError } from "./core/errors.mjs";
 import { TaskStore, deliveryTakeoverAuthority, verifiedRemoteTakeoverCandidate } from "./task-store.mjs";
+import { TaskStepCheckpoint } from "./task-step-checkpoint.mjs";
 import { deliveryEvidence } from "./candidate-evaluator.mjs";
 import { ErpPassGate } from "./erp-pass-gate.mjs";
 import { AuthManager } from "./auth.mjs";
@@ -251,6 +253,130 @@ function lastResumeTarget(events) {
     if (target) return target;
   }
   return null;
+}
+
+// One evidence contract for both developer handoff and the QA ready queue.
+async function candidateReportFromGit(root, sha, reportPath) {
+  const rel = String(reportPath || "").replaceAll("\\", "/");
+  if (!/^reports\/[A-Za-z0-9._/-]+\.md$/i.test(rel)
+    || rel.split("/").includes("..") || rel.includes("//")) return null;
+  return new Promise(resolve => {
+    const child = spawn("git", ["-C", root, "show", sha + ":" + rel], {
+      windowsHide: true, stdio: ["ignore", "pipe", "ignore"]
+    });
+    const parts = []; let size = 0, done = false;
+    const finish = value => { if (!done) { done = true; resolve(value); } };
+    child.stdout.on("data", chunk => {
+      size += chunk.length;
+      if (size > 2 * 1024 * 1024) { child.kill(); return; }
+      parts.push(chunk);
+    });
+    child.on("error", () => finish(null));
+    child.on("close", code => finish(code === 0 && size > 0 && size <= 2 * 1024 * 1024
+      ? Buffer.concat(parts) : null));
+  });
+}
+
+export async function developerQaProof({ taskStore, rootDir, projectId, taskId, task, history,
+  handoffMetadata = null, actorId = "", sessionId = "", expectedStatus = null,
+  expectedUpdatedAt = null, expectedRevision = null } = {}) {
+  const missing = [];
+  const events = history || await taskStore.taskHistory(projectId, taskId, { all: true });
+  const scanning = handoffMetadata === null;
+  const handoff = scanning ? [...events].reverse().find(e =>
+    e.event_type === "handoff" && e.actor_type === "developer_ai"
+    && e.metadata?.atomicLifecycle === true && e.new_status === task.status) : null;
+  const meta = scanning ? handoff?.metadata || {} : handoffMetadata;
+  actorId = scanning ? handoff?.actor_id || "" : actorId;
+  sessionId = scanning ? handoff?.session_id || "" : sessionId;
+  const cutoff = scanning ? events.indexOf(handoff) : events.length;
+  const before = events.slice(0, Math.max(0, cutoff));
+  const claimIndex = before.findLastIndex(e => ["claim", "takeover"].includes(e.event_type)
+    && e.actor_type === "developer_ai");
+  const claim = before[claimIndex];
+  if (!actorId || !sessionId || !claim || claim.actor_id !== actorId
+    || claim.session_id !== sessionId || claimIndex < 0) {
+    missing.push("缺少本轮合法开发认领或开发Session不一致");
+  }
+  if (scanning) {
+    if (!handoff) missing.push("缺少合法开发handoff事件");
+    if (expectedStatus !== task.status || expectedUpdatedAt !== task.updatedAt)
+      missing.push("QA扫描任务状态或更新时间已过期");
+    if (expectedRevision && (await taskStore.snapshot(projectId)).registryRevision !== expectedRevision)
+      missing.push("QA扫描注册表revision已变化");
+    if (task.assignee || task.sessionId) missing.push("待独测任务仍被会话占用");
+    if (events.slice(cutoff + 1).some(e => e.event_type === "code_change"
+      || e.metadata?.invalidatesTestEvidence === true)) missing.push("交测后代码或证据已发生变更");
+  } else if (!["开发中", "修复中"].includes(task.status)
+    || task.sessionId !== sessionId) {
+    missing.push("正式开发会话已经失权或任务不在开发阶段");
+  }
+  const stop = await taskStore.stopState(projectId, taskId);
+  if (stop.stopRequested) missing.push("用户STOP尚未解除");
+  const resources = await taskStore.testResourceState(projectId, taskId);
+  if (resources.activeCount > 0) missing.push("仍有未清理的测试资源");
+
+  const round = before.slice(Math.max(0, claimIndex));
+  const published = [...round].reverse().find(e => e.event_type === "code_published"
+    && e.actor_type === "developer_ai" && e.actor_id === actorId
+    && e.session_id === sessionId && e.metadata?.remoteVerified === true);
+  const devTest = [...round].reverse().find(e => e.event_type === "test_result"
+    && e.actor_type === "developer_ai" && e.actor_id === actorId
+    && e.session_id === sessionId && e.metadata?.testResult === "pass"
+    && Boolean(e.metadata?.reportPath));
+  const sha = String(meta?.commitSha || published?.metadata?.commitSha || "").toLowerCase();
+  const branch = String(meta?.headBranch || published?.metadata?.headBranch
+    || published?.metadata?.branch || "");
+  const reportPath = String(meta?.reportPath || published?.metadata?.reportPath || "");
+  const reportSha = String(meta?.reportSha256 || published?.metadata?.reportSha256 || "").toLowerCase();
+  const tests = meta?.developerSelfTests || published?.metadata?.developerSelfTests
+    || devTest?.metadata?.developerSelfTests;
+  const modern = /^[a-f0-9]{40}$/.test(sha) && Boolean(branch);
+  if (!modern) missing.push("缺少合法commitSha/headBranch，candidateSha文字不能代替正式Git候选");
+  if (published && (String(published.metadata.commitSha || "").toLowerCase() !== sha
+    || (meta?.commitSha && String(meta.commitSha).toLowerCase() !== sha)
+    || (meta?.reportPath && meta.reportPath !== published.metadata.reportPath)
+    || (meta?.reportSha256 && String(meta.reportSha256).toLowerCase()
+      !== String(published.metadata.reportSha256 || "").toLowerCase()))) {
+    missing.push("开发发布与handoff的Git候选或报告不一致");
+  }
+  if (published && before.slice(before.indexOf(published) + 1).some(e =>
+    e.event_type === "code_change" || e.metadata?.invalidatesTestEvidence === true))
+    missing.push("正式发布后代码或自测证据发生变更");
+  if (!published && !meta?.commitSha) missing.push("缺少code_published或现代Git绑定交接");
+  const steps = await new TaskStepCheckpoint(rootDir, { taskStore }).show(projectId, taskId);
+  const own = steps.state.records.filter(r => r.actorType === "developer_ai"
+    && r.actorId === actorId && r.sessionId === sessionId
+    && r.attempt === steps.state.attempts);
+  for (const id of ["D01_CLAIM", "D05_TEST_1", "D06_TEST_2", "D07_TEST_3"]) {
+    if (!own.some(r => r.stepId === id && r.result === "PASS"))
+      missing.push("缺少本轮正式" + id + " PASS断点");
+  }
+  if (claim && !own.some(r => r.stepId === "D01_CLAIM"
+    && r.result === "PASS" && r.eventId === claim.event_id))
+    missing.push("D01断点未绑定本轮真实claim事件");
+  const completedR3 = Number.isInteger(tests?.R3?.files) && tests.R3.files > 0
+    && tests.R3.failedFiles === 0 && tests.R3.exitCode === 0
+    && tests?.R1?.exitCode === 0 && tests?.R2?.exitCode === 0;
+  if (!completedR3) missing.push("缺少可信R3整仓0失败及三轮开发自测证据");
+  if (!reportPath) missing.push("缺少真实开发自测报告路径");
+  if (!/^[a-f0-9]{64}$/.test(reportSha)) missing.push("缺少绑定候选的报告SHA256");
+  if (!missing.length) {
+    const context = await taskStore.projects.context(projectId);
+    if (!await verifiedRemoteTakeoverCandidate(context.rootRealPath,
+      { commitSha: sha, headBranch: branch })) missing.push("远端origin候选SHA与分支不一致");
+    else {
+      const report = await candidateReportFromGit(context.rootRealPath, sha, reportPath);
+      const reportText = report?.toString("utf8") || "";
+      const lastR3 = (reportText.match(/R3[\s*：:-]*(?:PASS|FAIL)/gi) || []).at(-1) || "";
+      if (!report || createHash("sha256").update(report).digest("hex") !== reportSha
+        || !reportText.includes(taskId)
+        || !/R3[\s*：:-]*PASS/i.test(lastR3)) {
+        missing.push("Git候选中R3报告缺失、SHA256不符或未绑定本任务");
+      }
+    }
+  }
+  return { eligible: missing.length === 0, blockers: missing, candidateSha: missing.length ? null : sha };
 }
 
 export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port = 47831, chatgptMcpExecutorFactory = null, erpPassGateOptions = {} } = {}) {
@@ -769,49 +895,34 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
       if (req.method === "GET" && url.pathname === "/api/task-scan/status") {
         const candidates = await scanStore.list();
         const developerCandidates = candidates.filter((item) => item.eligible_role === "developer_ai" && ["待开发", "待执行", "测试失败待修复", "待准备"].includes(item.status));
-        const qaCandidates = await Promise.all(candidates.filter((item) =>
-          item.eligible_role === "test_ai" && ["待独测", "待复测"].includes(item.status)).map(async (item) => {
-          let evidenceVerified = false, candidateSha = null;
-          if (item.eligible && !item.blockers?.length && !item.stale_at && !item.consumed_at
-            && Date.parse(item.expires_at || "") > Date.now()) {
+        const qaCandidates = await Promise.all(candidates.filter(item =>
+          item.eligible_role === "test_ai" && ["待独测", "待复测"].includes(item.status)).map(async item => {
+          const blockers = [...(item.blockers || [])];
+          let proof = { eligible: false, candidateSha: null, blockers: [] };
+          if (!item.eligible || item.stale_at || item.consumed_at
+            || !(Date.parse(item.expires_at || "") > Date.now())) {
+            if (!blockers.length) blockers.push("候选已过期、已消费或扫描资格不满足");
+          } else {
             try {
-              const { task, snapshot } = await taskStore.getTask(item.project_id, item.task_id);
-              const history = await taskStore.taskHistory(item.project_id, item.task_id, { all: true });
-              const handoff = [...history].reverse().find((event) =>
-                event.event_type === "handoff" && event.actor_type === "developer_ai"
-                && event.new_status === item.status && event.metadata?.atomicLifecycle === true);
-              const index = history.indexOf(handoff), beforeHandoff = history.slice(0, index);
-              const devTest = [...beforeHandoff].reverse().find((event) =>
-                event.event_type === "test_result" && event.actor_type === "developer_ai"
-                && event.actor_id === handoff?.actor_id && event.session_id === handoff?.session_id);
-              const published = [...beforeHandoff].reverse().find((event) =>
-                event.event_type === "code_published" && event.actor_type === "developer_ai"
-                && event.actor_id === handoff?.actor_id && event.session_id === handoff?.session_id
-                && event.metadata?.remoteVerified === true);
-              const sha = handoff?.metadata?.commitSha || published?.metadata?.commitSha;
-              const branch = handoff?.metadata?.headBranch || published?.metadata?.branch;
-              const resources = await taskStore.testResourceState(item.project_id, item.task_id);
-              const stop = await taskStore.stopState(item.project_id, item.task_id);
-              evidenceVerified = Boolean(index >= 0 && task.status === item.status
-                && task.updatedAt === item.task_updated_at && snapshot.registryRevision === item.registry_revision
-                && !task.assignee && !task.sessionId && resources.activeCount === 0 && !stop.stopRequested
-                && devTest?.metadata?.testResult === "pass" && devTest?.metadata?.reportPath
-                && /^[a-f0-9]{40}$/i.test(String(sha || ""))
-                && /^[A-Za-z0-9][A-Za-z0-9._/-]{0,190}$/.test(String(branch || ""))
-                && !String(branch).includes("..") && !String(branch).includes("//")
-                && published?.metadata?.commitSha === sha
-                && /^[a-f0-9]{64}$/i.test(String(published?.metadata?.reportSha256 || ""))
-                && published?.metadata?.reportPath
-                && (!handoff?.metadata?.commitSha || handoff.metadata.commitSha === sha)
-                && !history.slice(index + 1).some((event) =>
-                  event.event_type === "code_change" || event.metadata?.invalidatesTestEvidence === true));
-              if (evidenceVerified) candidateSha = sha;
-            } catch { evidenceVerified = false; }
+              const { task } = await taskStore.getTask(item.project_id, item.task_id);
+              proof = await developerQaProof({
+                taskStore, rootDir, projectId: item.project_id, taskId: item.task_id, task,
+                expectedStatus: item.status, expectedUpdatedAt: item.task_updated_at,
+                expectedRevision: item.registry_revision
+              });
+            } catch {
+              proof = { eligible: false, candidateSha: null, blockers: ["无法读取可信任务或开发候选证据"] };
+            }
           }
-          return { projectId: item.project_id, taskId: item.task_id, status: item.status,
-            taskUpdatedAt: item.task_updated_at, candidateSha,
-            eligible: Boolean(item.eligible && evidenceVerified), evidenceVerified,
-            blockers: evidenceVerified ? [] : [...(item.blockers || []), "独测候选证据或实时准入未通过"] };
+          blockers.push(...proof.blockers);
+          return {
+            projectId: item.project_id, taskId: item.task_id, status: item.status,
+            taskUpdatedAt: item.task_updated_at,
+            candidateSha: proof.eligible && !blockers.length ? proof.candidateSha : null,
+            eligible: Boolean(item.eligible && proof.eligible && !blockers.length),
+            evidenceVerified: Boolean(proof.eligible && !blockers.length),
+            blockers
+          };
         }));
         const verifiedCandidates = candidates.map((item) => item.eligible_role === "test_ai"
           ? { ...item, eligible: qaCandidates.find((candidate) =>
@@ -1350,6 +1461,15 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         requireCurrentExecutionSession(task, body, {
           actorType,
           allowedStatuses: ["开发中", "修复中"]
+        });
+        const proof = await developerQaProof({
+          taskStore, rootDir, projectId: params.projectId, taskId: params.taskId, task,
+          actorId: body.actorId, sessionId: body.sessionId,
+          handoffMetadata: body.metadata || {}
+        });
+        if (!proof.eligible) throw new TaskboardError("开发交接缺少可信独测候选证据，保留原开发会话补齐", {
+          code: "DEVELOPER_QA_EVIDENCE_INCOMPLETE", status: 409,
+          details: { missing: proof.blockers }
         });
         const target = developerCompletionTarget(task.status);
         context.workflow.assertTransition(task.status, target.status);

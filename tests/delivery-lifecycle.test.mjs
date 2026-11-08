@@ -595,3 +595,159 @@ test("R1 controller HTTP endpoint validates and performs a real conflict rework"
     await new Promise(resolve => app.server.close(resolve));
   }
 });
+
+test("P0 QA evidence parity: reject missing proof before releasing developer and accept committed modern proof", async t => {
+  const crypto = await import("node:crypto");
+  const { createTaskboardServer, developerQaProof } = await import("../server/http-server.mjs");
+  const f = await makeFixture();
+  t.after(() => fs.rm(f.boardRoot, { recursive: true, force: true }));
+  const store = await new TaskStore(f.boardRoot).init();
+  const taskId = "B-10", actorId = "worker", sessionId = "wc_sess_test";
+  const bare = path.join(f.boardRoot, "remote.git");
+  await execFileAsync("git", ["init", "--bare", "--initial-branch=main", bare]);
+  await git(f.projectRoot, "init", "--initial-branch=main");
+  await git(f.projectRoot, "config", "user.name", "QA Proof Fixture");
+  await git(f.projectRoot, "config", "user.email", "qa-proof@example.test");
+  await git(f.projectRoot, "add", "-A");
+  await git(f.projectRoot, "commit", "-m", "base");
+  await git(f.projectRoot, "remote", "add", "origin", bare);
+  await git(f.projectRoot, "push", "-u", "origin", "main");
+  await execFileAsync("git", ["--git-dir", bare, "symbolic-ref", "HEAD", "refs/heads/main"]);
+  await git(f.projectRoot, "checkout", "-b", "feature/qa-proof");
+  const reportPath = "reports/B-10/developer-R1-R3.md";
+  const report = "B-10\nR1 PASS\nR2 PASS\nR3 PASS\n整仓 62 files 0 fail\n";
+  await fs.mkdir(path.dirname(path.join(f.projectRoot, reportPath)), { recursive: true });
+  await fs.writeFile(path.join(f.projectRoot, reportPath), report, "utf8");
+  await git(f.projectRoot, "add", "-A");
+  await git(f.projectRoot, "commit", "-m", "QA evidence candidate");
+  const sha = await git(f.projectRoot, "rev-parse", "HEAD");
+  await git(f.projectRoot, "push", "-u", "origin", "feature/qa-proof");
+  const reportSha256 = crypto.createHash("sha256").update(report).digest("hex");
+  const claimed = await store.appendTaskEvent("fixture", taskId, {
+    operationId: "qa.proof.developer.claim", eventType: "claim",
+    actorType: "developer_ai", actorId, sessionId
+  });
+  const checkpoint = {
+    version: 1, projectId: "fixture", taskId, flowVersion: "role-steps-v2",
+    cursors: { controller_ai: "C00_A_REQUIREMENTS", developer_ai: "D08_HANDOFF", test_ai: "Q01_ADMISSION" },
+    attempts: 1,
+    records: ["D01_CLAIM","D02_WORKTREE","D03_WRITE_SCOPE","D04_IMPLEMENT",
+      "D05_TEST_1","D06_TEST_2","D07_TEST_3"].map(stepId => ({
+      stepId, result: "PASS", actorType: "developer_ai", actorId, sessionId, attempt: 1,
+      eventId: stepId === "D01_CLAIM" ? claimed.event.event_id : null,
+      evidence: stepId === "D07_TEST_3" ? "npm test 62 files 0 failed R3 PASS" : "fixture evidence"
+    })),
+    lastAction: { stepId: "D07_TEST_3", result: "PASS" }
+  };
+  await fs.mkdir(path.join(f.projectRoot, "cp"), { recursive: true });
+  await fs.writeFile(path.join(f.projectRoot, "cp", taskId + ".md"),
+    "<!-- TASK_STEP_CHECKPOINT_START v1 -->\n" + JSON.stringify(checkpoint) +
+    "\n<!-- TASK_STEP_CHECKPOINT_END -->\n");
+  const app = await createTaskboardServer({ rootDir: f.boardRoot, host: "127.0.0.1", port: 0 });
+  await new Promise(resolve => app.server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => new Promise(resolve => app.server.close(resolve)));
+  const secret = JSON.parse(await fs.readFile(path.join(f.boardRoot, "config", "admin-secret.json"), "utf8")).adminSecret;
+  const url = "http://127.0.0.1:" + app.server.address().port +
+    "/api/projects/fixture/tasks/" + taskId;
+  const headers = { Authorization: "Bearer " + secret, "Content-Type": "application/json" };
+  const request = async (id, metadata) => {
+    const before = await (await fetch(url, { headers })).json();
+    const response = await fetch(url + "/complete-execution", {
+      method: "POST", headers, body: JSON.stringify({
+        operationId: id, expectedRevision: before.registryRevision,
+        actorType: "developer_ai", actorId, sessionId, metadata
+      })
+    });
+    return { status: response.status, body: await response.json() };
+  };
+  const rejected = await request("qa.proof.missing", {});
+  assert.equal(rejected.status, 409, JSON.stringify(rejected.body).slice(0, 350));
+  assert.equal(rejected.body.error.code, "DEVELOPER_QA_EVIDENCE_INCOMPLETE");
+  assert.match(JSON.stringify(rejected.body.error.details), /commitSha|自测|报告/);
+  const unchanged = await (await fetch(url, { headers })).json();
+  assert.equal(unchanged.status, "开发中");
+  assert.equal(unchanged.sessionId, sessionId);
+  const developerSelfTests = { R1: { exitCode: 0, passes: 4 },
+    R2: { exitCode: 0, passes: 5 },
+    R3: { exitCode: 0, files: 62, failedFiles: 0 } };
+  const proof = { commitSha: sha, headBranch: "feature/qa-proof",
+    reportPath, reportSha256, developerSelfTests };
+  const badRemote = await request("qa.proof.fake.sha", { ...proof, commitSha: "a".repeat(40) });
+  assert.equal(badRemote.status, 409);
+  assert.match(JSON.stringify(badRemote.body.error.details), /远端origin/);
+  const missingR3 = await request("qa.proof.r3.missing", {
+    ...proof, developerSelfTests: { ...developerSelfTests, R3: { files: 0, failedFiles: 0, exitCode: 0 } }
+  });
+  assert.equal(missingR3.status, 409);
+  assert.match(JSON.stringify(missingR3.body.error.details), /R3/);
+  const verified = await request("qa.proof.valid", proof);
+  assert.equal(verified.status, 200, JSON.stringify(verified.body).slice(0, 450));
+  assert.equal(verified.body.after.status, "待独测");
+  assert.equal(verified.body.after.assignee, "");
+  assert.equal(verified.body.after.sessionId, "");
+  const finished = await store.getTask("fixture", taskId);
+  const eligible = await developerQaProof({
+    taskStore: store, rootDir: f.boardRoot, projectId: "fixture", taskId, task: finished.task,
+    expectedStatus: "待独测", expectedUpdatedAt: finished.task.updatedAt,
+    expectedRevision: finished.snapshot.registryRevision
+  });
+  assert.equal(eligible.eligible, true, JSON.stringify(eligible.blockers));
+  assert.equal(eligible.candidateSha, sha);
+  const { ScanStore } = await import("../server/scan-store.mjs");
+  const scanStore = await new ScanStore(f.boardRoot).init();
+  await scanStore.writeState({ version: 1, candidates: {
+    qaFixture: {
+      detection_id: "det_fixture_qa", project_id: "fixture", task_id: taskId,
+      track: "infrastructure", priority: "P0", status: "待独测",
+      planned_role: "独立测试AI", eligible_role: "test_ai",
+      eligible: true, blockers: [], reason: "等待独测", dedupe_key: "fixture_qa",
+      task_updated_at: finished.task.updatedAt,
+      registry_revision: finished.snapshot.registryRevision,
+      expires_at: new Date(Date.now() + 600000).toISOString(),
+      consumed_at: null, stale_at: null
+    }
+  } });
+  const qaStatus = await (await fetch("http://127.0.0.1:" +
+    app.server.address().port + "/api/task-scan/status", { headers })).json();
+  assert.equal(qaStatus.qaCandidates.length, 1);
+  assert.equal(qaStatus.qaCandidates[0].eligible, true);
+  assert.equal(qaStatus.qaCandidates[0].candidateSha, sha);
+  assert.equal(qaStatus.qaCandidates[0].blockers.length, 0);
+  const stoppedStore = Object.create(store);
+  stoppedStore.stopState = async () => ({ stopRequested: true });
+  const stopped = await developerQaProof({
+    taskStore: stoppedStore, rootDir: f.boardRoot, projectId: "fixture",
+    taskId, task: finished.task
+  });
+  assert.equal(stopped.eligible, false);
+  assert.match(stopped.blockers.join(" "), /STOP/);
+  const activeStore = Object.create(store);
+  activeStore.testResourceState = async () => ({ activeCount: 1 });
+  const active = await developerQaProof({
+    taskStore: activeStore, rootDir: f.boardRoot, projectId: "fixture",
+    taskId, task: finished.task
+  });
+  assert.equal(active.eligible, false);
+  assert.match(active.blockers.join(" "), /资源/);
+  const outdated = await developerQaProof({
+    taskStore: store, rootDir: f.boardRoot, projectId: "fixture", taskId, task: finished.task,
+    expectedStatus: "待独测", expectedUpdatedAt: "2020-01-01T00:00:00Z"
+  });
+  assert.equal(outdated.eligible, false);
+  assert.match(outdated.blockers.join(" "), /过期/);
+  await store.appendTaskEvent("fixture", taskId, {
+    operationId: "qa.proof.code.changed", eventType: "code_change",
+    actorType: "developer_ai", actorId, sessionId,
+    metadata: { invalidatesTestEvidence: true }
+  });
+  const invalidated = await developerQaProof({
+    taskStore: store, rootDir: f.boardRoot, projectId: "fixture", taskId,
+    task: (await store.getTask("fixture", taskId)).task
+  });
+  assert.equal(invalidated.eligible, false);
+  assert.match(invalidated.blockers.join(" "), /变更/);
+  const afterChange = await (await fetch("http://127.0.0.1:" +
+    app.server.address().port + "/api/task-scan/status", { headers })).json();
+  assert.equal(afterChange.qaCandidates[0].eligible, false);
+  assert.match(afterChange.qaCandidates[0].blockers.join(" "), /变更/);
+});
