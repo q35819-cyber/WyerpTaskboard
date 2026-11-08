@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs/promises";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { randomUUID, randomBytes } from "node:crypto";
 import { logCliError } from "./cli-event-log.mjs";
 
 const rootDir = process.env.WYERP_TASKBOARD_ROOT || "D:\\WyerpTaskboard";
@@ -320,6 +320,58 @@ try {
     if (result.stopRequested) process.exitCode = 3;
     else if (result.userMessages?.requiresAcknowledgement) process.exitCode = 4;
     else if (result.requirements?.pendingCount > 0) process.exitCode = 5;
+  } else if (command === "preclaim-reserve" || command === "preclaim-next") {
+    const project = explicitProject(args);
+    const who = actor(args, args["actor-type"] || "developer_ai");
+    required(args, "actor-id"); required(args, "session-id");
+    const snapshot = await request("/api/projects/" + encodeURIComponent(project) + "/tasks");
+    const candidates = command === "preclaim-reserve"
+      ? [required(args, "task")]
+      : (snapshot.tasks || []).filter((t) => !t.assignee && !t.sessionId
+        && (who.actorType === "test_ai"
+          ? ["待独测", "待复测"].includes(t.status)
+          : ["待开发", "待准备", "待执行", "测试失败待修复"].includes(t.status)))
+        .sort((a, b) => {
+          const weight = (t) => (t.priority === "P0" && t.track === "bugfix" ? 0
+            : t.priority === "P0" ? 1 : t.track === "bugfix" ? 2 : 3);
+          return weight(a) - weight(b) || a.id.localeCompare(b.id);
+        }).map((t) => t.id);
+    const rejected = [];
+    let secured = null;
+    for (const task of candidates) {
+      const token = command === "preclaim-reserve" && args.token
+        ? args.token : randomBytes(24).toString("hex");
+      try {
+        const result = await request("/api/projects/" + encodeURIComponent(project)
+          + "/tasks/" + encodeURIComponent(task) + "/preclaim-lease", {
+            method: "POST", body: {
+              operationId: operationId(args, "preclaim_lease"),
+              expectedRevision: snapshot.registryRevision,
+              actorType: who.actorType, actorId: who.actorId, sessionId: who.sessionId, token
+            }
+          });
+        secured = { taskId: task, ...result }; break;
+      } catch (error) {
+        rejected.push({ taskId: task, code: error.code || "PRECLAIM_FAILED" });
+        if (command === "preclaim-reserve" || ![409, 423].includes(error.status)) throw error;
+      }
+    }
+    output(secured || { reserved: false, tried: candidates.length, rejected,
+      nextAction: "本轮无可短占候选，不可虚构claim或旧Session授权" });
+  } else if (command === "preclaim-release") {
+    const { project, task } = projectTask(args);
+    const who = actor(args, args["actor-type"] || "developer_ai");
+    required(args, "actor-id"); required(args, "session-id");
+    output(await request("/api/projects/" + encodeURIComponent(project)
+      + "/tasks/" + encodeURIComponent(task) + "/preclaim-lease/release", {
+        method: "POST", body: {
+          operationId: operationId(args, "preclaim_release"),
+          actorType: who.actorType, actorId: who.actorId, sessionId: who.sessionId,
+          token: required(args, "token"),
+          failureCode: args["failure-code"] || "", note: args.note || "",
+          relatedTaskIds: (args["related-tasks"] || "").split(",").filter(Boolean)
+        }
+      }));
   } else if (command === "preclaim-report") {
     const { project, task } = projectTask(args);
     const actorType = args["actor-type"] || "developer_ai";
@@ -487,19 +539,39 @@ try {
     const { project, task } = projectTask(args);
     required(args, "actor-id");
     const before = await current(project, task);
-    output(await request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task) + "/claim", {
-      method: "POST",
-      body: {
-        operationId: operationId(args, "claim"),
-        expectedRevision: before.registryRevision,
-        assignee: required(args, "assignee"),
-        sessionWindowName: required(args, "session-name"),
-        sessionId: required(args, "session-id"),
-        targetStatus: args["target-status"] || undefined,
-        ...actor(args, args["actor-type"] || "developer_ai"),
-        metadata: metadata(args)
+    const who = actor(args, args["actor-type"] || "developer_ai");
+    let claimed;
+    try {
+      claimed = await request("/api/projects/" + encodeURIComponent(project)
+        + "/tasks/" + encodeURIComponent(task) + "/claim", {
+        method: "POST", body: {
+          operationId: operationId(args, "claim"),
+          expectedRevision: before.registryRevision,
+          assignee: required(args, "assignee"),
+          sessionWindowName: required(args, "session-name"),
+          sessionId: required(args, "session-id"),
+          targetStatus: args["target-status"] || undefined,
+          ...who, metadata: metadata(args),
+          preclaimLeaseToken: args["preclaim-token"] || undefined
+        }
+      });
+    } catch (error) {
+      if (args["preclaim-token"]) {
+        try {
+          await request("/api/projects/" + encodeURIComponent(project)
+            + "/tasks/" + encodeURIComponent(task) + "/preclaim-lease/release", {
+            method: "POST", body: {
+              operationId: "preclaim_failure." + randomUUID(),
+              ...who, token: args["preclaim-token"],
+              failureCode: error.code || "CLAIM_FAILED",
+              note: String(error.message || "claim资格核查失败").slice(0, 800)
+            }
+          });
+        } catch (releaseError) { error.releaseCode = releaseError.code || "RELEASE_FAILED"; }
       }
-    }));
+      throw error;
+    }
+    output(claimed);
   } else if (command === "priority") {
     const { project, task } = projectTask(args);
     await preflight(project, task, args);

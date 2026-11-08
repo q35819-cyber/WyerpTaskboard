@@ -1299,6 +1299,34 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         });
       }
 
+      params = routeMatch(url.pathname, "/api/projects/:projectId/tasks/:taskId/preclaim-lease");
+      if (req.method === "POST" && params) {
+        requireTrustedApiIdentity(identity);
+        const body = await readJson(req);
+        requireOperation(body); requireExpectedRevision(body);
+        const actorType = body.actorType || "developer_ai";
+        const result = await taskStore.reservePreclaimLease(params.projectId, params.taskId, {
+          expectedRevision: body.expectedRevision, operationId: body.operationId,
+          actorType, actorId: body.actorId || identity.actorId || "",
+          sessionId: body.sessionId || "", token: body.token
+        });
+        return send(res, 200, result);
+      }
+
+      params = routeMatch(url.pathname, "/api/projects/:projectId/tasks/:taskId/preclaim-lease/release");
+      if (req.method === "POST" && params) {
+        requireTrustedApiIdentity(identity);
+        const body = await readJson(req);
+        requireOperation(body);
+        const result = await taskStore.releasePreclaimLease(params.projectId, params.taskId, {
+          operationId: body.operationId, actorType: body.actorType,
+          actorId: body.actorId || identity.actorId || "", sessionId: body.sessionId,
+          token: body.token, failureCode: body.failureCode || "",
+          note: body.note || "", relatedTaskIds: body.relatedTaskIds || []
+        });
+        return send(res, 200, result);
+      }
+
       params = routeMatch(url.pathname, "/api/projects/:projectId/tasks/:taskId/events");
       if (req.method === "POST" && params) {
         requireTrustedApiIdentity(identity);
@@ -1681,7 +1709,8 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           operationId: body.operationId,
           eventType: "claim",
           ...actorOptions(identity, { ...body, actorType: body.actorType || "developer_ai" }),
-          metadata: { ...(body.metadata || {}), claimedFromStatus: task.status }
+          metadata: { ...(body.metadata || {}), claimedFromStatus: task.status,
+            ...(body.preclaimLeaseToken ? { preclaimLeaseToken: body.preclaimLeaseToken } : {}) }
         });
         return send(res, 200, result);
       }
