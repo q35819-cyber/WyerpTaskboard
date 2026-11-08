@@ -2350,3 +2350,112 @@ test("P0 manual D09 ordinary claim denies missing root and fake controller appro
     assert.equal((await x.cp.show("fixture","A-10")).sha256,before.sha256,name);
   }
 });
+
+async function manualD07ReentryFixture(t, opts={}) {
+  const f=await makeFixture();
+  t.after(()=>fs.rm(f.boardRoot,{recursive:true,force:true}));
+  const row=["A-10","F-D07","bugfix","P0","待开发","开发AI","—","—","—",
+    "2026-11-08T00:00:00Z","D07 trusted manual-unblock reentry","plan.md","cp/A-10.md"];
+  let registry=registryText([row]);
+  await fs.writeFile(f.registryPath,registry,"utf8");
+  const taskStore=await new TaskStore(f.boardRoot).init();
+  const cp=await new TaskStepCheckpoint(f.boardRoot,{taskStore,flowVersion:"role-steps-v2"}).init();
+  const update=async(patch,eventType,actorType,actorId,sessionId)=>{
+    return taskStore.updateTask("fixture","A-10",patch,{
+      operationId:"fixture.manualD07."+String(sequence++).padStart(8,"0"),
+      expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      eventType,actorType,actorId,sessionId
+    });
+  };
+  await taskStore.appendTaskEvent("fixture","A-10",{
+    operationId:"fixture.manualD07.dispatch."+String(sequence++).padStart(8,"0"),
+    eventType:"controller_dispatch",actorType:"controller_ai",
+    actorId:"controller",sessionId:"controller-session"
+  });
+  const oldClaim=await update({status:"开发中",assignee:"old-developer",
+    sessionWindowName:"old",sessionId:"old-session"},"claim","developer_ai","old-developer","old-session");
+  const blocked=await update({status:"阻断"},"developer_external_issue_pause",
+    opts.wrongBlockActor?"controller_ai":"developer_ai",
+    opts.wrongBlockActor?"controller":"old-developer",
+    opts.wrongBlockActor?"controller-session":"old-session");
+  if(opts.noManual||opts.fakeManual||opts.wrongController){
+    await update({status:"待开发"},"controller_other_requeue",
+      "controller_ai","controller","controller-session");
+    if(opts.fakeManual||opts.wrongController){
+      await taskStore.events.append("fixture",{
+        operation_id:"fixture.fake.manual."+String(sequence++).padStart(8,"0"),
+        project_id:"fixture",task_id:"A-10",
+        event_type:"controller_verified_manual_unblock",
+        actor_type:opts.wrongController?"developer_ai":"controller_ai",
+        actor_id:opts.wrongController?"old-developer":"controller",
+        session_id:opts.wrongController?"old-session":"controller-session",
+        old_status:"阻断",new_status:"待开发",metadata:{}
+      });
+    }
+  }else{
+    await update({status:"待开发"},"controller_verified_manual_unblock",
+      "controller_ai","controller","controller-session");
+  }
+  const actorId="new-developer",sessionId=opts.oldSession?"old-session":"new-session";
+  const newClaim=await update({status:"开发中",assignee:actorId,sessionWindowName:"new",sessionId},
+    "claim","developer_ai",actorId,sessionId);
+  if(opts.dependency)await fs.writeFile(f.registryPath,
+    (await fs.readFile(f.registryPath,"utf8")).replace("read/A-10.md","ROOT-NOT-DONE完成"),"utf8");
+  if(opts.stop)await taskStore.appendTaskEvent("fixture","A-10",{
+    operationId:"fixture.manualD07.stop."+String(sequence++).padStart(8,"0"),
+    eventType:"stop_request",actorType:"user",actorId:"user",note:"STOP"
+  });
+  const state={version:1,projectId:"fixture",taskId:"A-10",flowVersion:"role-steps-v2",
+    cursors:{controller_ai:"C00_A_REQUIREMENTS",developer_ai:"D07_TEST_3",test_ai:"Q01_ADMISSION"},
+    attempts:1,records:[
+      {stepId:"D01_CLAIM",actorType:"developer_ai",actorId:"old-developer",
+        sessionId:"old-session",result:"PASS",attempt:1,eventId:oldClaim.eventId},
+      {stepId:"D07_TEST_3",actorType:"developer_ai",actorId:"old-developer",
+        sessionId:"old-session",result:opts.oldD07Pass?"PASS":"BLOCK",attempt:1,
+        at:"2026-11-08T00:00:00.000Z"}
+    ],lastAction:{stepId:"D07_TEST_3",result:opts.oldD07Pass?"PASS":"BLOCK"}};
+  await fs.writeFile(path.join(f.projectRoot,"cp","A-10.md"),
+    "## preserved old D07\n<!-- TASK_STEP_CHECKPOINT_START v1 -->\n"+
+    JSON.stringify(state,null,2)+"\n<!-- TASK_STEP_CHECKPOINT_END -->\n","utf8");
+  return {cp,taskStore,f,oldClaim,blocked,newClaim,actorId,sessionId};
+}
+
+test("P0 committed controller manual-unblock old D07 BLOCK opens exactly one D01 then D02",async t=>{
+  const x=await manualD07ReentryFixture(t);
+  const before=await x.cp.show("fixture","A-10");
+  assert.equal(before.state.cursors.developer_ai,"D07_TEST_3");
+  const recovered=await step(x.cp,"developer_ai","D01_CLAIM",{
+    actorId:x.actorId,sessionId:x.sessionId,eventId:x.newClaim.eventId
+  });
+  assert.equal(recovered.state.attempts,2);
+  assert.equal(recovered.state.cursors.developer_ai,"D02_WORKTREE");
+  assert.equal(recovered.state.cursors.test_ai,"Q01_ADMISSION");
+  assert.equal(recovered.state.records.find(r=>r.stepId==="D07_TEST_3").result,"BLOCK");
+  await step(x.cp,"developer_ai","D02_WORKTREE",{
+    actorId:x.actorId,sessionId:x.sessionId
+  });
+  await assert.rejects(step(x.cp,"developer_ai","D01_CLAIM",{
+    actorId:x.actorId,sessionId:x.sessionId,eventId:x.newClaim.eventId
+  }),e=>e.code==="CHECKPOINT_STEP_ORDER");
+});
+
+test("P0 manual D07 reentry rejects uncommitted forged restore, wrong role, old session, STOP and dependencies",async t=>{
+  for(const [label,variant] of [
+    ["missing manual restore",{noManual:true}],
+    ["uncommitted forged manual",{fakeManual:true}],
+    ["wrong controller role",{wrongController:true}],
+    ["wrong source BLOCK actor",{wrongBlockActor:true}],
+    ["no D07 BLOCK",{oldD07Pass:true}],
+    ["reused old Session",{oldSession:true}],
+    ["STOP",{stop:true}],
+    ["unfinished dependency",{dependency:true}]
+  ]){
+    const x=await manualD07ReentryFixture(t,variant);
+    const before=await x.cp.show("fixture","A-10");
+    await assert.rejects(step(x.cp,"developer_ai","D01_CLAIM",{
+      actorId:x.actorId,sessionId:x.sessionId,eventId:x.newClaim.eventId
+    }),e=>["CHECKPOINT_STEP_ORDER","CHECKPOINT_PREDECESSOR_REQUIRED",
+      "CHECKPOINT_SESSION_MISMATCH"].includes(e.code),label);
+    assert.equal((await x.cp.show("fixture","A-10")).sha256,before.sha256,label);
+  }
+});

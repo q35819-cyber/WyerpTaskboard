@@ -554,6 +554,69 @@ export class TaskStepCheckpoint {
           state.cursors.developer_ai = "D01_CLAIM";
           state.cursors.test_ai = "Q01_ADMISSION";
         }
+        // Only a committed controller unblock of this very D07 BLOCK may begin a new attempt.
+        if (modern && result === "PASS" && state.cursors.developer_ai === "D07_TEST_3"
+          && currentClaim?.event_type === "claim" && currentClaim.event_id === eventId
+          && currentClaim.actor_id === actorId && currentClaim.session_id === sessionId
+          && currentClaim.old_status === "待开发" && currentClaim.new_status === "开发中"
+          && task.status === "开发中" && task.sessionId === sessionId
+          && previouslyStarted && !alreadyRestarted
+          && !(await this.taskStore.stopState(projectId, taskId)).stopRequested
+          && await hardDependenciesCompleted(this.taskStore, projectId, task)) {
+          const oldD07 = state.records.findLast(r => r.stepId === "D07_TEST_3"
+            && r.attempt === state.attempts && r.result === "BLOCK");
+          const manualIndex = history.findLastIndex((e, i) => i < currentClaimIndex
+            && e.event_type === "controller_verified_manual_unblock");
+          const manual = history[manualIndex];
+          const blockedIndex = history.findLastIndex((e, i) => i < manualIndex
+            && e.new_status === "阻断" && e.old_status === "开发中"
+            && e.actor_type === "developer_ai");
+          const blocked = history[blockedIndex];
+          const blockedClaim = history.slice(0, blockedIndex).findLast(e =>
+            ["claim", "takeover"].includes(e.event_type) && e.actor_type === "developer_ai"
+            && e.actor_id === blocked?.actor_id && e.session_id === blocked?.session_id);
+          if (oldD07 && blocked && blockedClaim
+            && manual?.actor_type === "controller_ai" && manual.actor_id && manual.session_id
+            && manual.old_status === "阻断" && manual.new_status === "待开发"
+            && manual.project_id === projectId && manual.task_id === taskId
+            && blocked.project_id === projectId && blocked.task_id === taskId
+            && blocked.session_id !== sessionId && oldD07.sessionId !== sessionId
+            && Date.parse(oldD07.at) <= Date.parse(blocked.timestamp)
+            && history.slice(blockedIndex + 1, manualIndex).every(e =>
+              !e.old_status || e.old_status === e.new_status)
+            && history.slice(manualIndex + 1, currentClaimIndex).every(e =>
+              !e.old_status || e.old_status === e.new_status)) {
+            const [blockTx, manualTx, claimTx] = await Promise.all([
+              this.taskStore.transactions.read(blocked.operation_id),
+              this.taskStore.transactions.read(manual.operation_id),
+              this.taskStore.transactions.read(currentClaim.operation_id)
+            ]);
+            const committed = (tx, event) => tx?.state === "committed"
+              && tx.result?.eventId === event.event_id
+              && tx.event?.task_id === taskId && tx.event?.project_id === projectId
+              && tx.event?.event_type === event.event_type
+              && tx.event?.actor_type === event.actor_type
+              && tx.event?.actor_id === event.actor_id
+              && tx.event?.session_id === event.session_id;
+            if (committed(blockTx, blocked) && committed(manualTx, manual)
+              && committed(claimTx, currentClaim)
+              && blockTx.result.before?.sessionId === blocked.session_id
+              && blockTx.result.after?.status === "阻断"
+              && !blockTx.result.after?.sessionId
+              && manualTx.result.before?.status === "阻断"
+              && !manualTx.result.before?.sessionId
+              && manualTx.result.after?.status === "待开发"
+              && !manualTx.result.after?.sessionId
+              && claimTx.result.before?.status === "待开发"
+              && !claimTx.result.before?.sessionId
+              && claimTx.result.after?.status === "开发中"
+              && claimTx.result.after?.sessionId === sessionId) {
+              state.attempts += 1;
+              state.cursors.developer_ai = "D01_CLAIM";
+              state.cursors.test_ai = "Q01_ADMISSION";
+            }
+          }
+        }
         // Reopen only a new, committed machine recovery after the prior D07 BLOCK.
         if (modern && result === "PASS" && state.cursors.developer_ai === "D07_TEST_3"
           && currentClaim?.event_id === eventId && currentClaim.actor_id === actorId
