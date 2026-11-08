@@ -685,6 +685,19 @@ test("P0 QA evidence parity: reject missing proof before releasing developer and
   assert.equal(verified.body.after.status, "待独测");
   assert.equal(verified.body.after.assignee, "");
   assert.equal(verified.body.after.sessionId, "");
+  // The legacy release behavior is still valid *after* a properly evidenced handoff.
+  const afterHandoffRelease = await fetch(url + "/release", {
+    method: "POST", headers, body: JSON.stringify({
+      operationId: "qa.proof.idempotent.release",
+      expectedRevision: verified.body.registryRevision,
+      actorType: "developer_ai", actorId, sessionId: "not-the-old-session"
+    })
+  });
+  const afterHandoffBody = await afterHandoffRelease.json();
+  assert.equal(afterHandoffRelease.status, 200, JSON.stringify(afterHandoffBody).slice(0, 320));
+  assert.equal(afterHandoffBody.after.status, "待独测");
+  assert.equal(afterHandoffBody.after.assignee, "");
+  assert.equal(afterHandoffBody.after.sessionId, "");
   const finished = await store.getTask("fixture", taskId);
   const eligible = await developerQaProof({
     taskStore: store, rootDir: f.boardRoot, projectId: "fixture", taskId, task: finished.task,
