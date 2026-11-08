@@ -402,3 +402,196 @@ test("待交付任务 without valid independent PASS remains visible but is not 
   assert.equal(candidate.eligible, false);
   assert.ok(candidate.blockers.some((item) => item.includes("缺少有效的最新独立测试PASS")));
 });
+
+
+async function mergeConflictFixture(t, { conflict = true, failure = true } = {}) {
+  const x = await deliveryFixture(t, { merged: false, acceptanceScope: "system" });
+  await git(x.fixture.projectRoot, "push", "origin", "feature/delivery");
+  if (conflict) {
+    await fs.writeFile(path.join(x.fixture.projectRoot, "delivery-candidate.js"),
+      "export const deliveryCandidate = false;\n", "utf8");
+    await git(x.fixture.projectRoot, "add", "delivery-candidate.js");
+    await git(x.fixture.projectRoot, "commit", "-m", "main diverges from QA candidate");
+    await git(x.fixture.projectRoot, "push", "origin", "main");
+  }
+  const mainSha = await git(x.fixture.projectRoot, "rev-parse", "HEAD");
+  if (failure) {
+    await x.store.appendTaskEvent("fixture", x.taskId, {
+      operationId: "delivery.rework.attempt.failed.0001",
+      eventType: "delivery_attempt_failed",
+      actorType: "controller_ai", actorId: "controller", sessionId: "ctrl-session",
+      metadata: { failureStage: "merge", candidateSha: x.candidateSha }
+    });
+  }
+  return { ...x, mainSha };
+}
+
+test("R1 real Git merge conflict reopens the original developer and invalidates old QA PASS", async t => {
+  const x = await mergeConflictFixture(t);
+  const result = await x.store.updateTask("fixture", x.taskId, { status: "待开发" }, {
+    expectedRevision: x.snapshot.registryRevision,
+    operationId: "delivery.rework.valid.0001",
+    eventType: "delivery_merge_conflict_rework", actorType: "controller_ai",
+    actorId: "controller", sessionId: "ctrl-session",
+    metadata: { candidateSha: x.candidateSha, mainSha: x.mainSha }
+  });
+  assert.equal(result.before.status, "交付中");
+  assert.equal(result.after.status, "待开发");
+  assert.equal(result.after.plannedRole, "开发AI");
+  assert.equal(result.after.assignee, "");
+  assert.equal(result.after.sessionId, "");
+  const history = await x.store.taskHistory("fixture", x.taskId, { all: true });
+  const rework = history.at(-1);
+  assert.equal(rework.event_type, "delivery_merge_conflict_rework");
+  assert.equal(rework.metadata.mergeConflictVerified, true);
+  assert.equal(rework.metadata.requiresIndependentRetest, true);
+  assert.equal(rework.metadata.originalDeveloperActorId, "developer");
+  assert.ok(rework.metadata.conflictFiles.includes("delivery-candidate.js"));
+  const { deliveryEvidence } = await import("../server/candidate-evaluator.mjs");
+  const context = await x.store.projects.context("fixture");
+  assert.equal(deliveryEvidence(history, context.workflow).valid, false, "Old independent PASS is invalidated");
+  const now = await x.store.getTask("fixture", x.taskId);
+  await assert.rejects(() => x.store.updateTask("fixture", x.taskId, {
+    status: "开发中", assignee: "other", sessionId: "other-session", sessionWindowName: "other"
+  }, {
+    expectedRevision: now.snapshot.registryRevision, operationId: "delivery.rework.wrong.dev.0001",
+    eventType: "claim", actorType: "developer_ai", actorId: "other", sessionId: "other-session"
+  }), e => e.code === "DELIVERY_REWORK_ORIGINAL_DEVELOPER_REQUIRED");
+});
+
+test("R2 without a recorded merge failure or with a spoofed controller the state never changes", async t => {
+  const x = await mergeConflictFixture(t, { failure: false });
+  const run = (actorType, actorId, sessionId, operationId) =>
+    x.store.updateTask("fixture", x.taskId, { status: "待开发" }, {
+      expectedRevision: x.snapshot.registryRevision, operationId,
+      eventType: "delivery_merge_conflict_rework",
+      actorType, actorId, sessionId,
+      metadata: { candidateSha: x.candidateSha, mainSha: x.mainSha }
+    });
+  await assert.rejects(() => run("controller_ai", "controller", "ctrl-session", "delivery.rework.no.failure.0001"),
+    e => e.code === "DELIVERY_REWORK_FAILURE_EVIDENCE_REQUIRED");
+  await assert.rejects(() => run("developer_ai", "developer", "dev-session", "delivery.rework.spoof.0001"),
+    e => e.code === "DELIVERY_REWORK_CONTROLLER_REQUIRED");
+  assert.equal((await x.store.getTask("fixture", x.taskId)).task.status, "交付中");
+});
+
+test("R2 stale main SHA, candidate SHA and absence of conflict fail closed", async t => {
+  const x = await mergeConflictFixture(t);
+  const run = (candidateSha, mainSha, operationId) =>
+    x.store.updateTask("fixture", x.taskId, { status: "待开发" }, {
+      expectedRevision: x.snapshot.registryRevision, operationId,
+      eventType: "delivery_merge_conflict_rework",
+      actorType: "controller_ai", actorId: "controller", sessionId: "ctrl-session",
+      metadata: { candidateSha, mainSha }
+    });
+  await assert.rejects(() => run("a".repeat(40), x.mainSha, "delivery.rework.bad.candidate.0001"),
+    e => e.code === "DELIVERY_REWORK_CANDIDATE_MISMATCH");
+  await assert.rejects(() => run(x.candidateSha, "b".repeat(40), "delivery.rework.stale.main.0001"),
+    e => e.code === "DELIVERY_REWORK_MAIN_STALE");
+  assert.equal((await x.store.getTask("fixture", x.taskId)).task.status, "交付中");
+  const clean = await mergeConflictFixture(t, { conflict: false });
+  await assert.rejects(() => clean.store.updateTask("fixture", clean.taskId, { status: "待开发" }, {
+    expectedRevision: clean.snapshot.registryRevision, operationId: "delivery.rework.no.conflict.0001",
+    eventType: "delivery_merge_conflict_rework", actorType: "controller_ai",
+    actorId: "controller", sessionId: "ctrl-session",
+    metadata: { candidateSha: clean.candidateSha, mainSha: clean.mainSha }
+  }), e => e.code === "DELIVERY_REWORK_CONFLICT_NOT_VERIFIED");
+  assert.equal((await clean.store.getTask("fixture", clean.taskId)).task.status, "交付中");
+});
+
+
+test("R2 STOP and invalidated independent PASS cannot silently return delivery to development", async t => {
+  const stopped = await mergeConflictFixture(t);
+  await stopped.store.appendTaskEvent("fixture", stopped.taskId, {
+    operationId: "delivery.rework.stop.req.0001",
+    eventType: "stop_request", actorType: "user", actorId: "user",
+    note: "用户要求暂停"
+  });
+  await assert.rejects(() => stopped.store.updateTask("fixture", stopped.taskId, {status: "待开发"}, {
+    expectedRevision: stopped.snapshot.registryRevision,
+    operationId: "delivery.rework.stop.reject.0001",
+    eventType: "delivery_merge_conflict_rework",
+    actorType: "controller_ai", actorId: "controller", sessionId: "ctrl-session",
+    metadata: {candidateSha: stopped.candidateSha, mainSha: stopped.mainSha}
+  }), e => e.code === "DELIVERY_REWORK_CONTROLLER_REQUIRED");
+  assert.equal((await stopped.store.getTask("fixture", stopped.taskId)).task.status, "交付中");
+
+  const stale = await mergeConflictFixture(t);
+  await stale.store.appendTaskEvent("fixture", stale.taskId, {
+    operationId: "delivery.rework.code.changed.0001",
+    eventType: "code_change", actorType: "developer_ai", actorId: "developer",
+    sessionId: "dev-session", metadata: { invalidatesTestEvidence: true }
+  });
+  await assert.rejects(() => stale.store.updateTask("fixture", stale.taskId, {status: "待开发"}, {
+    expectedRevision: stale.snapshot.registryRevision,
+    operationId: "delivery.rework.stale.qa.0001",
+    eventType: "delivery_merge_conflict_rework",
+    actorType: "controller_ai", actorId: "controller", sessionId: "ctrl-session",
+    metadata: {candidateSha: stale.candidateSha, mainSha: stale.mainSha}
+  }), e => e.code === "DELIVERY_REWORK_INDEPENDENT_PASS_REQUIRED");
+  assert.equal((await stale.store.getTask("fixture", stale.taskId)).task.status, "交付中");
+});
+
+test("R2 concurrent registry revision and wrong project are rejected without mutation", async t => {
+  const x = await mergeConflictFixture(t);
+  await assert.rejects(() => x.store.updateTask("other-project", x.taskId, { status: "待开发" }, {
+    expectedRevision: x.snapshot.registryRevision,
+    operationId: "delivery.rework.wrong.project.0001",
+    eventType: "delivery_merge_conflict_rework", actorType: "controller_ai",
+    actorId: "controller", sessionId: "ctrl-session",
+    metadata: { candidateSha: x.candidateSha, mainSha: x.mainSha }
+  }), e => Boolean(e.code));
+  const valid = await x.store.updateTask("fixture", x.taskId, { status: "待开发" }, {
+    expectedRevision: x.snapshot.registryRevision,
+    operationId: "delivery.rework.concurrent.first.0001",
+    eventType: "delivery_merge_conflict_rework", actorType: "controller_ai",
+    actorId: "controller", sessionId: "ctrl-session",
+    metadata: { candidateSha: x.candidateSha, mainSha: x.mainSha }
+  });
+  assert.equal(valid.after.status, "待开发");
+  await assert.rejects(() => x.store.updateTask("fixture", x.taskId, { status: "待开发" }, {
+    expectedRevision: x.snapshot.registryRevision,
+    operationId: "delivery.rework.concurrent.stale.0001",
+    eventType: "delivery_merge_conflict_rework", actorType: "controller_ai",
+    actorId: "controller", sessionId: "ctrl-session",
+    metadata: { candidateSha: x.candidateSha, mainSha: x.mainSha }
+  }), e => e.code === "REVISION_CONFLICT");
+});
+
+
+test("R1 controller HTTP endpoint validates and performs a real conflict rework", async t => {
+  const x = await mergeConflictFixture(t);
+  const { createTaskboardServer } = await import("../server/http-server.mjs");
+  const app = await createTaskboardServer({ rootDir: x.fixture.boardRoot, host: "127.0.0.1", port: 0 });
+  await new Promise(resolve => app.server.listen(0, "127.0.0.1", resolve));
+  try {
+    const secret = JSON.parse(await fs.readFile(
+      path.join(x.fixture.boardRoot, "config", "admin-secret.json"), "utf8")).adminSecret;
+    const url = "http://127.0.0.1:" + app.server.address().port +
+      "/api/projects/fixture/tasks/" + x.taskId + "/delivery-merge-conflict-rework";
+    const body = {
+      operationId: "delivery.rework.http.valid.0001",
+      expectedRevision: x.snapshot.registryRevision,
+      actorType: "controller_ai", actorId: "controller", sessionId: "ctrl-session",
+      candidateSha: x.candidateSha, mainSha: x.mainSha,
+      note: "已独立核验真实Git merge-tree冲突"
+    };
+    const wrong = await fetch(url, {
+      method: "POST", headers: { "Content-Type": "application/json",
+        Authorization: "Bearer " + secret },
+      body: JSON.stringify({ ...body, operationId: "delivery.rework.http.bad.0001",
+        actorType: "developer_ai", actorId: "developer" })
+    });
+    assert.equal(wrong.status, 409);
+    const response = await fetch(url, {
+      method: "POST", headers: { "Content-Type": "application/json",
+        Authorization: "Bearer " + secret }, body: JSON.stringify(body)
+    });
+    const result = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(result).slice(0, 350));
+    assert.equal(result.after.status, "待开发");
+    assert.equal(result.after.sessionId, "");
+  } finally {
+    await new Promise(resolve => app.server.close(resolve));
+  }
+});
