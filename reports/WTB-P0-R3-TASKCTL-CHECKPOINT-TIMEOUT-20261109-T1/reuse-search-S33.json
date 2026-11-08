@@ -1,0 +1,38 @@
+{
+  "taskId": "WTB-P0-R3-TASKCTL-CHECKPOINT-TIMEOUT-20261109-T1",
+  "actorId": "dev-gpt6-r3-timeout-s33",
+  "sessionId": "wc_sess_oOOGKnWqT8_bgfO3",
+  "attempt": 1,
+  "claimEventId": "evt_7ee0cc07fb2a256ec85782a2",
+  "searchedAt": "2026-11-08T17:24:45.611Z",
+  "query": "minimal bounded per-file timeout mapping for taskctl and task-step-checkpoint preserving subprocess failures",
+  "checks": {
+    "source": "scripts/run-tests.mjs",
+    "tests": "tests/run-tests-timeout.test.mjs",
+    "dependencies": "AGENTS.md",
+    "technicalNotes": "WORKFLOW.md",
+    "historyCommit": "ba5031b64ad6fee93c6e0132b560aef0ce96fcda",
+    "libraryIndex": "../开源参考源码/00_公共开源库索引.md",
+    "libraryStatus": "checked",
+    "libraryExamples": [
+      "../开源参考源码/00_公共开源库索引.md",
+      "../开源参考源码/dsh-drawai/src/drawing-queue.js"
+    ]
+  },
+  "candidates": [
+    {
+      "path": "scripts/run-tests.mjs",
+      "symbol": "spawnSync",
+      "decision": "reuse",
+      "reason": "复用现有有界timeout与非零退出FAIL分支，仅为两个明确慢用例更新预算",
+      "license": "project-owned"
+    },
+    {
+      "path": "tests/run-tests-timeout.test.mjs",
+      "symbol": "test runner budgets are bounded per file",
+      "decision": "reuse",
+      "reason": "复用原预算映射测试并新增真实子进程超时及非零退出负向验证",
+      "license": "project-owned"
+    }
+  ]
+}

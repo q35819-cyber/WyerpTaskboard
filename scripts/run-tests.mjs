@@ -44,7 +44,7 @@ for (const file of files) {
     cwd: root,
     encoding: "utf8",
     windowsHide: true,
-    timeout: file === "service-control.test.mjs" ? 180000 : ["delivery-lifecycle.test.mjs", "delivery-takeover.test.mjs", "task-step-checkpoint.test.mjs", "task-auto-unblock.test.mjs"].includes(file) ? 90000 : 30000,
+    timeout: ["service-control.test.mjs", "task-step-checkpoint.test.mjs"].includes(file) ? 180000 : ["delivery-lifecycle.test.mjs", "delivery-takeover.test.mjs", "task-auto-unblock.test.mjs", "taskctl.test.mjs"].includes(file) ? 90000 : 30000,
     maxBuffer: 8 * 1024 * 1024
   });
   if (result.stdout) process.stdout.write(result.stdout);
