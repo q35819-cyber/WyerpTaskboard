@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { TaskboardError } from "./core/errors.mjs";
 import { withProjectLock } from "./core/project-lock.mjs";
 import { isWithinRoot } from "./core/path-safety.mjs";
@@ -58,6 +59,72 @@ const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const CLOSED = new Set(["已完成", "已取消"]);
 function invalid(code, message, status = 409) {
   return new TaskboardError(message, { code, status });
+}
+async function reuseFile(root, relative, boundary = root) {
+  if (typeof relative !== "string" || !relative.trim() || path.isAbsolute(relative) || relative.includes("://"))
+    throw invalid("CHECKPOINT_REUSE_INVALID", "检索证据需要真实相对路径");
+  const file = path.resolve(root, relative);
+  const stat = await fs.lstat(file).catch((error) =>
+    error.code === "ENOENT" ? null : Promise.reject(error));
+  if (!isWithinRoot(boundary, file) || !stat?.isFile() || stat.isSymbolicLink()
+    || !isWithinRoot(boundary, await fs.realpath(file)))
+    throw invalid("CHECKPOINT_REUSE_INVALID", "检索文件不存在或越界: " + relative);
+  return file;
+}
+async function verifyReuse(store, projectId, taskId, actorId, sessionId, attempt, claim, evidenceFile) {
+  const root = (await store.projects.context(projectId)).rootRealPath;
+  const proofFile = await reuseFile(root, evidenceFile);
+  let proof;
+  try { proof = JSON.parse(await fs.readFile(proofFile, "utf8")); }
+  catch { throw invalid("CHECKPOINT_REUSE_INVALID", "检索报告JSON无效"); }
+  if (proof?.taskId !== taskId || proof.actorId !== actorId || proof.sessionId !== sessionId
+    || proof.attempt !== attempt || proof.claimEventId !== claim?.event_id
+    || !Number.isFinite(Date.parse(proof.searchedAt))
+    || Date.parse(proof.searchedAt) < Date.parse(claim.timestamp)
+    || Date.parse(proof.searchedAt) > Date.now() + 60000
+    || String(proof.query || "").trim().length < 3)
+    throw invalid("CHECKPOINT_REUSE_INVALID", "检索报告的本轮D01、任务、Session或时间无效");
+  const c = proof.checks || {};
+  for (const key of ["source", "tests", "dependencies", "technicalNotes"])
+    await reuseFile(root, c[key]);
+  let actualCommit = "";
+  if (/^[a-f0-9]{40}$/i.test(c.historyCommit || "")) {
+    try { actualCommit = execFileSync("git", ["-C", root, "log", "-1", "--format=%H", "--", c.source],
+      { encoding: "utf8", timeout: 5000, windowsHide: true }).trim(); } catch { /* fail closed */ }
+  }
+  if (!actualCommit || actualCommit.toLowerCase() !== String(c.historyCommit || "").toLowerCase())
+    throw invalid("CHECKPOINT_REUSE_INVALID", "源码Git历史提交无法核实");
+  const lib = path.resolve(root, "../开源参考源码/00_公共开源库索引.md");
+  const exists = (await fs.stat(lib).catch((error) =>
+    error.code === "ENOENT" ? null : Promise.reject(error)))?.isFile() === true;
+  if (c.libraryIndex !== "../开源参考源码/00_公共开源库索引.md"
+    || c.libraryStatus !== (exists ? "checked" : "unavailable"))
+    throw invalid("CHECKPOINT_REUSE_INVALID", "本机公共库检索状态与实际不符");
+  if (exists) {
+    await reuseFile(root, c.libraryIndex, path.dirname(lib));
+    if (!Array.isArray(c.libraryExamples) || !c.libraryExamples.length)
+      throw invalid("CHECKPOINT_REUSE_INVALID", "没有实际核对公共库源码目录");
+    for (const example of c.libraryExamples) {
+      const loc = path.resolve(root, String(example || ""));
+      if (!isWithinRoot(path.dirname(lib), loc)
+        || !(await fs.stat(loc).catch((error) =>
+          error.code === "ENOENT" ? null : Promise.reject(error)))?.isFile())
+        throw invalid("CHECKPOINT_REUSE_INVALID", "公共库实际目录不存在");
+    }
+  }
+  if (!Array.isArray(proof.candidates) || (!proof.candidates.length
+    && String(proof.noCandidateReason || "").trim().length < 16))
+    throw invalid("CHECKPOINT_REUSE_INVALID", "缺少具体可复用源码或未命中技术原因");
+  for (const candidate of proof.candidates) {
+    const source = await reuseFile(root, candidate.path);
+    if (!["reuse", "inapplicable"].includes(candidate.decision)
+      || !String(candidate.symbol || "").trim() || !String(candidate.reason || "").trim()
+      || !String(candidate.license || "").trim()
+      || !(await fs.readFile(source, "utf8")).includes(candidate.symbol))
+      throw invalid("CHECKPOINT_REUSE_INVALID", "候选缺少真实源码符号、许可证或适配判断");
+    if (candidate.license !== "project-owned") await reuseFile(root, candidate.licenseFile);
+  }
+  return SHA(await fs.readFile(proofFile));
 }
 async function hardDependenciesCompleted(taskStore, projectId, task) {
   const ids = String(task.readDependencies || "").split(/[；;]/)
@@ -205,9 +272,22 @@ export class TaskStepCheckpoint {
     if (!prior || !stage.results.includes(prior.result) || !cursorReady) {
       throw invalid("CHECKPOINT_STAGE_REQUIRED", "正式任务状态推进缺少本轮当前角色的可信上一步证据");
     }
+    if (eventType === "handoff" && await this.taskStore.ruleGateEnabled(projectId)) {
+      const d04 = state.records.findLast((r) => r.stepId === "D04_IMPLEMENT"
+        && r.result === "PASS" && r.attempt === state.attempts);
+      if (!d04 || d04.actorId !== actorId || d04.sessionId !== sessionId)
+        throw invalid("CHECKPOINT_REUSE_REQUIRED", "正式交独测前缺少本轮开发检索");
+      if (d04.reuseProofSha) {
+        const root = (await this.taskStore.projects.context(projectId)).rootRealPath;
+        const file = await reuseFile(root, d04.reuseEvidenceFile);
+        if (SHA(await fs.readFile(file)) !== d04.reuseProofSha)
+          throw invalid("CHECKPOINT_REUSE_INVALID", "交独测前D04报告已修改或遗失");
+      }
+    }
   }
   async record(projectId, taskId, { operationId, expectedSha256, stepId, actorType, actorId,
-    sessionId, result = "PASS", evidence, eventId = null, note = "", substepId = null } = {}) {
+    sessionId, result = "PASS", evidence, eventId = null, note = "", substepId = null,
+    reuseEvidenceFile = null } = {}) {
     if (!ID_PATTERN.test(operationId || "") || !expectedSha256 || !ID_PATTERN.test(actorId || "")
       || !String(sessionId || "").trim()) throw invalid("CHECKPOINT_ARGUMENT_REQUIRED", "缺少操作编号/断点版本/actor/Session", 400);
     const supported = Object.values(FLOW_STEPS).some((roleSteps) => roleSteps[actorType]?.includes(stepId));
@@ -834,6 +914,40 @@ export class TaskStepCheckpoint {
       if (result === "PASS" && stepId === "D08_HANDOFF" && !["待独测", "待复测"].includes(event?.new_status)) {
         throw invalid("CHECKPOINT_FORMAL_EVENT_REQUIRED", "未真实进入独测队列");
       }
+      let reuseProofSha = null;
+      if (modern && result === "PASS" && actorType === "developer_ai"
+        && await this.taskStore.ruleGateEnabled(projectId)) {
+        const claim = history.findLast((e) => e.actor_type === "developer_ai"
+          && ["claim", "takeover"].includes(e.event_type));
+        if (stepId === "D04_IMPLEMENT") {
+          if (!state.records.some((r) => r.stepId === "D01_CLAIM" && r.result === "PASS"
+            && r.attempt === state.attempts && r.actorId === actorId && r.sessionId === sessionId))
+            throw invalid("CHECKPOINT_REUSE_REQUIRED", "缺少本轮正式D01");
+          reuseProofSha = await verifyReuse(this.taskStore, projectId, taskId,
+            actorId, sessionId, state.attempts, claim, reuseEvidenceFile);
+        }
+        if (stepId === "D08_HANDOFF") {
+          const d04 = state.records.findLast((r) => r.stepId === "D04_IMPLEMENT"
+            && r.result === "PASS" && r.attempt === state.attempts);
+          if (!d04 || d04.actorId !== actorId || d04.sessionId !== sessionId
+            || (d04.reuseProofSha && d04.claimEventId !== claim?.event_id))
+            throw invalid("CHECKPOINT_REUSE_REQUIRED", "D08缺少本轮D04实际检索证据");
+          if (d04.reuseProofSha) {
+            const root = (await this.taskStore.projects.context(projectId)).rootRealPath;
+            const file = await reuseFile(root, d04.reuseEvidenceFile);
+            if (SHA(await fs.readFile(file)) !== d04.reuseProofSha)
+              throw invalid("CHECKPOINT_REUSE_INVALID", "D04检索报告在交独测前被替换或修改");
+            let gitType = "";
+            const sha = String(event?.metadata?.commitSha || "");
+            if (/^[a-f0-9]{40}$/i.test(sha)) {
+              try { gitType = execFileSync("git", ["-C", root, "cat-file", "-t", sha],
+                { encoding: "utf8", timeout: 5000, windowsHide: true }).trim(); } catch { /* fail closed */ }
+            }
+            if (gitType !== "commit")
+              throw invalid("CHECKPOINT_REUSE_CANDIDATE_REQUIRED", "D08候选SHA不是实际Git提交");
+          }
+        }
+      }
       if (result === "PASS" && stepId === "Q03_RESULT" && !["pass", "fail", "blocked"].includes(event?.metadata?.testResult)) {
         throw invalid("CHECKPOINT_QA_RESULT_INVALID", "独测正式事件缺少真实判定");
       }
@@ -901,7 +1015,9 @@ export class TaskStepCheckpoint {
         operationId, stepId, actorType, actorId, sessionId, result, substepId,
         attempt: state.attempts, at: new Date().toISOString(), evidence: evidence.trim(),
         eventId: eventId || null, verdict: stepId === "Q03_RESULT" && result === "PASS" ? event.metadata.testResult : null,
-        note: String(note || "").slice(0, 1000)
+        note: String(note || "").slice(0, 1000),
+        ...(reuseProofSha ? { reuseProofSha, reuseEvidenceFile, claimEventId: history.findLast((e) =>
+          e.actor_type === "developer_ai" && ["claim", "takeover"].includes(e.event_type))?.event_id } : {})
       };
       state.records.push(item);
       state.lastAction = item;

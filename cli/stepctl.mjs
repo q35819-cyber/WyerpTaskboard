@@ -17,7 +17,7 @@ function argsOf(argv) {
 const [command, ...args] = process.argv.slice(2);
 if (command === "help" || !command) {
   console.log("用法：node cli/stepctl.mjs show --project <project> --task <task-id>");
-  console.log("      node cli/stepctl.mjs record --project <project> --task <task-id> --step <C01_SCAN|D01_CLAIM|...> --actor-type <controller_ai|developer_ai|test_ai> --actor-id <id> --session-id <session> --expected-sha256 <show返回的SHA> --evidence <报告或真实事件证据> [--event-id <正式事件ID>] [--result PASS|FAIL|BLOCK|PROGRESS] [--substep <小步骤编号，PROGRESS必需>]");
+  console.log("      node cli/stepctl.mjs record --project <project> --task <task-id> --step <C01_SCAN|D01_CLAIM|...> --actor-type <controller_ai|developer_ai|test_ai> --actor-id <id> --session-id <session> --expected-sha256 <show返回的SHA> --evidence <报告或真实事件证据> [--event-id <正式事件ID>] [--reuse-evidence-file <项目相对JSON路径，D04必需>] [--result PASS|FAIL|BLOCK|PROGRESS] [--substep <小步骤编号，PROGRESS必需>]");
   console.log(JSON.stringify(ROLE_STAGE_STEPS, null, 2));
   process.exit(0);
 }
@@ -33,7 +33,8 @@ try {
       expectedSha256: a.expectedSha256,
       stepId: a.step, actorType: a.actorType, actorId: a.actorId,
       sessionId: a.sessionId, evidence: a.evidence, eventId: a.eventId,
-      result: a.result || "PASS", substepId: a.substep, note: a.note
+      result: a.result || "PASS", substepId: a.substep, note: a.note,
+      reuseEvidenceFile: a.reuseEvidenceFile
     });
     console.log(JSON.stringify({ file: response.file, sha256: response.sha256,
       duplicate: response.duplicate, lastAction: response.state.lastAction,
