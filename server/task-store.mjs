@@ -32,6 +32,36 @@ stale_takeover:"revoke_old_session",incomplete_dependency_or_stop:"deny_claim",
 independent_qa:"unique_qa_only",final_merge:"controller_after_qa_pass",
 green_completed_dependency:"skip_green_check_workflow",missing_or_cyclic_dependency:"deny_unresolved"};
 const RULE_ROLE_DUTY={developer_ai:"develop_only_own_task",test_ai:"test_independently",controller_ai:"dispatch_and_merge_after_qa"};
+const PRECLAIM_TTL_MS = 180_000;
+function preclaimHash(token) {
+  if (!/^[a-f0-9]{48,128}$/i.test(String(token || ""))) {
+    throw new TaskboardError("短占令牌无效", { code: "PRECLAIM_TOKEN_INVALID", status: 400 });
+  }
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+function activePreclaimLease(task, history, now = Date.now()) {
+  if (task.assignee || task.sessionId) return null;
+  let lease = null;
+  for (const event of history) {
+    if (event.event_type === "preclaim_lease_acquired") lease = event;
+    else if (lease && ["preclaim_lease_released", "preclaim_lease_failed", "claim"].includes(event.event_type)
+      && (event.metadata?.tokenHash === lease.metadata?.tokenHash
+        || event.metadata?.preclaimLeaseHash === lease.metadata?.tokenHash)) lease = null;
+  }
+  if (!lease || Date.parse(lease.metadata?.expiresAt || "") <= now) return null;
+  return { actorType: lease.actor_type, actorId: lease.actor_id,
+    sessionId: lease.session_id, tokenHash: lease.metadata.tokenHash,
+    expiresAt: lease.metadata.expiresAt, fingerprint: lease.metadata.fingerprint };
+}
+function preclaimFingerprint(task, history, tasks) {
+  const deps = [...String(task.readDependencies || "").matchAll(/([A-Za-z0-9._-]+)\s*完成/g)]
+    .map((m) => [m[1], tasks.find((t) => t.id === m[1])?.status || "missing"]);
+  const last = history.filter((e) => !/^(preclaim_lease_|preclaim_report|rule_read_)/.test(e.event_type)).at(-1);
+  return crypto.createHash("sha256").update(JSON.stringify({
+    status: task.status, updatedAt: task.updatedAt, priority: task.priority, deps,
+    lastEventId: last?.event_id || null
+  })).digest("hex");
+}
 const USER_MESSAGE_TYPES = new Set(["user_review"]);
 const USER_DECISION_TYPES = new Set(["user_accept", "user_reject"]);
 function cleanHumanText(value = "") {
@@ -1158,6 +1188,23 @@ export class TaskStore {
 
       const currentTask = parsed.tasks.find((item) => item.id === taskId);
       if (!currentTask) throw new TaskboardError("未知任务ID: " + taskId, { code: "TASK_NOT_FOUND", status: 404 });
+      let preclaimLeaseHash = null;
+      if (eventType === "claim" && ["developer_ai", "test_ai"].includes(actorType)) {
+        const history = await this.events.listTaskEvents(projectId, taskId, { all: true });
+        const active = activePreclaimLease(currentTask, history);
+        const supplied = String(metadata?.preclaimLeaseToken || "");
+        if (active && (!supplied || active.tokenHash !== preclaimHash(supplied)
+          || active.actorType !== actorType || active.actorId !== actorId
+          || active.sessionId !== sessionId)) {
+          throw new TaskboardError("任务已被其它AI短占，禁止无有效令牌认领", {
+            code: "PRECLAIM_LEASE_HELD", status: 409
+          });
+        }
+        if (supplied && !active) throw new TaskboardError("短占已过期或已撤销", {
+          code: "PRECLAIM_LEASE_INVALID", status: 409
+        });
+        if (active) preclaimLeaseHash = active.tokenHash;
+      }
       if (eventType === "auto_unblock") {
         const allowed = await eligibleTemporaryUnblock(this, projectId, currentTask, parsed.tasks, context);
         if (actorType !== "system" || !allowed || patch.status !== allowed.target ||
@@ -1253,6 +1300,10 @@ export class TaskStore {
         provisionalBaseSha: provisional.baseSha,
         provisionalWorktreeName: provisional.worktreeName
       } : metadata;
+      if (metadata && Object.hasOwn(metadata, "preclaimLeaseToken")) {
+        const { preclaimLeaseToken: omitted, ...safeMetadata } = effectiveMetadata || {};
+        effectiveMetadata = { ...safeMetadata, ...(preclaimLeaseHash ? { preclaimLeaseHash } : {}) };
+      }
       let effectivePatchInput = patch;
       if (["user_accept", "user_reject"].includes(eventType)) {
         const history = await this.events.listTaskEvents(projectId, taskId, { all: true });
@@ -1559,6 +1610,144 @@ export class TaskStore {
     return expectedRevision === undefined || expectedRevision === null
       ? append()
       : withProjectLock(this.rootDir, projectId, operationId, append);
+  }
+
+  async reservePreclaimLease(projectId, taskId, {
+    expectedRevision, operationId, actorType, actorId, sessionId, token
+  } = {}) {
+    assertOperationId(operationId);
+    const tokenHash = preclaimHash(token);
+    if (!["developer_ai", "test_ai"].includes(actorType) || !actorId || !sessionId) {
+      throw new TaskboardError("仅真实开发/独测AI可申请短占", { code: "PRECLAIM_ROLE_INVALID", status: 403 });
+    }
+    const work = async () => withProjectLock(this.rootDir, projectId, operationId, async () => {
+      const replay = await this.events.findByOperationId(projectId, operationId);
+      if (replay) {
+        if (replay.event_type !== "preclaim_lease_acquired" || replay.task_id !== taskId
+          || replay.metadata?.tokenHash !== tokenHash || replay.actor_type !== actorType
+          || replay.actor_id !== actorId || replay.session_id !== sessionId) {
+          throw new TaskboardError("短占操作幂等身份不一致", { code: "IDEMPOTENCY_KEY_CONFLICT", status: 409 });
+        }
+        return { lease: activePreclaimLease((await this.getTask(projectId, taskId)).task,
+          await this.events.listTaskEvents(projectId, taskId, { all: true })),
+          idempotentReplay: true };
+      }
+      const snap = await this.snapshot(projectId);
+      if (!expectedRevision || snap.registryRevision !== expectedRevision) {
+        throw new TaskboardError("短占使用了过期revision", { code: "REVISION_CONFLICT", status: 409 });
+      }
+      const task = snap.tasks.find((t) => t.id === taskId);
+      if (!task) throw new TaskboardError("任务不存在", { code: "TASK_NOT_FOUND", status: 404 });
+      if (task.assignee || task.sessionId || !["待准备", "待开发", "待执行", "测试失败待修复",
+        "待独测", "待复测"].includes(task.status)) {
+        throw new TaskboardError("任务已有owner或不是候选阶段", { code: "PRECLAIM_TASK_NOT_FREE", status: 409 });
+      }
+      if ((actorType === "test_ai") !== ["待独测", "待复测"].includes(task.status)) {
+        throw new TaskboardError("角色与候选阶段不匹配", { code: "PRECLAIM_ROLE_STAGE_MISMATCH", status: 409 });
+      }
+      if ((await this.stopState(projectId, taskId)).stopRequested) {
+        throw new TaskboardError("任务已STOP，不允许短占", { code: "PRECLAIM_STOP_REQUESTED", status: 409 });
+      }
+      const all = await this.events.listProjectTaskEvents(projectId, snap.tasks.map((t) => t.id), { all: true });
+      const prior = all.get(taskId) || [];
+      const current = activePreclaimLease(task, prior);
+      if (current) throw new TaskboardError("其他AI已短占本任务", {
+        code: "PRECLAIM_LEASE_HELD", status: 409, details: { expiresAt: current.expiresAt }
+      });
+      const fingerprint = preclaimFingerprint(task, prior, snap.tasks);
+      const failed = [...prior].reverse().find((e) => e.event_type === "preclaim_lease_failed"
+        && e.metadata?.fingerprint === fingerprint);
+      if (failed) throw new TaskboardError("同一资格版本已失败，本轮直接跳过", {
+        code: "PRECLAIM_QUALIFICATION_UNCHANGED", status: 409,
+        details: { failureCode: failed.metadata?.failureCode, failureEventId: failed.event_id }
+      });
+      for (const other of snap.tasks) {
+        if (other.id === taskId) continue;
+        const lease = activePreclaimLease(other, all.get(other.id) || []);
+        if (other.sessionId && other.sessionId === sessionId
+          && ["开发中", "修复中", "独测中", "复测中"].includes(other.status)) {
+          throw new TaskboardError("本Session已正式占有其它执行中任务", {
+            code: "PRECLAIM_ACTOR_BUSY", status: 409, details: { otherTaskId: other.id }
+          });
+        }
+        if (lease && ((lease.actorType === actorType && lease.actorId === actorId
+          && lease.sessionId === sessionId) || (actorType === "test_ai" && lease.actorType === "test_ai"))) {
+          throw new TaskboardError("同一AI或独测角色已有短占", {
+            code: "PRECLAIM_ACTOR_BUSY", status: 409, details: { otherTaskId: other.id }
+          });
+        }
+        if (actorType === "test_ai" && ["独测中", "复测中"].includes(other.status)) {
+          throw new TaskboardError("唯一独测已占用", {
+            code: "PRECLAIM_QA_BUSY", status: 409, details: { otherTaskId: other.id }
+          });
+        }
+      }
+      const expiresAt = new Date(Date.now() + PRECLAIM_TTL_MS).toISOString();
+      const { event } = await this.events.append(projectId, {
+        operation_id: operationId, project_id: projectId, task_id: taskId,
+        event_type: "preclaim_lease_acquired", timestamp: new Date().toISOString(),
+        actor_type: actorType, actor_id: actorId, session_id: sessionId, session_window_name: "",
+        old_status: task.status, new_status: task.status,
+        old_priority: task.priority, new_priority: task.priority,
+        old_track: task.track, new_track: task.track,
+        note: "临时占位仅准核查，绝非正式claim",
+        metadata: { tokenHash, expiresAt, fingerprint },
+        registry_revision_before: snap.registryRevision, registry_revision_after: snap.registryRevision
+      });
+      return { lease: { token, expiresAt, eventId: event.event_id, fingerprint },
+        idempotentReplay: false };
+    });
+    try { return await work(); }
+    catch (error) {
+      if (error.code === "PROJECT_LOCKED") throw new TaskboardError("短占争抢中，改领下一候选", {
+        code: "PRECLAIM_LEASE_BUSY", status: 409
+      });
+      throw error;
+    }
+  }
+
+  async releasePreclaimLease(projectId, taskId, {
+    operationId, actorType, actorId, sessionId, token, failureCode = "", note = "",
+    relatedTaskIds = []
+  } = {}) {
+    assertOperationId(operationId);
+    const tokenHash = preclaimHash(token);
+    return withProjectLock(this.rootDir, projectId, operationId, async () => {
+      const prior = await this.events.findByOperationId(projectId, operationId);
+      if (prior) {
+        if (prior.task_id !== taskId || prior.metadata?.tokenHash !== tokenHash) {
+          throw new TaskboardError("释放操作幂等身份不一致", {
+            code: "IDEMPOTENCY_KEY_CONFLICT", status: 409
+          });
+        }
+        return { released: true, eventId: prior.event_id, idempotentReplay: true };
+      }
+      const { task, snapshot } = await this.getTask(projectId, taskId);
+      const history = await this.events.listTaskEvents(projectId, taskId, { all: true });
+      const lease = activePreclaimLease(task, history);
+      if (!lease || lease.tokenHash !== tokenHash || lease.actorType !== actorType
+        || lease.actorId !== actorId || lease.sessionId !== sessionId) {
+        throw new TaskboardError("短占已过期、撤销或不属于本会话", {
+          code: "PRECLAIM_LEASE_NOT_OWNED", status: 409
+        });
+      }
+      const { event } = await this.events.append(projectId, {
+        operation_id: operationId, project_id: projectId, task_id: taskId,
+        event_type: failureCode ? "preclaim_lease_failed" : "preclaim_lease_released",
+        timestamp: new Date().toISOString(), actor_type: actorType, actor_id: actorId,
+        session_id: sessionId, session_window_name: "",
+        old_status: task.status, new_status: task.status,
+        old_priority: task.priority, new_priority: task.priority,
+        old_track: task.track, new_track: task.track,
+        note: String(note).slice(0, 1000),
+        metadata: { tokenHash, failureCode: String(failureCode).slice(0, 120),
+          fingerprint: lease.fingerprint,
+          relatedTaskIds: Array.isArray(relatedTaskIds) ? relatedTaskIds.slice(0, 8) : [] },
+        registry_revision_before: snapshot.registryRevision,
+        registry_revision_after: snapshot.registryRevision
+      });
+      return { released: true, eventId: event.event_id, idempotentReplay: false };
+    });
   }
 
   async taskHistory(projectId, taskId, { limit = 200, all = false } = {}) {

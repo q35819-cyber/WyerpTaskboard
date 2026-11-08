@@ -595,3 +595,43 @@ test("R1 controller HTTP endpoint validates and performs a real conflict rework"
     await new Promise(resolve => app.server.close(resolve));
   }
 });
+
+
+test("HTTP preclaim API atomically reserves and releases without formal claim", async (t) => {
+  const fixture = await makeFixture();
+  t.after(() => fs.rm(fixture.boardRoot, { recursive: true, force: true }));
+  const { createTaskboardServer } = await import("../server/http-server.mjs");
+  const app = await createTaskboardServer({ rootDir: fixture.boardRoot, host: "127.0.0.1", port: 0 });
+  await new Promise((resolve) => app.server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => { if (app.server.listening) await new Promise((resolve) => app.server.close(resolve)); });
+  const secret = JSON.parse(await fs.readFile(
+    path.join(fixture.boardRoot, "config", "admin-secret.json"), "utf8")).adminSecret;
+  const endpoint = "http://127.0.0.1:" + app.server.address().port +
+    "/api/projects/fixture/tasks/A-10/preclaim-lease";
+  const headers = { "Content-Type": "application/json", Authorization: "Bearer " + secret };
+  const revision = (await app.taskStore.snapshot("fixture")).registryRevision;
+  const body = { operationId: "http.preclaim.one", expectedRevision: revision,
+    actorType: "developer_ai", actorId: "worker-one", sessionId: "session-one",
+    token: "1".repeat(48) };
+  const send = (url, payload) => fetch(url, {
+    method: "POST", headers, body: JSON.stringify(payload)
+  });
+  const first = await send(endpoint, body);
+  assert.equal(first.status, 200, await first.text().catch(() => ""));
+  const duplicate = await send(endpoint, { ...body, operationId: "http.preclaim.two",
+    actorId: "worker-two", sessionId: "session-two", token: "2".repeat(48) });
+  assert.equal(duplicate.status, 409);
+  assert.equal((await duplicate.json()).error.code, "PRECLAIM_LEASE_HELD");
+  const current = (await app.taskStore.getTask("fixture", "A-10")).task;
+  assert.equal(current.status, "待开发", "preclaim is not a formal developer claim");
+  assert.equal(current.sessionId, "");
+  const release = await send(endpoint + "/release", {
+    operationId: "http.preclaim.release", actorType: body.actorType,
+    actorId: body.actorId, sessionId: body.sessionId, token: body.token
+  });
+  assert.equal(release.status, 200, JSON.stringify(await release.json()));
+  const newOwner = await send(endpoint, { ...body, operationId: "http.preclaim.next",
+    actorId: "worker-two", sessionId: "session-two", token: "2".repeat(48) });
+  assert.equal(newOwner.status, 200, JSON.stringify(await newOwner.json()));
+  assert.equal((await app.taskStore.events.verifyProject("fixture")).ok, true);
+});

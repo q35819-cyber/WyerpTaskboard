@@ -703,3 +703,158 @@ test("TaskStore rule-read receipts are session-bound, cannot be forged, and expi
   assert.equal(after.developmentIssue,null);
   assert.equal(after.suspectedDisconnect,false);
 });
+
+
+test("atomic preclaim serializes competing AI, rejects forged tokens and upgrades a valid claim", async (t) => {
+  const f = await makeFixture(); t.after(() => fs.rm(f.boardRoot, { recursive: true, force: true }));
+  const store = await new TaskStore(f.boardRoot).init();
+  const revision = (await store.snapshot("fixture")).registryRevision;
+  const one = { expectedRevision: revision, operationId: "lease.compete.one", actorType: "developer_ai",
+    actorId: "dev-one", sessionId: "dev-session-one", token: "a".repeat(48) };
+  const two = { ...one, operationId: "lease.compete.two", actorId: "dev-two",
+    sessionId: "dev-session-two", token: "b".repeat(48) };
+  const concurrent = await Promise.allSettled([
+    store.reservePreclaimLease("fixture", "A-10", one),
+    store.reservePreclaimLease("fixture", "A-10", two)
+  ]);
+  assert.equal(concurrent.filter((r) => r.status === "fulfilled").length, 1);
+  assert.equal(concurrent.filter((r) => r.status === "rejected").length, 1);
+  assert.ok(["PRECLAIM_LEASE_BUSY", "PRECLAIM_LEASE_HELD"].includes(
+    concurrent.find((r) => r.status === "rejected").reason.code));
+  const winner = concurrent[0].status === "fulfilled" ? one : two;
+  const loser = winner === one ? two : one;
+  const repeat = await store.reservePreclaimLease("fixture", "A-10", winner);
+  assert.equal(repeat.idempotentReplay, true);
+  await assert.rejects(store.updateTask("fixture", "A-10", {
+    status: "开发中", assignee: "unauthorized", sessionId: loser.sessionId,
+    sessionWindowName: "fake"
+  }, {
+    expectedRevision: revision, operationId: "lease.forged.claim",
+    eventType: "claim", actorType: "developer_ai",
+    actorId: loser.actorId, sessionId: loser.sessionId
+  }), (e) => e.code === "PRECLAIM_LEASE_HELD");
+  await assert.rejects(store.updateTask("fixture", "A-10", {
+    status: "开发中", assignee: "unauthorized", sessionId: loser.sessionId,
+    sessionWindowName: "fake"
+  }, {
+    expectedRevision: revision, operationId: "lease.forged.token",
+    eventType: "claim", actorType: "developer_ai",
+    actorId: loser.actorId, sessionId: loser.sessionId,
+    metadata: { preclaimLeaseToken: loser.token }
+  }), (e) => e.code === "PRECLAIM_LEASE_HELD");
+  const claim = await store.updateTask("fixture", "A-10", {
+    status: "开发中", assignee: winner.actorId,
+    sessionWindowName: "dev-window", sessionId: winner.sessionId
+  }, {
+    expectedRevision: revision, operationId: "lease.upgrade.claim",
+    eventType: "claim", actorType: "developer_ai",
+    actorId: winner.actorId, sessionId: winner.sessionId,
+    metadata: { preclaimLeaseToken: winner.token }
+  });
+  assert.equal(claim.after.sessionId, winner.sessionId);
+  const committed = await store.events.findByOperationId("fixture", "lease.upgrade.claim");
+  assert.ok(committed.metadata.preclaimLeaseHash);
+  assert.equal(committed.metadata.preclaimLeaseToken, undefined, "never publish raw secret to event history");
+  assert.equal((await store.transactions.read("lease.upgrade.claim")).state, "committed");
+  await assert.rejects(store.releasePreclaimLease("fixture", "A-10", {
+    operationId: "lease.invalid.release", actorType: winner.actorType,
+    actorId: winner.actorId, sessionId: winner.sessionId, token: winner.token
+  }), (e) => e.code === "PRECLAIM_LEASE_NOT_OWNED");
+});
+
+test("preclaim failure releases the same round; changed qualifications permit retry", async (t) => {
+  const f = await makeFixture(); t.after(() => fs.rm(f.boardRoot, { recursive: true, force: true }));
+  const store = await new TaskStore(f.boardRoot).init();
+  let revision = (await store.snapshot("fixture")).registryRevision;
+  const who = { expectedRevision: revision, operationId: "lease.failure.acquire",
+    actorType: "developer_ai", actorId: "dev", sessionId: "sess", token: "c".repeat(48) };
+  const lease = await store.reservePreclaimLease("fixture", "A-10", who);
+  assert.ok(lease.lease.expiresAt);
+  const released = await store.releasePreclaimLease("fixture", "A-10", {
+    operationId: "lease.failure.release", actorType: who.actorType,
+    actorId: who.actorId, sessionId: who.sessionId, token: who.token,
+    failureCode: "CHECKPOINT_PREDECESSOR_REQUIRED",
+    note: "D01 formal evidence missing", relatedTaskIds: ["B-10"]
+  });
+  assert.equal(released.released, true);
+  assert.equal((await store.releasePreclaimLease("fixture", "A-10", {
+    operationId: "lease.failure.release", actorType: who.actorType,
+    actorId: who.actorId, sessionId: who.sessionId, token: who.token
+  })).idempotentReplay, true);
+  await assert.rejects(store.reservePreclaimLease("fixture", "A-10", {
+    ...who, operationId: "lease.failure.same.fingerprint", token: "d".repeat(48)
+  }), (e) => e.code === "PRECLAIM_QUALIFICATION_UNCHANGED");
+  await store.updateTask("fixture", "A-10", { priority: "P1" }, {
+    expectedRevision: revision, operationId: "lease.qualifications.changed",
+    eventType: "priority_change", actorType: "user", actorId: "owner"
+  });
+  revision = (await store.snapshot("fixture")).registryRevision;
+  const next = await store.reservePreclaimLease("fixture", "A-10", {
+    ...who, expectedRevision: revision, operationId: "lease.qualifications.retry",
+    token: "e".repeat(48)
+  });
+  assert.equal(next.lease.token, "e".repeat(48));
+  await store.releasePreclaimLease("fixture", "A-10", {
+    operationId: "lease.qualifications.free", actorType: who.actorType,
+    actorId: who.actorId, sessionId: who.sessionId, token: "e".repeat(48)
+  });
+  const events = await store.taskHistory("fixture", "A-10", { all: true });
+  assert.ok(events.some((e) => e.event_type === "preclaim_lease_failed"));
+  assert.equal((await store.events.verifyProject("fixture")).ok, true);
+});
+
+test("preclaim honors STOP, expiring leases, and unique QA admission", async (t) => {
+  const f = await makeFixture(); t.after(() => fs.rm(f.boardRoot, { recursive: true, force: true }));
+  await fs.writeFile(f.registryPath, registryText([
+    ["A-10","F-A","bugfix","P0","待开发","开发AI","—","—","—","—","scope","plan.md","trace","","server/task-store.mjs","checkpoint.md"],
+    ["T-01","F-T","bugfix","P0","待独测","独立测试AI","—","—","—","—","scope","plan.md","trace","","tests/task-store.test.mjs","checkpoint.md"],
+    ["T-02","F-T","bugfix","P0","待独测","独立测试AI","—","—","—","—","scope","plan.md","trace","","tests/task-store.test.mjs","checkpoint.md"]
+  ]), "utf8");
+  const store = await new TaskStore(f.boardRoot).init();
+  const rev = (await store.snapshot("fixture")).registryRevision;
+  await store.appendTaskEvent("fixture", "A-10", {
+    operationId: "lease.stop.signal", eventType: "stop_request",
+    actorType: "user", actorId: "owner"
+  });
+  await assert.rejects(store.reservePreclaimLease("fixture", "A-10", {
+    expectedRevision: rev, operationId: "lease.stop.denied",
+    actorType: "developer_ai", actorId: "dev", sessionId: "dev-session",
+    token: "f".repeat(48)
+  }), (e) => e.code === "PRECLAIM_STOP_REQUESTED");
+  const qa = { expectedRevision: rev, operationId: "lease.qa.first",
+    actorType: "test_ai", actorId: "tester", sessionId: "qa-session",
+    token: "1".repeat(48) };
+  await store.reservePreclaimLease("fixture", "T-01", qa);
+  await assert.rejects(store.reservePreclaimLease("fixture", "T-02", {
+    ...qa, operationId: "lease.qa.duplicate", token: "2".repeat(48)
+  }), (e) => e.code === "PRECLAIM_ACTOR_BUSY");
+  await assert.rejects(store.releasePreclaimLease("fixture", "T-01", {
+    operationId: "lease.qa.wrong.owner", actorType: "test_ai",
+    actorId: "forged", sessionId: "qa-session", token: qa.token
+  }), (e) => e.code === "PRECLAIM_LEASE_NOT_OWNED");
+  await store.releasePreclaimLease("fixture", "T-01", {
+    operationId: "lease.qa.release", actorType: "test_ai",
+    actorId: qa.actorId, sessionId: qa.sessionId, token: qa.token
+  });
+  await store.reservePreclaimLease("fixture", "T-02", {
+    ...qa, operationId: "lease.qa.new", token: "3".repeat(48)
+  });
+
+  // Simulate a persisted but expired reservation without sleeping.
+  await store.events.append("fixture", {
+    operation_id: "lease.expired.fixture", project_id: "fixture", task_id: "T-02",
+    event_type: "preclaim_lease_acquired", timestamp: new Date().toISOString(),
+    actor_type: "test_ai", actor_id: "stale", session_id: "stale-session",
+    old_status: "待独测", new_status: "待独测",
+    metadata: {
+      tokenHash: "0".repeat(64),
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+      fingerprint: "stale"
+    }
+  });
+  const newest = await store.reservePreclaimLease("fixture", "T-02", {
+    ...qa, operationId: "lease.expired.reclaim", token: "4".repeat(48)
+  });
+  assert.equal(newest.lease.token, "4".repeat(48));
+  assert.equal((await store.events.verifyProject("fixture")).ok, true);
+});
