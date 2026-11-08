@@ -1,0 +1,45 @@
+{
+  "taskId": "WTB-P0-D07-FAIL-TAKEOVER-D01-REENTRY-20261108-T1",
+  "actorId": "dev-gpt6-d07-fail-reentry-s32",
+  "sessionId": "wc_sess_e4bA0lbabq5vwH-c",
+  "attempt": 1,
+  "claimEventId": "evt_fcbefb6837cbd77187605146",
+  "searchedAt": "2026-11-08T16:39:27.729Z",
+  "query": "TaskStepCheckpoint D07 FAIL takeover D01 reentry existing authorization guard history and HTTP handoff evidence",
+  "checks": {
+    "source": "server/task-step-checkpoint.mjs",
+    "tests": "tests/task-step-checkpoint.test.mjs",
+    "dependencies": "AGENTS.md",
+    "technicalNotes": "WORKFLOW.md",
+    "historyCommit": "949d5cbaeeb03b95c024f32806507f052bca68ba",
+    "libraryIndex": "../开源参考源码/00_公共开源库索引.md",
+    "libraryStatus": "checked",
+    "libraryExamples": [
+      "../开源参考源码/00_公共开源库索引.md",
+      "../开源参考源码/dsh-drawai/src/drawing-queue.js"
+    ]
+  },
+  "candidates": [
+    {
+      "path": "server/task-step-checkpoint.mjs",
+      "symbol": "CHECKPOINT_STEP_ORDER",
+      "decision": "reuse",
+      "reason": "沿用既有D01重入和授权证明校验，只增加D07 FAIL旧Session撤权后唯一新开发接管分支",
+      "license": "project-owned"
+    },
+    {
+      "path": "tests/task-step-checkpoint.test.mjs",
+      "symbol": "takeover revokes the old developer Session",
+      "decision": "reuse",
+      "reason": "复用现有断点和失联接管fixture，新增D07 FAIL正负向覆盖",
+      "license": "project-owned"
+    },
+    {
+      "path": "tests/http-server.test.mjs",
+      "symbol": "complete-execution",
+      "decision": "reuse",
+      "reason": "保留无现代断点兼容200，新增现代证据缺失/失败的真实HTTP 409断言",
+      "license": "project-owned"
+    }
+  ]
+}

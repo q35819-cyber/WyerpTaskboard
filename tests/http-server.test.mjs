@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { createTaskboardServer } from "../server/http-server.mjs";
 import { makeFixture, registryText } from "./helpers.mjs";
+import { TaskStepCheckpoint } from "../server/task-step-checkpoint.mjs";
 
 async function startFixture(t, serverOptions = {}, probe = fetch) {
   const fixture = await makeFixture();
@@ -758,6 +759,10 @@ test("handoff releases execution identity and permits independent developer befo
     return { status: response.status, body: await response.json() };
   }
   assert.equal((await request("A-10", "dev-A", "session-A", "claim", "claim.scope.handoff.001")).status, 200);
+  const unproven = await request("A-10", "dev-A", "unverified-session",
+    "complete-execution", "handoff.scope.unverified.001");
+  assert.equal(unproven.status, 409);
+  assert.equal(unproven.body.error.code, "EXECUTION_COMPLETION_IDENTITY_MISMATCH");
   const handedOff = await request("A-10", "dev-A", "session-A", "complete-execution", "handoff.scope.001");
   assert.equal(handedOff.status, 200);
   assert.equal(handedOff.body.after.status, "待独测");
@@ -766,6 +771,56 @@ test("handoff releases execution identity and permits independent developer befo
   assert.equal(conflict.status, 200);
   assert.equal(conflict.body.after.status, "开发中");
   assert.equal((await request("D-10", "dev-A", "session-A", "claim", "claim.scope.free.003")).status, 200);
+});
+
+test("modern HTTP handoff rejects missing D07 evidence and failed D07 with 409", async t => {
+  const { base, secret, app, fixture } = await startFixture(t);
+  const headers = { Authorization: "Bearer " + secret, "Content-Type": "application/json" };
+  const actorId = "http-modern-dev", sessionId = "http-modern-session", taskId = "A-10";
+  await app.taskStore.appendTaskEvent("fixture", taskId, {
+    operationId: "fixture.modern.handoff.dispatch",
+    eventType: "controller_dispatch", actorType: "controller_ai",
+    actorId: "controller", sessionId: "controller-session"
+  });
+  await recordPreclaim(base, secret, taskId, { actorId, sessionId });
+  const original = await (await fetch(base + "/api/projects/fixture/tasks/" + taskId, { headers })).json();
+  const claimResponse = await fetch(base + "/api/projects/fixture/tasks/" + taskId + "/claim", {
+    method: "POST", headers, body: JSON.stringify({
+      operationId: "fixture.modern.handoff.claim", expectedRevision: original.registryRevision,
+      actorType: "developer_ai", actorId, sessionId, assignee: actorId, sessionWindowName: sessionId
+    })
+  });
+  assert.equal(claimResponse.status, 200);
+  const claim = await claimResponse.json();
+  const checkpoint = await new TaskStepCheckpoint(fixture.boardRoot, { taskStore: app.taskStore }).init();
+  async function record(stepId, result = "PASS", eventId = null) {
+    const before = await checkpoint.show("fixture", taskId);
+    return checkpoint.record("fixture", taskId, {
+      operationId: "fixture.modern.handoff." + stepId, expectedSha256: before.sha256,
+      stepId, actorType: "developer_ai", actorId, sessionId, result,
+      evidence: "真实HTTP现代步骤测试 " + stepId, eventId
+    });
+  }
+  await record("D01_CLAIM", "PASS", claim.eventId);
+  async function deniedHandoff(operationId) {
+    const current = await (await fetch(base + "/api/projects/fixture/tasks/" + taskId, { headers })).json();
+    const response = await fetch(base + "/api/projects/fixture/tasks/" + taskId + "/complete-execution", {
+      method: "POST", headers, body: JSON.stringify({
+        operationId, expectedRevision: current.registryRevision,
+        actorType: "developer_ai", actorId, sessionId
+      })
+    });
+    assert.equal(response.status, 409);
+    assert.equal((await response.json()).error.code, "CHECKPOINT_STAGE_REQUIRED");
+    const after = await (await fetch(base + "/api/projects/fixture/tasks/" + taskId, { headers })).json();
+    assert.equal(after.status, "开发中");
+    assert.equal(after.sessionId, sessionId);
+  }
+  await deniedHandoff("fixture.modern.handoff.no-d07");
+  for (const stepId of ["D02_WORKTREE", "D03_WRITE_SCOPE", "D04_IMPLEMENT", "D05_TEST_1", "D06_TEST_2"])
+    await record(stepId);
+  await record("D07_TEST_3", "FAIL");
+  await deniedHandoff("fixture.modern.handoff.d07-failed");
 });
 
 test("direct HTTP claim requires a current preclaim report and rejects stale reports", async (t) => {
@@ -1363,6 +1418,17 @@ test("release rejects active execution and handoff atomically clears ownership",
   const afterBrowserHandoff = await (await fetch(base + "/api/projects/fixture/tasks/B-10", { headers })).json();
   assert.equal(afterBrowserHandoff.status, "开发中");
 
+  const noSessionProof = await fetch(base + "/api/projects/fixture/tasks/B-10/complete-execution", {
+    method: "POST", headers,
+    body: JSON.stringify({
+      operationId: "release.handoff.unverified.001",
+      expectedRevision: initial.registryRevision,
+      actorType: "developer_ai", actorId: "dev",
+      sessionId: "unverified-session"
+    })
+  });
+  assert.equal(noSessionProof.status, 409);
+  assert.equal((await noSessionProof.json()).error.code, "EXECUTION_COMPLETION_IDENTITY_MISMATCH");
   const handedOff = await fetch(base + "/api/projects/fixture/tasks/B-10/complete-execution", {
     method: "POST", headers,
     body: JSON.stringify({

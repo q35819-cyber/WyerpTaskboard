@@ -379,6 +379,106 @@ test("takeover revokes the old developer Session for PASS and PROGRESS; new owne
   assert.equal(resumed.state.lastAction.actorId,"replacement");
   assert.equal(resumed.state.cursors.developer_ai,"D05_TEST_1");
 });
+async function d07FailedDeveloperTakeover(t, {
+  d07Fail = true, authorization = "valid", revoke = false,
+  previousSession = "developer_ai.session", wrongAssignee = false, stop = false
+} = {}) {
+  const { f, taskStore } = await fixture(t);
+  const cp = await new TaskStepCheckpoint(f.boardRoot, { taskStore }).init();
+  await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.d07.dispatch." + String(sequence++).padStart(8, "0"),
+    eventType: "controller_dispatch", actorType: "controller_ai",
+    actorId: "controller", sessionId: "controller-session"
+  });
+  const original = await claimDev(taskStore);
+  await step(cp, "developer_ai", "D01_CLAIM", { eventId: original.eventId });
+  for (const id of ROLE_STAGE_STEPS.developer_ai.slice(1, 6))
+    await step(cp, "developer_ai", id);
+  await step(cp, "developer_ai", "D07_TEST_3", { result: d07Fail ? "FAIL" : "PASS" });
+  const revision = (await taskStore.snapshot("fixture")).registryRevision;
+  const suspectedOp = "fixture.d07.suspect." + String(sequence++).padStart(8, "0");
+  await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: suspectedOp, eventType: "suspected_disconnect",
+    actorType: "developer_ai", actorId: "new-dev", sessionId: "new-dev-session",
+    metadata: { observedSessionId: "developer_ai.session", observedAssignee: "developer",
+      observedRegistryRevision: revision }
+  });
+  const allowOp = "fixture.d07.allow." + String(sequence++).padStart(8, "0");
+  if (authorization !== "missing") await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: allowOp, eventType: "takeover_allowed",
+    actorType: "developer_ai", actorId: "new-dev", sessionId: "new-dev-session",
+    metadata: { authorizationSource: authorization === "forged"
+        ? "developer_note" : "chat_user_instruction_cooperative",
+      authorizationScope: "task", authorizationQuote: "符合条件直接异常接管",
+      explicitUserOverride: true, authorizationForwardedBy: "new-dev",
+      authorizationForwardingSessionId: "new-dev-session",
+      authorizedFromSessionId: "developer_ai.session",
+      authorizedFromAssignee: wrongAssignee ? "not-original-owner" : "developer",
+      authorizedFromStatus: "开发中", authorizedRegistryRevision: revision,
+      suspicionOperationId: suspectedOp }
+  });
+  if (revoke) await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.d07.revoke." + String(sequence++).padStart(8, "0"),
+    eventType: "takeover_revoked", actorType: "developer_ai",
+    actorId: "new-dev", sessionId: "new-dev-session"
+  });
+  const takeover = await taskStore.updateTask("fixture", "A-10", {
+    assignee: "new-dev", sessionId: "new-dev-session",
+    sessionWindowName: "new-dev", status: "开发中"
+  }, {
+    operationId: "fixture.d07.takeover." + String(sequence++).padStart(8, "0"),
+    expectedRevision: (await taskStore.snapshot("fixture")).registryRevision,
+    eventType: "takeover", actorType: "developer_ai", actorId: "new-dev",
+    sessionId: "new-dev-session",
+    metadata: { authorizationOperationId: allowOp,
+      previousSessionId: previousSession, previousAssignee: "developer" }
+  });
+  if (stop) await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.d07.stop." + String(sequence++).padStart(8, "0"),
+    eventType: "stop_request", actorType: "user", note: "用户STOP"
+  });
+  return { cp, taskStore, takeover, original };
+}
+
+test("authentic D07 FAIL followed by atomic developer takeover can reopen fresh D01", async t => {
+  const x = await d07FailedDeveloperTakeover(t);
+  const oldCheckpoint = await x.cp.show("fixture", "A-10");
+  assert.equal(oldCheckpoint.state.cursors.developer_ai, "D07_TEST_3");
+  await assert.rejects(step(x.cp, "developer_ai", "D01_CLAIM", {
+    eventId: x.original.eventId
+  }), e => ["CHECKPOINT_STEP_ORDER", "CHECKPOINT_SESSION_MISMATCH"].includes(e.code));
+  const resumed = await step(x.cp, "developer_ai", "D01_CLAIM", {
+    actorId: "new-dev", sessionId: "new-dev-session", eventId: x.takeover.eventId
+  });
+  assert.equal(resumed.state.attempts, oldCheckpoint.state.attempts + 1);
+  assert.equal(resumed.state.cursors.developer_ai, "D02_WORKTREE");
+  assert.ok(resumed.state.records.some(r => r.stepId === "D07_TEST_3" &&
+    r.result === "FAIL" && r.attempt === oldCheckpoint.state.attempts));
+  await step(x.cp, "developer_ai", "D02_WORKTREE", {
+    actorId: "new-dev", sessionId: "new-dev-session"
+  });
+  await assert.rejects(step(x.cp, "developer_ai", "D01_CLAIM", {
+    actorId: "new-dev", sessionId: "new-dev-session", eventId: x.takeover.eventId
+  }), e => e.code === "CHECKPOINT_STEP_ORDER");
+});
+
+test("D07 takeover D01 refuses no FAIL, fake/revoked grant, wrong old session and STOP", async t => {
+  for (const options of [
+    { d07Fail: false }, { authorization: "missing" },
+    { authorization: "forged" }, { revoke: true },
+    { previousSession: "forged-old" }, { wrongAssignee: true }, { stop: true }
+  ]) {
+    const x = await d07FailedDeveloperTakeover(t, options);
+    const before = await x.cp.show("fixture", "A-10");
+    await assert.rejects(step(x.cp, "developer_ai", "D01_CLAIM", {
+      actorId: "new-dev", sessionId: "new-dev-session", eventId: x.takeover.eventId
+    }), e => ["CHECKPOINT_STEP_ORDER", "CHECKPOINT_PREDECESSOR_REQUIRED"].includes(e.code),
+    JSON.stringify(options));
+    const after = await x.cp.show("fixture", "A-10");
+    assert.equal(after.sha256, before.sha256);
+  }
+});
+
 test("missing D08 recovers only from a genuine latest handoff bound to the owner before QA claim", async(t) => {
   const {cp,taskStore}=await fixture(t);
   await controllerReady(taskStore,cp);

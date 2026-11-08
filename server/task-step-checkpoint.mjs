@@ -369,6 +369,7 @@ export class TaskStepCheckpoint {
       const currentClaimIndex = history.indexOf(currentClaim);
       let q04RequeuedTakeover = false;
       let manualRequeuedTakeover = false;
+      let d07FailedTakeover = false;
       if (stepId === "D01_CLAIM" && state.cursors.developer_ai !== "D01_CLAIM") {
         const lastFailIndex = history.findLastIndex((entry) =>
           entry.event_type === "test_result" && entry.actor_type === "test_ai"
@@ -553,6 +554,63 @@ export class TaskStepCheckpoint {
           state.attempts += 1;
           state.cursors.developer_ai = "D01_CLAIM";
           state.cursors.test_ai = "Q01_ADMISSION";
+        }
+        // Only a real failed D07 and a proven atomic takeover may start a fresh D01.
+        if (modern && result === "PASS" && state.cursors.developer_ai === "D07_TEST_3"
+          && currentClaim?.event_type === "takeover" && currentClaim.event_id === eventId
+          && currentClaim.actor_id === actorId && currentClaim.session_id === sessionId
+          && currentClaim.old_status === currentClaim.new_status
+          && ["开发中", "修复中"].includes(currentClaim.new_status)
+          && task.status === currentClaim.new_status && task.sessionId === sessionId
+          && previouslyStarted && !alreadyRestarted
+          && !(await this.taskStore.stopState(projectId, taskId)).stopRequested
+          && await hardDependenciesCompleted(this.taskStore, projectId, task)) {
+          const oldD07 = state.records.findLast(r => r.stepId === "D07_TEST_3"
+            && r.result === "FAIL" && r.attempt === state.attempts);
+          const former = history.slice(0, currentClaimIndex).findLast(e =>
+            e.actor_type === "developer_ai" && ["claim", "takeover"].includes(e.event_type));
+          const formerIndex = history.indexOf(former);
+          const allowed = history.slice(formerIndex + 1, currentClaimIndex).findLast(e =>
+            e.event_type === "takeover_allowed" && e.actor_type === "developer_ai"
+            && e.actor_id === actorId && e.session_id === sessionId
+            && e.operation_id === currentClaim.metadata?.authorizationOperationId);
+          const allowIndex = history.indexOf(allowed);
+          const suspect = history.slice(formerIndex + 1, allowIndex).findLast(e =>
+            e.event_type === "suspected_disconnect" && e.actor_type === "developer_ai"
+            && e.actor_id === actorId && e.session_id === sessionId
+            && e.operation_id === allowed?.metadata?.suspicionOperationId);
+          const auth = allowed?.metadata || {};
+          if (oldD07 && former && oldD07.actorId === former.actor_id
+            && oldD07.sessionId === former.session_id
+            && state.records.some(r => r.stepId === "D01_CLAIM" && r.result === "PASS"
+              && r.attempt === state.attempts && r.actorId === former.actor_id
+              && r.sessionId === former.session_id)
+            && currentClaim.metadata?.previousSessionId === former.session_id
+            && former.session_id !== sessionId && former.actor_id !== actorId
+            && auth.authorizedFromSessionId === former.session_id
+            && auth.authorizedFromAssignee === currentClaim.metadata?.previousAssignee
+            && auth.authorizedFromStatus === former.new_status
+            && auth.authorizedRegistryRevision === currentClaim.registry_revision_before
+            && suspect?.metadata?.observedSessionId === former.session_id
+            && suspect.metadata?.observedAssignee === auth.authorizedFromAssignee
+            && suspect.metadata?.observedRegistryRevision === auth.authorizedRegistryRevision
+            && ["task", "project"].includes(auth.authorizationScope)
+            && ["chat_user_instruction_cooperative", "browser_user_session"].includes(auth.authorizationSource)
+            && (auth.authorizationSource !== "chat_user_instruction_cooperative"
+              || (auth.explicitUserOverride === true
+                && auth.authorizationForwardedBy === actorId
+                && auth.authorizationForwardingSessionId === sessionId
+                && Boolean(String(auth.authorizationQuote || "").trim())))
+            && Date.parse(oldD07.at) < Date.parse(currentClaim.timestamp)
+            && formerIndex >= 0 && history.indexOf(suspect) > formerIndex
+            && allowIndex > history.indexOf(suspect) && allowIndex < currentClaimIndex
+            && !history.slice(allowIndex + 1, currentClaimIndex).some(e =>
+              e.event_type === "takeover_revoked")) {
+            state.attempts += 1;
+            state.cursors.developer_ai = "D01_CLAIM";
+            state.cursors.test_ai = "Q01_ADMISSION";
+            d07FailedTakeover = true;
+          }
         }
         // Reopen only a new, committed machine recovery after the prior D07 BLOCK.
         if (modern && result === "PASS" && state.cursors.developer_ai === "D07_TEST_3"
@@ -909,7 +967,8 @@ export class TaskStepCheckpoint {
           authorizedTakeover = priorDeveloperIndex >= 0 && allowedIndex >= 0
             && suspicionIndex >= 0 && !revoked
             && String(authorization?.metadata?.authorizationQuote || "").trim().length > 0
-            && (dispatchIndex > priorDeveloperIndex || q04RequeuedTakeover || manualRequeuedTakeover)
+            && (dispatchIndex > priorDeveloperIndex || q04RequeuedTakeover
+              || manualRequeuedTakeover || d07FailedTakeover)
             && history[priorDeveloperIndex].session_id === authorityEvent.metadata?.previousSessionId
             && authorityEvent.old_status === authorityEvent.new_status
             && ["开发中", "修复中"].includes(authorityEvent.old_status);
