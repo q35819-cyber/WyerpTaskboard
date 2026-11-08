@@ -1,10 +1,12 @@
 import http from "node:http";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { URL } from "node:url";
 import { TaskboardError } from "./core/errors.mjs";
 import { TaskStore, deliveryTakeoverAuthority, verifiedRemoteTakeoverCandidate } from "./task-store.mjs";
+import { TaskStepCheckpoint } from "./task-step-checkpoint.mjs";
 import { deliveryEvidence } from "./candidate-evaluator.mjs";
 import { ErpPassGate } from "./erp-pass-gate.mjs";
 import { AuthManager } from "./auth.mjs";
@@ -229,6 +231,60 @@ async function takeoverAuthorizationEvidence(identity, body, params, taskStore) 
     authorizationMessageRef: String(proof.messageRef || "").slice(0, 120)
   };
 }
+async function controllerInFlightEvidence(taskStore, rootDir, projectId, taskId, task, history) {
+  const state = await new TaskStepCheckpoint(rootDir, { taskStore }).show(projectId, taskId);
+  const c04 = state.state.records.findLast(r => r.actorType === "controller_ai"
+    && r.stepId === "C04_MERGE_MAIN" && r.result === "PASS"
+    && r.attempt === state.state.attempts);
+  const event = history.find(e => e.event_id === c04?.eventId);
+  const proof = event?.metadata || {};
+  const qa = history.find(e => e.event_id === proof.qaPassEventId);
+  const lastQa = history.findLast(e => e.event_type === "test_result" && e.actor_type === "test_ai");
+  const originalClaim = [...history].reverse().find(e =>
+    e.event_type === "claim" && e.actor_type === "controller_ai"
+    && e.session_id === task.sessionId && e.actor_id === c04?.actorId);
+  if (state.state.cursors.controller_ai !== "C05_POSTMERGE" || !c04 || !originalClaim
+    || c04.sessionId !== task.sessionId
+    || event?.event_type !== "controller_c04_merge_published"
+    || event.actor_type !== "controller_ai"
+    || event.actor_id !== c04.actorId || event.session_id !== c04.sessionId
+    || qa?.actor_type !== "test_ai" || qa.event_type !== "test_result"
+    || qa.event_id !== lastQa?.event_id
+    || qa.metadata?.testResult !== "pass" || !qa.metadata?.atomicLifecycle
+    || proof.candidateSha !== qa.metadata?.commitSha
+    || !/^[a-f0-9]{40}$/i.test(proof.mergeCommitSha || "")
+    || proof.mergeCommitSha !== proof.remoteMainSha
+    || !/^[a-f0-9]{64}$/i.test(proof.reportSha256 || "")) return null;
+  const rel = String(proof.reportPath || "").replaceAll("\\", "/");
+  if (!rel.startsWith("reports/") || rel.includes("../") || rel.includes("//")
+    || !rel.endsWith(".md")) return null;
+  const file = path.resolve(rootDir, rel);
+  if (!file.startsWith(path.resolve(rootDir) + path.sep)) return null;
+  let contents;
+  try { contents = await fs.readFile(file); } catch { return null; }
+  if (contents.length === 0 || contents.length > 2 * 1024 * 1024
+    || createHash("sha256").update(contents).digest("hex") !== proof.reportSha256) return null;
+  if (!(await verifiedRemoteTakeoverCandidate(rootDir,
+    { commitSha: proof.remoteMainSha, headBranch: "main" }))) return null;
+  // Independently verify that merged source is an ancestor of the immutable remote main.
+  if (!(await gitStatus(rootDir, ["merge-base", "--is-ancestor", proof.candidateSha, proof.remoteMainSha]))) return null;
+  if (!(await gitStatus(rootDir, ["rev-parse", "--verify", "refs/heads/main"], proof.remoteMainSha))) return null;
+  return { c04EventId: event.event_id, qaPassEventId: qa.event_id,
+    candidateSha: proof.candidateSha, remoteMainSha: proof.remoteMainSha,
+    reportSha256: proof.reportSha256 };
+}
+async function gitStatus(root, args, stdoutMustEqual = null) {
+  return new Promise(resolve => {
+    const child = spawn("git", ["-C", root, ...args],
+      { windowsHide: true, stdio: ["ignore", "pipe", "ignore"] });
+    let out = ""; child.stdout.setEncoding("utf8");
+    child.stdout.on("data", chunk => { if (out.length < 2048) out += chunk; });
+    child.on("error", () => resolve(false));
+    child.on("close", code => resolve(code === 0
+      && (stdoutMustEqual === null || out.trim() === stdoutMustEqual)));
+  });
+}
+
 async function contextAndTask(taskStore, projectId, taskId) {
   const context = await taskStore.projects.context(projectId);
   const pair = await taskStore.getTask(projectId, taskId);
@@ -1856,6 +1912,14 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
             });
           }
         }
+        if (task.status === "交付中") {
+          requireUserSession(identity);
+          if (body.actorType !== "controller_ai") {
+            throw new TaskboardError("交付中只能由用户会话授权总控接管", {
+              code: "CONTROLLER_TAKEOVER_ROLE_REQUIRED", status: 403
+            });
+          }
+        }
         if (!context.workflow.isExecutionStatus(task.status) && task.status !== "待交付") {
           throw new TaskboardError("只有执行中或待交付任务可以授权异常接管", {
             code: "TAKEOVER_STAGE_INVALID", status: 409, details: { status: task.status }
@@ -1934,6 +1998,94 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
               code: "TAKEOVER_STANDING_CONTEXT_INVALID", status: 409
             });
           }
+        }
+        if (task.status === "交付中") {
+          requireTrustedApiIdentity(identity);
+          const auth = state.authorization, authz = auth?.metadata || {};
+          if (!state.takeoverAllowed || !state.suspectedDisconnect || !auth
+            || auth.actor_type !== "user"
+            || authz.authorizationSource !== "browser_user_session"
+            || authz.authorizedFromStatus !== "交付中"
+            || authz.authorizedFromAssignee !== task.assignee
+            || authz.authorizedFromSessionId !== task.sessionId
+            || authz.authorizedRegistryRevision !== snapshot.registryRevision) {
+            throw new TaskboardError("交付中接管缺少可信用户会话授权或已过期", {
+              code: "CONTROLLER_TAKEOVER_AUTHORIZATION_REQUIRED", status: 409
+            });
+          }
+          if (body.actorType !== "controller_ai" || !body.actorId || !body.assignee
+            || !body.sessionId || !body.sessionWindowName
+            || body.actorId === task.assignee || body.sessionId === task.sessionId) {
+            throw new TaskboardError("必须使用新的总控actor和Session", {
+              code: "CONTROLLER_TAKEOVER_IDENTITY_REQUIRED", status: 409
+            });
+          }
+          if ((await taskStore.stopState(params.projectId, params.taskId)).stopRequested) {
+            throw new TaskboardError("STOP期间不能接管", {
+              code: "CONTROLLER_TAKEOVER_STOP", status: 409
+            });
+          }
+          if ((await taskStore.testResourceState(params.projectId, params.taskId)).activeCount) {
+            throw new TaskboardError("活动资源未清理，不能接管", {
+              code: "CONTROLLER_TAKEOVER_ACTIVE_RESOURCES", status: 409
+            });
+          }
+          const inspection = String(body.liveInspection || "").trim();
+          if (inspection.length < 12 || !state.suspicion
+            || state.suspicion.metadata?.observedSessionId !== task.sessionId
+            || state.suspicion.metadata?.observedAssignee !== task.assignee) {
+            throw new TaskboardError("缺少原Session失联核验", {
+              code: "CONTROLLER_TAKEOVER_INSPECTION_REQUIRED", status: 409
+            });
+          }
+          const history = await taskStore.taskHistory(params.projectId, params.taskId, { all: true });
+          const deps = String(task.readDependencies || "").split(/[；;]/)
+            .map(text => text.replaceAll("`", "").trim()
+              .match(/^([A-Za-z0-9][A-Za-z0-9._-]{0,127})\s*完成$/)?.[1]).filter(Boolean);
+          if (deps.length) {
+            const tasks = (await taskStore.snapshot(params.projectId)).tasks;
+            if (deps.some(id => !tasks.some(row => row.id === id && row.status === "已完成"))) {
+              throw new TaskboardError("交付硬前置尚未完成", {
+                code: "CONTROLLER_TAKEOVER_DEPENDENCY_INCOMPLETE", status: 409
+              });
+            }
+          }
+          const suspectIndex = history.findIndex(e => e.event_id === state.suspicion.event_id);
+          if (suspectIndex < 0) throw new TaskboardError("疑似失联事件与当前历史不一致", {
+            code: "CONTROLLER_TAKEOVER_INSPECTION_REQUIRED", status: 409
+          });
+          const afterSuspect = history.slice(suspectIndex + 1);
+          if (afterSuspect.some(e => e.actor_type === "controller_ai"
+            && e.session_id === task.sessionId
+            && /^(?:step_report_|controller_)/.test(e.event_type))) {
+            throw new TaskboardError("原总控Session仍有执行活动", {
+              code: "CONTROLLER_TAKEOVER_OLD_ACTIVE", status: 409
+            });
+          }
+          const proof = await controllerInFlightEvidence(taskStore, context.rootRealPath,
+            params.projectId, params.taskId, task, history);
+          if (!proof) throw new TaskboardError("C04/QA/Git合并证据不完整", {
+            code: "CONTROLLER_TAKEOVER_C04_INVALID", status: 409
+          });
+          const generation = history.filter(e => e.event_type === "takeover"
+            && e.actor_type === "controller_ai").length + 1;
+          const result = await taskStore.updateTask(params.projectId, params.taskId, {
+            assignee: body.assignee, sessionWindowName: body.sessionWindowName,
+            sessionId: body.sessionId
+          }, {
+            operationId: body.operationId, expectedRevision: body.expectedRevision,
+            eventType: "takeover", ...actorOptions(identity, body),
+            metadata: {
+              inflightControllerTakeover: true, generation,
+              authorizationOperationId: auth.operation_id,
+              suspicionOperationId: state.suspicion.operation_id,
+              previousAssignee: task.assignee, previousSessionId: task.sessionId,
+              newAssignee: body.assignee, newSessionId: body.sessionId,
+              liveInspection: inspection, ...proof
+            }
+          });
+          return send(res, 200, { ...result, takeoverConsumed: true,
+            generation, resumeStep: "C05_POSTMERGE", preservedC04: true });
         }
         if (task.status === "待交付") {
           requireTrustedApiIdentity(identity);

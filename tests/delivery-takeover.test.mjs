@@ -414,3 +414,179 @@ test("explicit bold Markdown QA PASS with matching SHA remains valid", async (t)
   assert.equal(result.data.after.status, "待交付");
   assert.equal(result.data.requiresIndependentRetest, false);
 });
+
+async function setupInFlight(t) {
+  const x = await setup(t);
+  const { TaskStepCheckpoint } = await import("../server/task-step-checkpoint.mjs");
+  const { createHash } = await import("node:crypto");
+  const controller = "controller-old", oldSession = "wc_sess_controller_old";
+  assert.equal((await preclaim(x, controller, oldSession, "controller_ai")).status, 200);
+  const claimResult = await claim(x, controller, oldSession, "inflight.controller.claim", "controller_ai");
+  assert.equal(claimResult.status, 200, JSON.stringify(claimResult.data));
+  const history = await x.app.taskStore.taskHistory("fixture", "D-PENDING", { all: true });
+  const qa = history.find(e => e.event_type === "test_result" && e.actor_type === "test_ai");
+  const reportPath = "reports/D-PENDING/controller-c04.md";
+  const report = "交付C04合并报告\n候选SHA：" + x.sha + "\nC04 PASS\n";
+  await fs.writeFile(path.join(x.fixture.projectRoot, reportPath), report);
+  const sha = createHash("sha256").update(report).digest("hex");
+  const c04 = await x.app.taskStore.appendTaskEvent("fixture", "D-PENDING", {
+    operationId: "inflight.c04.published", eventType: "controller_c04_merge_published",
+    actorType: "controller_ai", actorId: controller, sessionId: oldSession,
+    metadata: {
+      reportSha256: sha, candidateSha: x.sha, qaPassEventId: qa.event_id,
+      mergeCommitSha: x.sha, remoteMainSha: x.sha, reportPath
+    }
+  });
+  const records = ["C00_A_REQUIREMENTS", "C00_B_MAIN_VERSION", "C00_C_SAFE_CLEANUP",
+    "C01_SCAN", "C02_TRIAGE", "C03_DISPATCH", "C04_MERGE_MAIN"].map(stepId => ({
+    operationId: "fixture." + stepId, stepId, actorType: "controller_ai",
+    actorId: controller, sessionId: oldSession, result: "PASS",
+    attempt: 1, evidence: "真实fixture已合并C04 QA PASS", eventId:
+      stepId === "C04_MERGE_MAIN" ? c04.event.event_id : null
+  }));
+  const state = { version: 1, projectId: "fixture", taskId: "D-PENDING",
+    flowVersion: "role-steps-v2",
+    cursors: { controller_ai: "C05_POSTMERGE", developer_ai: null, test_ai: null },
+    attempts: 1, records, lastAction: records.at(-1) };
+  await fs.writeFile(path.join(x.fixture.projectRoot, "cp/D-PENDING.md"),
+    "# D-PENDING\n<!-- TASK_STEP_CHECKPOINT_START v1 -->\n" +
+    JSON.stringify(state) + "\n<!-- TASK_STEP_CHECKPOINT_END -->\n");
+  const checkpoint = await new TaskStepCheckpoint(x.fixture.boardRoot, {
+    taskStore: x.app.taskStore
+  }).init();
+  const current = await checkpoint.show("fixture", "D-PENDING");
+  assert.equal(current.state.cursors.controller_ai, "C05_POSTMERGE");
+  const suspect = await x.send("/takeover/suspect", {
+    operationId: "inflight.suspect", actorType: "controller_ai",
+    actorId: "controller-new", sessionId: "wc_sess_controller_new",
+    note: "已核查旧总控无工作任务与步骤进展"
+  });
+  assert.equal(suspect.status, 200, JSON.stringify(suspect.data));
+  const authorize = await x.send("/takeover/allow", {
+    operationId: "inflight.allow", actorType: "controller_ai",
+    note: "用户授权交付中可信总控接管"
+  }, true);
+  assert.equal(authorize.status, 200, JSON.stringify(authorize.data));
+  const body = {
+    operationId: "inflight.execute", expectedRevision: (await x.get()).registryRevision,
+    actorType: "controller_ai", actorId: "controller-new", assignee: "新总控",
+    sessionId: "wc_sess_controller_new", sessionWindowName: "总控新窗口",
+    liveInspection: "核查原Session没有任何在执行的作业且原工作区保持原样"
+  };
+  return { ...x, checkpoint, body, oldSession, controller, c04 };
+}
+
+test("P0 in-flight controller takeover preserves merged C04 and starts C05 with a new session", async t => {
+  const x = await setupInFlight(t);
+  const old = await x.checkpoint.show("fixture", "D-PENDING");
+  const result = await x.send("/takeover", x.body);
+  assert.equal(result.status, 200, JSON.stringify(result.data));
+  assert.equal(result.data.after.status, "交付中");
+  assert.equal(result.data.after.sessionId, x.body.sessionId);
+  assert.equal(result.data.resumeStep, "C05_POSTMERGE");
+  assert.equal(result.data.preservedC04, true);
+  const cp = await x.checkpoint.show("fixture", "D-PENDING");
+  assert.equal(cp.sha256, old.sha256);
+  assert.equal(cp.state.cursors.controller_ai, "C05_POSTMERGE");
+  const oldAction = () => x.checkpoint.record("fixture", "D-PENDING", {
+    operationId: "inflight.old.C05", expectedSha256: cp.sha256,
+    stepId: "C05_POSTMERGE", actorType: "controller_ai",
+    actorId: x.controller, sessionId: x.oldSession, result: "PASS",
+    evidence: "旧Session不应该继续被批准登记C05"
+  });
+  await assert.rejects(oldAction(),e=>e.code==="CHECKPOINT_SESSION_MISMATCH");
+  const newer = await x.checkpoint.record("fixture", "D-PENDING", {
+    operationId: "inflight.new.C05", expectedSha256: cp.sha256,
+    stepId: "C05_POSTMERGE", actorType: "controller_ai",
+    actorId: x.body.actorId, sessionId: x.body.sessionId, result: "PASS",
+    evidence: "真实C04后一轮完整整仓复测及服务验证通过"
+  });
+  assert.equal(newer.state.cursors.controller_ai, "C06_CLEANUP");
+  const stale = await x.send("/takeover", {
+    ...x.body, operationId: "inflight.duplicate", expectedRevision: result.data.registryRevision
+  });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.data.error.code, "CONTROLLER_TAKEOVER_AUTHORIZATION_REQUIRED");
+});
+
+test("P0 in-flight controller rejects missing authorization, wrong role and old activity", async t => {
+  const x = await setupInFlight(t);
+  const invalid = await x.send("/takeover", {
+    ...x.body, operationId: "inflight.bad.actor", actorType: "developer_ai"
+  });
+  assert.equal(invalid.status, 409);
+  assert.equal(invalid.data.error.code, "CONTROLLER_TAKEOVER_IDENTITY_REQUIRED");
+  await x.app.taskStore.appendTaskEvent("fixture", "D-PENDING", {
+    operationId: "inflight.old.progress", eventType: "step_report_started",
+    actorType: "controller_ai", actorId: x.controller, sessionId: x.oldSession,
+    metadata: { stepId: "C05_POSTMERGE" }
+  });
+  const active = await x.send("/takeover", x.body);
+  assert.equal(active.status, 409);
+  assert.equal(active.data.error.code, "CONTROLLER_TAKEOVER_OLD_ACTIVE");
+  assert.equal((await x.get()).sessionId, x.oldSession);
+});
+
+test("P0 in-flight controller fails closed on STOP and changed C04 report", async t => {
+  const x = await setupInFlight(t);
+  await x.app.taskStore.appendTaskEvent("fixture", "D-PENDING", {
+    operationId: "inflight.user.stop", eventType: "stop_request",
+    actorType: "user", actorId: "user", sessionId: ""
+  });
+  const stopped = await x.send("/takeover", x.body);
+  assert.equal(stopped.status, 409);
+  assert.equal(stopped.data.error.code, "CONTROLLER_TAKEOVER_STOP");
+  const original = await fs.readFile(path.join(x.fixture.projectRoot,
+    "reports/D-PENDING/controller-c04.md"));
+  await fs.writeFile(path.join(x.fixture.projectRoot, "reports/D-PENDING/controller-c04.md"),
+    Buffer.concat([original, Buffer.from("forged")]));
+  await x.app.taskStore.appendTaskEvent("fixture", "D-PENDING", {
+    operationId: "inflight.stop.ack", eventType: "stop_acknowledged",
+    actorType: "user", actorId: "user", sessionId: ""
+  });
+  const mismatch = await x.send("/takeover", { ...x.body, operationId: "inflight.bad.report" });
+  assert.equal(mismatch.status, 409);
+  assert.equal(mismatch.data.error.code, "CONTROLLER_TAKEOVER_C04_INVALID");
+  assert.equal((await x.get()).sessionId, x.oldSession);
+});
+
+test("P0 in-flight controller refuses invalidated independent QA and stale revision", async t => {
+  const x = await setupInFlight(t);
+  await x.app.taskStore.appendTaskEvent("fixture", "D-PENDING", {
+    operationId: "inflight.qa.later.failed", eventType: "test_result",
+    actorType: "test_ai", actorId: "qa-dev", sessionId: "wc_sess_qa",
+    metadata: { atomicLifecycle: true, testResult: "fail" }
+  });
+  const staleQA = await x.send("/takeover", x.body);
+  assert.equal(staleQA.status, 409);
+  assert.equal(staleQA.data.error.code, "CONTROLLER_TAKEOVER_C04_INVALID");
+  const old = await x.get();
+  const change = await fetch(x.base + x.root, {
+    method: "PATCH", headers: x.browser,
+    body: JSON.stringify({ operationId: "inflight.priority.changed",
+      expectedRevision: old.registryRevision, eventType: "priority_change",
+      patch: { priority: "P1" } })
+  });
+  assert.equal(change.status, 200);
+  const now = await x.get();
+  const stale = await x.send("/takeover", {
+    ...x.body, operationId: "inflight.stale.rev", expectedRevision: now.registryRevision
+  });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.data.error.code, "CONTROLLER_TAKEOVER_AUTHORIZATION_REQUIRED");
+});
+
+test("P0 in-flight controller requires browser user grant, not ordinary bearer", async t => {
+  const x = await setupInFlight(t);
+  const forged = await x.send("/takeover/allow", {
+    operationId: "inflight.bearer.controller.allow",
+    actorType: "controller_ai", actorId: "forged-controller",
+    sessionId: "wc_sess_forged", note: "伪造授权",
+    chatAuthorization: {
+      source: "direct_user_message", projectId: "fixture", scope: "task",
+      taskId: "D-PENDING", quote: "我允许你直接异常接管"
+    }
+  });
+  assert.equal(forged.status, 403);
+  assert.equal(forged.data.error.code, "USER_SESSION_REQUIRED");
+});
