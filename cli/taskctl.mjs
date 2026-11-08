@@ -213,6 +213,7 @@ try {
         "taskctl projects",
         "taskctl list [--project wyerp-taskboard]",
         "taskctl create --project PROJECT --task TASK-ID --parent TEXT --track product[/subtrack]|bugfix|infrastructure --priority P0 --status 待开发 --planned-role 开发AI --boundary TEXT --plan PATH --traceability TEXT --read-dependencies TEXT --write-targets TEXT --targets TEXT [--acceptance-scope system|user_ui_business]",
+        "taskctl correct-empty-dependencies --project PROJECT --task TASK-ID --actor-type controller_ai --actor-id ID --session-id ID --creation-event-id EVENT-ID --note EVIDENCE",
         "taskctl get --project PROJECT --task WTB-TEST-001",
         "taskctl context --task TASK-ID [--project PROJECT]",
         "taskctl guard --project PROJECT --task WTB-TEST-001 [--actor-id ID --session-id ID]",
@@ -259,6 +260,8 @@ try {
   } else if (command === "create") {
     const project = explicitProject(args);
     const snapshot = await request("/api/projects/" + encodeURIComponent(project) + "/tasks");
+    const readDependencies = args["read-dependencies"];
+    if (readDependencies === true) throw new Error("--read-dependencies requires a text value, not a bare flag");
     const acceptanceScope = args["acceptance-scope"] ? String(args["acceptance-scope"]).trim() : "";
     if (acceptanceScope && !["system", "user_ui_business"].includes(acceptanceScope)) throw new Error("--acceptance-scope must be system or user_ui_business");
     const task = {
@@ -271,7 +274,7 @@ try {
       boundary: required(args, "boundary"),
       plan: required(args, "plan"),
       traceability: required(args, "traceability"),
-      readDependencies: args["read-dependencies"] || "",
+      readDependencies: readDependencies ?? "",
       writeTargets: required(args, "write-targets"),
       targets: required(args, "targets")
     };
@@ -284,6 +287,20 @@ try {
         ...actor(args, args["actor-type"] || "developer_ai"),
         metadata: metadata(args, {...(acceptanceScope?{acceptanceScope}:{}),
           ...(args["rule-source-task"]?{ruleReadContextTaskId:args["rule-source-task"]}:{})})
+      }
+    }));
+  } else if (command === "correct-empty-dependencies") {
+    const { project, task } = projectTask(args);
+    const before = await current(project, task);
+    output(await request("/api/projects/" + encodeURIComponent(project) + "/tasks/" + encodeURIComponent(task), {
+      method: "PATCH", body: {
+        operationId: operationId(args, "task_dependency_true_correction"),
+        expectedRevision: before.registryRevision,
+        eventType: "task_dependency_true_correction",
+        patch: { readDependencies: "" },
+        ...actor(args, "controller_ai"),
+        note: required(args, "note"),
+        metadata: { creationEventId: required(args, "creation-event-id"), reason: "cli_empty_dependency_boolean" }
       }
     }));
   } else if (command === "get") {

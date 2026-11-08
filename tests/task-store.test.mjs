@@ -703,3 +703,67 @@ test("TaskStore rule-read receipts are session-bound, cannot be forged, and expi
   assert.equal(after.developmentIssue,null);
   assert.equal(after.suspectedDisconnect,false);
 });
+
+test("CLI boolean dependency can be transactionally corrected only before development", async (t) => {
+  const f = await makeFixture();
+  t.after(() => fs.rm(f.boardRoot, { recursive: true, force: true }));
+  const store = await new TaskStore(f.boardRoot).init();
+  const template = id => ({
+    id, parent: "CLI boolean regression", track: "bugfix", priority: "P0",
+    status: "待开发", plannedRole: "开发AI", boundary: "fixed", plan: "plan.md",
+    traceability: "tests/task-store.test.mjs", readDependencies: true,
+    writeTargets: "cli/taskctl.mjs", targets: "plan.md"
+  });
+  const create = async id => {
+    const result = await store.createTask("fixture", template(id), {
+      expectedRevision: (await store.snapshot("fixture")).registryRevision,
+      operationId: "emptydep.create." + id, actorType: "controller_ai",
+      actorId: "controller", sessionId: "ctrl-session"
+    });
+    return (await store.taskHistory("fixture", id, { all: true }))
+      .find(event => event.event_type === "task_created").event_id;
+  };
+  const correct = async (id, eventId, overrides = {}) => store.updateTask(
+    "fixture", id, { readDependencies: "" }, {
+      expectedRevision: (await store.snapshot("fixture")).registryRevision,
+      operationId: "emptydep.correct." + id + "." + (overrides.label || "valid"),
+      eventType: "task_dependency_true_correction", actorType: "controller_ai",
+      actorId: "controller", sessionId: "ctrl-session",
+      metadata: { reason: "cli_empty_dependency_boolean", creationEventId: eventId },
+      ...overrides
+    });
+  const validId = "EMPTYDEP-CORRECT";
+  const validCreation = await create(validId);
+  assert.equal((await store.getTask("fixture", validId)).task.readDependencies, "true");
+  await assert.rejects(store.updateTask("fixture", validId, { readDependencies: "" }, {
+    expectedRevision: (await store.snapshot("fixture")).registryRevision,
+    operationId: "emptydep.patch.rejected", actorType: "controller_ai",
+    actorId: "controller", sessionId: "ctrl-session"
+  }), e => e.code === "FIELD_NOT_WRITABLE");
+  await assert.rejects(correct(validId, "evt_forged", { label: "forged" }),
+    e => e.code === "TASK_DEPENDENCY_CORRECTION_NOT_ALLOWED");
+  await assert.rejects(correct(validId, validCreation, { label: "wrongactor", actorType: "developer_ai" }),
+    e => e.code === "TASK_DEPENDENCY_CORRECTION_NOT_ALLOWED");
+  await assert.rejects(correct(validId, validCreation, {
+    label: "stale", expectedRevision: "stale_revision"
+  }), e => e.code === "REVISION_CONFLICT");
+  const original = (await store.getTask("fixture", validId)).task;
+  const done = await correct(validId, validCreation);
+  assert.equal(done.after.readDependencies, "");
+  assert.equal(done.after.status, original.status);
+  assert.equal(done.after.assignee, original.assignee);
+  assert.equal(done.after.plan, original.plan);
+  assert.equal((await store.transactions.read("emptydep.correct." + validId + ".valid")).state, "committed");
+  assert.equal((await store.getTask("fixture", validId)).task.readDependencies, "");
+  await assert.rejects(correct(validId, validCreation, { label: "repeat" }),
+    e => e.code === "TASK_DEPENDENCY_CORRECTION_NOT_ALLOWED");
+  const frozenId = "EMPTYDEP-CLAIMED";
+  const frozenCreation = await create(frozenId);
+  await store.appendTaskEvent("fixture", frozenId, {
+    operationId: "emptydep.frozen.claim", eventType: "claim",
+    actorType: "developer_ai", actorId: "dev", sessionId: "dev-session"
+  });
+  await assert.rejects(correct(frozenId, frozenCreation),
+    e => e.code === "TASK_DEPENDENCY_CORRECTION_NOT_ALLOWED");
+  assert.equal((await store.getTask("fixture", frozenId)).task.readDependencies, "true");
+});

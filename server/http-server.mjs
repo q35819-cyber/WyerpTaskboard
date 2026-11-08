@@ -1165,6 +1165,7 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
             });
           }
         }
+        if (body.eventType === "task_dependency_true_correction") requireTrustedApiIdentity(identity);
         if (!body.patch || typeof body.patch !== "object") throw new TaskboardError("patch不能为空", { code: "INVALID_PATCH", status: 400 });
         const result = await taskStore.updateTask(params.projectId, params.taskId, body.patch, {
           expectedRevision: body.expectedRevision,

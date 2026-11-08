@@ -2448,3 +2448,56 @@ test("server checks full rule chunks and scenarios before claim, rejecting forge
   assert.equal(accepted.status,200);
   assert.equal((await accepted.json()).after.status,"开发中");
 });
+
+test("HTTP correction uses trusted controller transaction, not browser or ordinary PATCH", async (t) => {
+  const { fixture, base, secret } = await startFixture(t);
+  const url = base + "/api/projects/fixture/tasks";
+  const headers = { Authorization: "Bearer " + secret, "Content-Type": "application/json" };
+  const api = async (route, method = "GET", body, customHeaders = headers) => {
+    const res = await fetch(route, {
+      method, headers: customHeaders, ...(body ? { body: JSON.stringify(body) } : {})
+    });
+    return { status: res.status, payload: await res.json() };
+  };
+  const initial = await api(url);
+  const task = {
+    id: "EMPTYDEP-HTTP", parent: "legacy CLI flag", track: "bugfix",
+    priority: "P0", status: "待开发", plannedRole: "开发AI",
+    boundary: "boolean dependency", plan: "plan.md", traceability: "CLI",
+    readDependencies: true, writeTargets: "cli/taskctl.mjs", targets: "plan.md"
+  };
+  const created = await api(url, "POST", {
+    operationId: "emptydep.http.create", expectedRevision: initial.payload.registryRevision,
+    task, actorType: "controller_ai", actorId: "controller", sessionId: "controller-session"
+  });
+  assert.equal(created.status, 201);
+  const taskUrl = url + "/" + task.id;
+  const history = await api(taskUrl + "/history");
+  const eventId = history.payload.events.find(event => event.event_type === "task_created").event_id;
+  const revision = (await api(url)).payload.registryRevision;
+  const request = {
+    operationId: "emptydep.http.correct", expectedRevision: revision,
+    eventType: "task_dependency_true_correction", patch: { readDependencies: "" },
+    actorType: "controller_ai", actorId: "controller", sessionId: "controller-session",
+    metadata: { creationEventId: eventId, reason: "cli_empty_dependency_boolean" }
+  };
+  const browser = await api(taskUrl, "PATCH", request, { "Content-Type": "application/json" });
+  assert.notEqual(browser.status, 200, "browser cannot use admin correction");
+  const ordinary = await api(taskUrl, "PATCH", {
+    ...request, operationId: "emptydep.http.ordinary", eventType: "task_update"
+  });
+  assert.equal(ordinary.payload.error.code, "FIELD_NOT_WRITABLE");
+  const extra = await api(taskUrl, "PATCH", {
+    ...request, operationId: "emptydep.http.extra",
+    patch: { readDependencies: "", priority: "P1" }
+  });
+  assert.equal(extra.payload.error.code, "TASK_DEPENDENCY_CORRECTION_NOT_ALLOWED");
+  const authorized = await api(taskUrl, "PATCH", request);
+  assert.equal(authorized.status, 200);
+  assert.equal(authorized.payload.after.readDependencies, "");
+  const loaded = await api(taskUrl);
+  assert.equal(loaded.payload.readDependencies, "");
+  const events = await api(taskUrl + "/history");
+  assert.equal(events.payload.events.filter(event =>
+    event.event_type === "task_dependency_true_correction").length, 1);
+});

@@ -26,6 +26,28 @@ function injectedCrash(phase) {
   });
 }
 
+// The only nonstandard registry correction: a CLI boolean accidentally saved as "true".
+function correctedEmptyDependenciesText(fileText, context, taskId) {
+  const old = context.adapter.parseRegistryText(fileText, context.project);
+  const row = old.rowMeta.get(taskId);
+  const index = old.indexes.readDependencies;
+  if (!row || index < 0) throw new TaskboardError("任务注册表缺少依赖字段", {
+    code: "REGISTRY_SCHEMA_ERROR", status: 422
+  });
+  const cells = [...row.cells];
+  cells[index] = "—";
+  const lines = [...old.lines];
+  lines[row.lineIndex] = "| " + cells.join(" | ") + " |";
+  const next = old.text.slice(0, old.blockStart) + lines.join(old.eol) + old.text.slice(old.end);
+  const text = old.hasBom ? "\ufeff" + next : next;
+  const updated = context.adapter.parseRegistryText(text, context.project);
+  return {
+    text, before: old.tasks.find(task => task.id === taskId),
+    after: updated.tasks.find(task => task.id === taskId),
+    beforeRevision: old.registryRevision, afterRevision: updated.registryRevision,
+    beforeFileSha256: old.fileSha256, afterFileSha256: updated.fileSha256
+  };
+}
 const RULE_INTERNAL=Symbol("RULE_INTERNAL");
 const RULE_ANSWERS={parallel_different_tasks:"allow_isolated",parallel_same_task:"deny_duplicate",
 stale_takeover:"revoke_old_session",incomplete_dependency_or_stop:"deny_claim",
@@ -1139,6 +1161,24 @@ export class TaskStore {
 
       const currentTask = parsed.tasks.find((item) => item.id === taskId);
       if (!currentTask) throw new TaskboardError("未知任务ID: " + taskId, { code: "TASK_NOT_FOUND", status: 404 });
+      if (eventType === "task_dependency_true_correction") {
+        const history = await this.events.listTaskEvents(projectId, taskId, { all: true });
+        const created = history.find(event => event.event_type === "task_created");
+        const started = history.some(event =>
+          ["claim", "takeover", "handoff", "test_start", "test_result", "delivery_complete"].includes(event.event_type));
+        if (actorType !== "controller_ai" || !actorId || !sessionId
+          || currentTask.status !== "待开发" || currentTask.assignee
+          || currentTask.sessionId || currentTask.sessionWindowName
+          || currentTask.readDependencies !== "true" || started
+          || (await this.stopState(projectId, taskId)).stopRequested
+          || !patch || Object.keys(patch).length !== 1 || patch.readDependencies !== ""
+          || metadata?.reason !== "cli_empty_dependency_boolean"
+          || !created || metadata?.creationEventId !== created.event_id) {
+          throw new TaskboardError("仅允许可信总控纠正未开工任务的CLI空前置误写", {
+            code: "TASK_DEPENDENCY_CORRECTION_NOT_ALLOWED", status: 409
+          });
+        }
+      }
       if (eventType === "auto_unblock") {
         const allowed = await eligibleTemporaryUnblock(this, projectId, currentTask, parsed.tasks, context);
         if (actorType !== "system" || !allowed || patch.status !== allowed.target ||
@@ -1276,7 +1316,9 @@ export class TaskStore {
       if (parsed.indexes.updatedAt >= 0 && !("updatedAt" in effectivePatch)) {
         effectivePatch.updatedAt = new Date().toISOString();
       }
-      const change = context.adapter.patchRegistryText(fileText, context.project, taskId, effectivePatch, context.workflow);
+      const change = eventType === "task_dependency_true_correction"
+        ? correctedEmptyDependenciesText(fileText, context, taskId)
+        : context.adapter.patchRegistryText(fileText, context.project, taskId, effectivePatch, context.workflow);
       const timestamp = new Date().toISOString();
       const event = {
         operation_id: operationId,

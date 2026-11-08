@@ -782,3 +782,33 @@ test("taskctl rules, rule-chunk, rule-verify use current server evidence rather 
     ["guard",...projectTask,...who])).stdout);
   assert.equal(guard.ruleRead.valid,true);
 });
+
+test("taskctl create keeps missing, empty and real dependencies distinct", async (t) => {
+  const { fixture, base } = await startFixture(t);
+  const baseArgs = [
+    "create", "--project", "fixture", "--task", "EMPTYDEP-OMITTED",
+    "--parent", "CLI optional dependencies", "--track", "bugfix", "--priority", "P0",
+    "--status", "待开发", "--planned-role", "开发AI", "--boundary", "CLI-only boundary",
+    "--plan", "plan.md", "--traceability", "CLI source", "--write-targets", "cli/taskctl.mjs",
+    "--targets", "plan.md"
+  ];
+  const created = async (id, extra) => {
+    const args = [...baseArgs]; args[args.indexOf("--task") + 1] = id;
+    return taskctl(fixture.boardRoot, base, [...args, ...extra]);
+  };
+  for (const [id, extra, expected] of [
+    ["EMPTYDEP-OMITTED", [], ""],
+    ["EMPTYDEP-EMPTY", ["--read-dependencies", ""], ""],
+    ["EMPTYDEP-REAL", ["--read-dependencies", "other-task completed"], "other-task completed"]
+  ]) {
+    await created(id, extra);
+    const row = JSON.parse((await taskctl(fixture.boardRoot, base,
+      ["get", "--project", "fixture", "--task", id])).stdout);
+    assert.equal(row.readDependencies, expected);
+  }
+  await assert.rejects(created("EMPTYDEP-BARE", ["--read-dependencies"]),
+    error => { assert.match(error.stderr, /requires a text value/); return true; });
+  const all = JSON.parse((await taskctl(fixture.boardRoot, base,
+    ["list", "--project", "fixture"])).stdout).tasks;
+  assert.equal(all.some(task => task.id === "EMPTYDEP-BARE"), false);
+});
