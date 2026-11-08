@@ -145,6 +145,142 @@ test("explicit current chat user authorization can replace browser clicking, sco
   assert.equal((await replay.json()).error.code, "TAKEOVER_NOT_ALLOWED");
 });
 
+test("browser-signed standing authorization allows verified disconnect without a new quote, and revocation is effective", async (t) => {
+  const fx = await startFixture(t);
+  const standing = fx.base + "/api/projects/fixture/takeover/standing-authorization";
+  const takeover = fx.base + "/api/projects/fixture/tasks/B-10/takeover";
+  const who = { actorType: "developer_ai", actorId: "standing-dev", sessionWindowName: "standing dev", sessionId: "wc_sess_standing_new" };
+  const browserGrant = (operationId, action, roles = []) => fetch(standing, {
+    method: "POST", headers: fx.browserHeaders,
+    body: JSON.stringify({ operationId, action, roles })
+  });
+  const bearerGrant = await fetch(standing, {
+    method: "POST", headers: fx.bearerHeaders,
+    body: JSON.stringify({ operationId: "standing.spoof.001", action: "grant", roles: ["developer_ai"] })
+  });
+  assert.equal(bearerGrant.status, 403);
+  assert.equal((await bearerGrant.json()).error.code, "USER_SESSION_REQUIRED");
+  const initial = await (await fetch(standing, { headers: fx.bearerHeaders })).json();
+  assert.equal(initial.enabled, false);
+  assert.equal(initial.requiresBrowserRegistration, true);
+
+  const granted = await browserGrant("standing.grant.001", "grant", ["developer_ai"]);
+  assert.equal(granted.status, 200);
+  const registered = await granted.json();
+  assert.equal(registered.enabled, true);
+  assert.ok(registered.grantEventId);
+  const suspect = await fetch(takeover + "/suspect", {
+    method: "POST", headers: fx.bearerHeaders,
+    body: JSON.stringify({ operationId: "standing.suspect.001", ...who, note: "已核查旧 Session 失联，无正在执行的作业" })
+  });
+  assert.equal(suspect.status, 200);
+  const allow = (operationId, quote) => fetch(takeover + "/allow", {
+    method: "POST", headers: fx.bearerHeaders,
+    body: JSON.stringify({ operationId, ...who, note: "系统核验后依用户持久授权接管",
+      ...(quote ? { chatAuthorization: { source: "direct_user_message", projectId: "fixture", taskId: "B-10",
+        scope: "task", quote } } : {}) })
+  });
+  const permitted = await allow("standing.allow.001", "开发中有失联的");
+  assert.equal(permitted.status, 200);
+  const history = await (await fetch(fx.base + "/api/projects/fixture/tasks/B-10/history", { headers: fx.bearerHeaders })).json();
+  const approval = history.events.find(event => event.event_type === "takeover_allowed");
+  assert.equal(approval.metadata.authorizationSource, "browser_user_session");
+  assert.equal(approval.metadata.authorizationScope, "task");
+  assert.equal(approval.metadata.standingGrantEventId, registered.grantEventId);
+
+  const revoked = await browserGrant("standing.revoke.001", "revoke");
+  assert.equal(revoked.status, 200);
+  assert.equal((await revoked.json()).enabled, false);
+  let task = await (await fetch(fx.base + "/api/projects/fixture/tasks/B-10", { headers: fx.bearerHeaders })).json();
+  const blocked = await fetch(takeover, {
+    method: "POST", headers: fx.bearerHeaders,
+    body: JSON.stringify({ operationId: "standing.execute.denied", expectedRevision: task.registryRevision,
+      assignee: "standing-dev", ...who })
+  });
+  assert.equal(blocked.status, 409);
+  assert.equal((await blocked.json()).error.code, "TAKEOVER_STANDING_AUTH_REVOKED");
+  const afterBlocked = await (await fetch(fx.base + "/api/projects/fixture/tasks/B-10", { headers: fx.bearerHeaders })).json();
+  assert.equal(afterBlocked.sessionId, task.sessionId);
+
+  const grantedAgain = await browserGrant("standing.grant.002", "grant", ["developer_ai", "test_ai"]);
+  assert.equal(grantedAgain.status, 200);
+  assert.equal((await allow("standing.allow.002")).status, 200);
+  task = await (await fetch(fx.base + "/api/projects/fixture/tasks/B-10", { headers: fx.bearerHeaders })).json();
+  const taken = await fetch(takeover, {
+    method: "POST", headers: fx.bearerHeaders,
+    body: JSON.stringify({ operationId: "standing.execute.ok", expectedRevision: task.registryRevision,
+      assignee: "standing-dev", ...who })
+  });
+  assert.equal(taken.status, 200);
+  assert.equal((await taken.json()).after.sessionId, who.sessionId);
+});
+
+test("standing grant is role-scoped and denies forged, stale, and mismatched actor evidence", async (t) => {
+  const fx = await startFixture(t);
+  const standing = fx.base + "/api/projects/fixture/takeover/standing-authorization";
+  const url = fx.base + "/api/projects/fixture/tasks/B-10/takeover";
+  const who = { actorType: "developer_ai", actorId: "fresh-dev", sessionId: "wc_sess_fresh", sessionWindowName: "new worker" };
+  const grant = await fetch(standing, { method: "POST", headers: fx.browserHeaders,
+    body: JSON.stringify({ operationId: "standing.r2.grant", action: "grant", roles: ["developer_ai"] }) });
+  assert.equal(grant.status, 200);
+  const duplicateWrongAction = await fetch(standing, { method: "POST", headers: fx.browserHeaders,
+    body: JSON.stringify({ operationId: "standing.r2.grant", action: "revoke" }) });
+  assert.equal(duplicateWrongAction.status, 409);
+  const forgedEvent = await fetch(fx.base + "/api/projects/fixture/tasks/B-10/events", {
+    method: "POST", headers: fx.bearerHeaders,
+    body: JSON.stringify({ operationId: "standing.r2.forge", eventType: "takeover_standing_granted",
+      actorType: "user", actorId: "forged", metadata: { authorizationSource: "browser_user_session", scope: "project" } })
+  });
+  assert.equal(forgedEvent.status, 403);
+  assert.equal((await fetch(url + "/suspect", { method: "POST", headers: fx.bearerHeaders,
+    body: JSON.stringify({ operationId: "standing.r2.suspect", ...who, note: "核对旧Session确实停滞" }) })).status, 200);
+  const allow = async (operationId, identity, chatAuthorization) => fetch(url + "/allow", {
+    method: "POST", headers: fx.bearerHeaders,
+    body: JSON.stringify({ operationId, ...identity, note: "核验失联后申请常设授权", ...(chatAuthorization ? { chatAuthorization } : {}) })
+  });
+  assert.equal((await allow("standing.r2.qa", { ...who, actorType: "test_ai" })).status, 403);
+  assert.equal((await allow("standing.r2.old", { ...who, actorId: "dev", sessionId: "wc_sess_test" })).status, 409);
+  assert.equal((await allow("standing.r2.negative", who, { source: "direct_user_message", projectId: "fixture",
+    taskId: "B-10", scope: "task", quote: "不允许接管" })).status, 403);
+  assert.equal((await allow("standing.r2.wrongtask", who, { source: "direct_user_message", projectId: "fixture",
+    taskId: "OTHER", scope: "task", quote: "开发中有失联的" })).status, 403);
+  const authorized = await allow("standing.r2.ok", who);
+  assert.equal(authorized.status, 200);
+  const task = await (await fetch(fx.base + "/api/projects/fixture/tasks/B-10", { headers: fx.bearerHeaders })).json();
+  const crossActor = await fetch(url, { method: "POST", headers: fx.bearerHeaders,
+    body: JSON.stringify({ operationId: "standing.r2.crossactor", expectedRevision: task.registryRevision,
+      ...who, actorId: "fake-dev", assignee: "fake-dev" }) });
+  assert.equal(crossActor.status, 409);
+  assert.equal((await crossActor.json()).error.code, "TAKEOVER_STANDING_CONTEXT_INVALID");
+  const after = await (await fetch(fx.base + "/api/projects/fixture/tasks/B-10", { headers: fx.bearerHeaders })).json();
+  assert.equal(after.sessionId, task.sessionId);
+});
+
+test("standing authorization cannot override a browser STOP request", async (t) => {
+  const fx = await startFixture(t);
+  const route = fx.base + "/api/projects/fixture/tasks/B-10";
+  const grant = await fetch(fx.base + "/api/projects/fixture/takeover/standing-authorization", {
+    method: "POST", headers: fx.browserHeaders,
+    body: JSON.stringify({ operationId: "standing.stop.grant", action: "grant", roles: ["developer_ai"] })
+  });
+  assert.equal(grant.status, 200);
+  const initial = await (await fetch(route, { headers: fx.bearerHeaders })).json();
+  const who = { actorType: "developer_ai", actorId: "new-dev", sessionId: "wc_sess_new", sessionWindowName: "new dev" };
+  assert.equal((await fetch(route + "/takeover/suspect", { method: "POST", headers: fx.bearerHeaders,
+    body: JSON.stringify({ operationId: "standing.stop.suspect", ...who, note: "旧会话无可核实进展" }) })).status, 200);
+  const stop = await fetch(route + "/stop", { method: "POST", headers: fx.browserHeaders,
+    body: JSON.stringify({ operationId: "standing.stop.request", expectedRevision: initial.registryRevision,
+      note: "用户要求停止" }) });
+  assert.equal(stop.status, 202);
+  const denied = await fetch(route + "/takeover/allow", { method: "POST", headers: fx.bearerHeaders,
+    body: JSON.stringify({ operationId: "standing.stop.deny", ...who, note: "尝试使用常设授权" }) });
+  assert.equal(denied.status, 409);
+  assert.equal((await denied.json()).error.code, "TAKEOVER_STANDING_STOP_REQUESTED");
+  const after = await (await fetch(route, { headers: fx.bearerHeaders })).json();
+  assert.equal(after.sessionId, initial.sessionId);
+  assert.equal(after.takeover.takeoverAllowed, false);
+});
+
 test("takeover authorization expires when registry revision changes", async (t) => {
   const fx = await startFixture(t);
   let task = await (await fetch(fx.base + "/api/projects/fixture/tasks/B-10", { headers: { Cookie: fx.cookie } })).json();

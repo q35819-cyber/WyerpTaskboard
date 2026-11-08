@@ -168,10 +168,28 @@ function requireTrustedApiIdentity(identity) {
     });
   }
 }
+// Only an authenticated browser session can create/revoke this durable project grant.
+// Project events have no task id, so an ordinary task event cannot impersonate one.
+async function standingTakeoverGrant(taskStore, projectId, actorType = "") {
+  const events = await taskStore.events.listTaskEvents(projectId, null, { all: true });
+  let grant = null;
+  for (const event of events) {
+    if (event.project_id !== projectId || event.task_id != null ||
+        event.actor_type !== "user" || !event.actor_id || event.session_id ||
+        event.metadata?.authorizationSource !== "browser_user_session" ||
+        event.metadata?.scope !== "project") continue;
+    if (event.event_type === "takeover_standing_granted" &&
+        Array.isArray(event.metadata?.roles) && event.metadata.roles.length > 0 &&
+        event.metadata.roles.every(role => ["developer_ai", "test_ai"].includes(role))) grant = event;
+    if (event.event_type === "takeover_standing_revoked") grant = null;
+  }
+  return grant && (!actorType || grant.metadata.roles.includes(actorType)) ? grant : null;
+}
+
 // Cooperative delegation: the AI forwards a CURRENT, explicit user utterance.
 // A bearer credential does not cryptographically prove the author of a chat
 // message; record its narrow provenance for auditing, never claim signed proof.
-function takeoverAuthorizationEvidence(identity, body, params) {
+async function takeoverAuthorizationEvidence(identity, body, params, taskStore) {
   if (identity.mode === "session") return { authorizationSource: "browser_user_session" };
   const proof = body.chatAuthorization;
   const quote = String(proof?.quote || "").trim();
@@ -180,6 +198,19 @@ function takeoverAuthorizationEvidence(identity, body, params) {
   const sessionId = String(body.sessionId || "").trim();
   const approved = /(?:允许|同意|授权|可以|直接|执行|请).{0,30}(?:异常)?接管|(?:异常)?接管.{0,20}(?:允许|同意|授权|可以|执行)|(?:^|[，,。；;\s])(?:有需要|必要时|需要时).{0,20}(?:异常)?接管.{0,20}(?:你自行处理|自行处理|你来处理|你处理)|^异常接管[！!。.]?$/.test(quote);
   const rejected = /不允许|不同意|不授权|不可以|不需要|没必要|没有必要|不必|无需|不用|没有允许|未允许|不接管|不准|不想|请勿|不要|不得|禁止|不能|拒绝|暂不|先不|别接管|取消接管/.test(quote);
+  const scoped = !proof || (proof.source === "direct_user_message" &&
+    proof.projectId === params.projectId && ["task", "project"].includes(scope) &&
+    (scope !== "task" || proof.taskId === params.taskId));
+  if (identity.mode === "bearer" && scoped && !rejected && actorId && sessionId &&
+      ["developer_ai", "test_ai"].includes(body.actorType)) {
+    const grant = await standingTakeoverGrant(taskStore, params.projectId, body.actorType);
+    if (grant) return {
+      authorizationSource: "browser_user_session", authorizationScope: "task",
+      authorizationQuote: "已验证用户浏览器会话常设授权",
+      standingGrantEventId: grant.event_id, standingGrantScope: "project",
+      authorizationForwardedBy: actorId, authorizationForwardingSessionId: sessionId
+    };
+  }
   if (identity.mode !== "bearer" || proof?.source !== "direct_user_message" ||
       proof?.projectId !== params.projectId || !["task", "project"].includes(scope) ||
       (scope === "task" && proof?.taskId !== params.taskId) ||
@@ -650,6 +681,43 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
       }
       if (req.method === "GET" && url.pathname === "/api/auth/session") {
         return send(res, 200, { ok: true, actorId: identity.actorId, mode: identity.mode, browserLoginRequired: false });
+      }
+
+      const standingParams = routeMatch(url.pathname, "/api/projects/:projectId/takeover/standing-authorization");
+      if (standingParams && ["GET", "POST"].includes(req.method)) {
+        taskStore.projects.get(standingParams.projectId);
+        if (req.method === "POST") {
+          requireUserSession(identity);
+          const body = await readJson(req);
+          requireOperation(body);
+          if (!["grant", "revoke"].includes(body.action) ||
+              (body.action === "grant" && (!Array.isArray(body.roles) || body.roles.length < 1 ||
+                body.roles.length > 2 || new Set(body.roles).size !== body.roles.length ||
+                body.roles.some(role => !["developer_ai", "test_ai"].includes(role))))) {
+            throw new TaskboardError("常设授权仅允许用户明确登记或撤销开发/独测角色", {
+              code: "TAKEOVER_STANDING_GRANT_INVALID", status: 400
+            });
+          }
+          const eventType = body.action === "grant" ? "takeover_standing_granted" : "takeover_standing_revoked";
+          const prior = await taskStore.events.findByOperationId(standingParams.projectId, body.operationId);
+          if (prior && (prior.event_type !== eventType || prior.actor_type !== "user" ||
+              prior.actor_id !== identity.actorId || prior.task_id != null)) {
+            throw new TaskboardError("常设授权操作编号已被其它事件占用", {
+              code: "TAKEOVER_STANDING_OPERATION_CONFLICT", status: 409
+            });
+          }
+          await taskStore.events.append(standingParams.projectId, {
+            operation_id: body.operationId, project_id: standingParams.projectId, task_id: null,
+            event_type: eventType, actor_type: "user", actor_id: identity.actorId,
+            session_id: "", session_window_name: "", old_status: null, new_status: null,
+            note: body.action === "grant" ? "用户浏览器会话登记项目级异常接管常设授权" : "用户浏览器会话撤销异常接管常设授权",
+            metadata: { authorizationSource: "browser_user_session", scope: "project",
+              roles: body.action === "grant" ? body.roles : [] }
+          });
+        }
+        const grant = await standingTakeoverGrant(taskStore, standingParams.projectId);
+        return send(res, 200, { enabled: Boolean(grant), roles: grant?.metadata.roles || [],
+          grantEventId: grant?.event_id || null, requiresBrowserRegistration: !grant });
       }
 
       if (req.method === "GET" && url.pathname === "/api/ai-execution/settings") {
@@ -1769,8 +1837,25 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
       if (req.method === "POST" && params) {
         const body = await readJson(req);
         requireOperation(body);
-        const authorizationEvidence = takeoverAuthorizationEvidence(identity, body, params);
+        const authorizationEvidence = await takeoverAuthorizationEvidence(identity, body, params, taskStore);
         const { context, task, snapshot } = await contextAndTask(taskStore, params.projectId, params.taskId);
+        if (authorizationEvidence.standingGrantEventId) {
+          const expectedRole = ["独测中", "复测中"].includes(task.status) ? "test_ai" :
+            ["开发中", "修复中", "待交付"].includes(task.status) ? "developer_ai" : null;
+          const former = (await taskStore.taskHistory(params.projectId, params.taskId, { all: true }))
+            .findLast(event => ["claim", "takeover"].includes(event.event_type) && event.actor_type === expectedRole);
+          if (body.actorType !== expectedRole || body.actorId === former?.actor_id ||
+              body.sessionId === task.sessionId || !body.sessionId) {
+            throw new TaskboardError("常设授权仅允许新的同角色合法开发或独测会话接管", {
+              code: "TAKEOVER_STANDING_ROLE_SESSION_INVALID", status: 409
+            });
+          }
+          if ((await taskStore.stopState(params.projectId, params.taskId)).stopRequested) {
+            throw new TaskboardError("任务已被停止，不能依常设授权接管", {
+              code: "TAKEOVER_STANDING_STOP_REQUESTED", status: 409
+            });
+          }
+        }
         if (!context.workflow.isExecutionStatus(task.status) && task.status !== "待交付") {
           throw new TaskboardError("只有执行中或待交付任务可以授权异常接管", {
             code: "TAKEOVER_STAGE_INVALID", status: 409, details: { status: task.status }
@@ -1834,6 +1919,22 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
           });
         }
         const state = await taskStore.takeoverState(params.projectId, params.taskId);
+        if (state.authorization?.metadata?.standingGrantEventId) {
+          const grant = await standingTakeoverGrant(taskStore, params.projectId, state.authorization.actor_type);
+          if (grant?.event_id !== state.authorization.metadata.standingGrantEventId) {
+            throw new TaskboardError("原浏览器会话常设授权已撤销或变更", {
+              code: "TAKEOVER_STANDING_AUTH_REVOKED", status: 409
+            });
+          }
+          if (state.authorization.actor_id !== body.actorId ||
+              state.authorization.session_id !== body.sessionId ||
+              state.authorization.actor_type !== body.actorType ||
+              (await taskStore.stopState(params.projectId, params.taskId)).stopRequested) {
+            throw new TaskboardError("常设授权接管必须保持获准身份及无STOP状态", {
+              code: "TAKEOVER_STANDING_CONTEXT_INVALID", status: 409
+            });
+          }
+        }
         if (task.status === "待交付") {
           requireTrustedApiIdentity(identity);
           const authz = state.authorization?.metadata || {};
