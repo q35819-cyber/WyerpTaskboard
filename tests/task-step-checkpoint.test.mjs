@@ -2350,3 +2350,180 @@ test("P0 manual D09 ordinary claim denies missing root and fake controller appro
     assert.equal((await x.cp.show("fixture","A-10")).sha256,before.sha256,name);
   }
 });
+
+async function manualD08RequeueFixture(t, opts={}) {
+  const f=await makeFixture();
+  t.after(()=>fs.rm(f.boardRoot,{recursive:true,force:true}));
+  const row=["A-10","F-D08","bugfix","P0","待开发","开发AI","—","—","—",
+    "2026-11-08T00:00:00Z","D08 manual requeue new D01","plan.md","cp/A-10.md"];
+  const root=["ROOT-10","F-ROOT","bugfix","P0","已完成","开发AI",
+    "—","—","—","—","completed legitimate root","plan.md","cp/ROOT-10.md"];
+  await fs.writeFile(f.registryPath,registryText([row,root]),"utf8");
+  const taskStore=await new TaskStore(f.boardRoot).init();
+  const cp=await new TaskStepCheckpoint(f.boardRoot,{taskStore,flowVersion:"role-steps-v2"}).init();
+  // Fixture simulates a committed root C07; production checks persistent transactions.
+  const rootOp="fixture.manualD08.rootC07."+String(sequence++).padStart(8,"0");
+  const rootEvent=(await taskStore.events.append("fixture",{
+    operation_id:rootOp,project_id:"fixture",task_id:"ROOT-10",
+    event_type:"delivery_complete",actor_type:"controller_ai",
+    actor_id:"controller",session_id:"controller-session",
+    old_status:"交付中",new_status:"已完成",
+    old_track:"bugfix",new_track:"bugfix"
+  })).event;
+  const originalRead=taskStore.transactions.read.bind(taskStore.transactions);
+  taskStore.transactions.read=async operationId=>{
+    if(operationId!==rootOp)return originalRead(operationId);
+    if(opts.uncommittedC07)return null;
+    return {state:"committed",
+      event:{project_id:"fixture",task_id:"ROOT-10",event_type:"delivery_complete",
+        actor_type:"controller_ai",actor_id:"controller",session_id:"controller-session"},
+      result:{eventId:rootEvent.event_id,before:{status:"交付中"},after:{status:"已完成"}}};
+  };
+  const rootClosed={eventId:rootEvent.event_id};
+  async function update(taskId,patch,eventType,actorType,actorId,sessionId,metadata={}) {
+    return taskStore.updateTask("fixture",taskId,patch,{
+      operationId:"fixture.manualD08."+String(sequence++).padStart(8,"0"),
+      expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      eventType,actorType,actorId,sessionId,metadata
+    });
+  }
+  await taskStore.appendTaskEvent("fixture","A-10",{
+    operationId:"fixture.manualD08.dispatch."+String(sequence++).padStart(8,"0"),
+    eventType:"controller_dispatch",actorType:"controller_ai",
+    actorId:"controller",sessionId:"controller-session"
+  });
+  const oldClaim=await update("A-10",{
+    status:"开发中",assignee:"old-dev",sessionWindowName:"old",sessionId:"old-session"
+  },"claim","developer_ai","old-dev","old-session");
+  let blockerActor="old-dev",blockerSession="old-session";
+  if(opts.newBlocker){
+    blockerActor="blocker-dev";blockerSession="blocker-session";
+    await update("A-10",{status:"开发中",assignee:blockerActor,
+      sessionWindowName:"blocker",sessionId:blockerSession},
+    "takeover","developer_ai",blockerActor,blockerSession,
+    {previousSessionId:"old-session"});
+  }
+  const block=await update("A-10",{
+    status:"阻断",assignee:"",sessionWindowName:"",sessionId:""
+  },"developer_external_issue_pause","developer_ai",blockerActor,blockerSession);
+  const manualMetadata={
+    manualRecoveryUserAuthorized:!opts.noUserAuthorization,
+    requiresIndependentRetest:!opts.noRetest,
+    invalidatesTestEvidence:!opts.noInvalidation,
+    rootCauseTaskIds:opts.badRoot?["ROOT-NOT-FOUND"]:["ROOT-10"],
+    blockedEventId:opts.badBlockPointer?"evt_fake":block.eventId,
+    rootDeliveryEventId:opts.badC07?"evt_fake_c07":rootClosed.eventId
+  };
+  let manual;
+  if(opts.noManual || opts.forgedManual){
+    await update("A-10",{status:"待开发"},"controller_other_requeue",
+      "controller_ai","controller","controller-session");
+    if(opts.forgedManual)await taskStore.events.append("fixture",{
+      operation_id:"fixture.manualD08.fake."+String(sequence++).padStart(8,"0"),
+      project_id:"fixture",task_id:"A-10",
+      event_type:"controller_manual_rework_ready_after_verified_roots",
+      actor_type:"controller_ai",actor_id:"controller",session_id:"controller-session",
+      old_status:"阻断",new_status:"待开发",old_track:"bugfix",new_track:"bugfix",
+      metadata:manualMetadata
+    });
+  } else {
+    manual=await update("A-10",{status:"待开发"},
+      "controller_manual_rework_ready_after_verified_roots",
+      "controller_ai","controller","controller-session",manualMetadata);
+  }
+  const actorId="new-dev",sessionId=opts.oldSession?"old-session":"new-session";
+  const newClaim=await update("A-10",{
+    status:"开发中",assignee:actorId,sessionWindowName:"new",sessionId
+  },"claim","developer_ai",actorId,sessionId);
+  if(opts.stop)await taskStore.appendTaskEvent("fixture","A-10",{
+    operationId:"fixture.manualD08.stop."+String(sequence++).padStart(8,"0"),
+    eventType:"stop_request",actorType:"user",actorId:"user",note:"STOP"
+  });
+  if(opts.dependency){
+    const text=await fs.readFile(f.registryPath,"utf8");
+    await fs.writeFile(f.registryPath,text.replace("read/A-10.md","ROOT-NOT-FOUND完成"),"utf8");
+  }
+  if(opts.staleHistory)await taskStore.events.append("fixture",{
+    operation_id:"fixture.manualD08.intervening."+String(sequence++).padStart(8,"0"),
+    project_id:"fixture",task_id:"A-10",event_type:"untrusted_requeue",
+    actor_type:"developer_ai",actor_id:"old-dev",session_id:"old-session",
+    old_status:"阻断",new_status:"待开发"
+  });
+  const oldClaimEvent=(await taskStore.taskHistory("fixture","A-10",{all:true}))
+    .find(e=>e.event_id===oldClaim.eventId);
+  const state={version:1,projectId:"fixture",taskId:"A-10",flowVersion:"role-steps-v2",
+    cursors:{controller_ai:"C00_A_REQUIREMENTS",developer_ai:"D08_HANDOFF",test_ai:"Q01_ADMISSION"},
+    attempts:1,records:[
+      {stepId:"D01_CLAIM",actorType:"developer_ai",actorId:"old-dev",
+        sessionId:"old-session",result:"PASS",attempt:1,eventId:oldClaim.eventId},
+      {stepId:"D07_TEST_3",actorType:"developer_ai",actorId:"old-dev",
+        sessionId:"old-session",result:opts.noD07Pass?"BLOCK":"PASS",attempt:1,
+        at:oldClaimEvent.timestamp}
+    ],lastAction:{stepId:"D07_TEST_3",result:"PASS"}};
+  if(opts.oldD08Pass)state.records.push({
+    stepId:"D08_HANDOFF",actorType:"developer_ai",actorId:"old-dev",
+    sessionId:"old-session",result:"PASS",attempt:1
+  });
+  await fs.writeFile(path.join(f.projectRoot,"cp","A-10.md"),
+    "## preserved D08 checkpoint history\n<!-- TASK_STEP_CHECKPOINT_START v1 -->\n"+
+    JSON.stringify(state,null,2)+"\n<!-- TASK_STEP_CHECKPOINT_END -->\n","utf8");
+  return {cp,taskStore,f,oldClaim,block,manual,newClaim,actorId,sessionId};
+}
+
+test("P0 manual D08 requeue committed root and fresh claim reopens one D01 then D02",async t=>{
+  const x=await manualD08RequeueFixture(t);
+  const before=await x.cp.show("fixture","A-10");
+  assert.equal(before.state.cursors.developer_ai,"D08_HANDOFF");
+  const after=await step(x.cp,"developer_ai","D01_CLAIM",{
+    actorId:x.actorId,sessionId:x.sessionId,eventId:x.newClaim.eventId
+  });
+  assert.equal(after.state.attempts,2);
+  assert.equal(after.state.cursors.developer_ai,"D02_WORKTREE");
+  assert.equal(after.state.cursors.test_ai,"Q01_ADMISSION");
+  assert.equal(after.state.records.filter(r=>r.attempt===1&&r.stepId==="D07_TEST_3").length,1);
+  await step(x.cp,"developer_ai","D02_WORKTREE",{
+    actorId:x.actorId,sessionId:x.sessionId
+  });
+  await assert.rejects(step(x.cp,"developer_ai","D01_CLAIM",{
+    actorId:x.actorId,sessionId:x.sessionId,eventId:x.newClaim.eventId
+  }),e=>e.code==="CHECKPOINT_STEP_ORDER");
+});
+
+test("P0 manual D08 requeue denies fake permission or transaction, STOP, old session and stale attempts",async t=>{
+  for(const [label,opts] of [
+    ["no manual",{noManual:true}],
+    ["forged uncommitted manual",{forgedManual:true}],
+    ["no user authorization",{noUserAuthorization:true}],
+    ["no independent retest",{noRetest:true}],
+    ["old QA not invalidated",{noInvalidation:true}],
+    ["unverified root",{badRoot:true}],
+    ["fake C07 provenance",{badC07:true}],
+    ["uncommitted C07 transaction",{uncommittedC07:true}],
+    ["wrong blocked event",{badBlockPointer:true}],
+    ["missing previous D07 PASS",{noD07Pass:true}],
+    ["already handed off old D08",{oldD08Pass:true}],
+    ["revoked old Session reuse",{oldSession:true}],
+    ["user STOP",{stop:true}],
+    ["hard dependency unfinished",{dependency:true}],
+    ["unexpected status transition",{staleHistory:true}]
+  ]){
+    const x=await manualD08RequeueFixture(t,opts);
+    const before=await x.cp.show("fixture","A-10");
+    await assert.rejects(step(x.cp,"developer_ai","D01_CLAIM",{
+      actorId:x.actorId,sessionId:x.sessionId,eventId:x.newClaim.eventId
+    }),e=>["CHECKPOINT_STEP_ORDER","CHECKPOINT_PREDECESSOR_REQUIRED",
+      "CHECKPOINT_SESSION_MISMATCH"].includes(e.code),label);
+    assert.equal((await x.cp.show("fixture","A-10")).sha256,before.sha256,label);
+  }
+});
+
+test("P0 manual D08 requeue retains earlier D07 PASS after a different blocking developer takeover",async t=>{
+  const x=await manualD08RequeueFixture(t,{newBlocker:true});
+  const before=await x.cp.show("fixture","A-10");
+  const after=await step(x.cp,"developer_ai","D01_CLAIM",{
+    actorId:x.actorId,sessionId:x.sessionId,eventId:x.newClaim.eventId
+  });
+  assert.equal(after.state.attempts,before.state.attempts+1);
+  assert.equal(after.state.cursors.developer_ai,"D02_WORKTREE");
+  assert.equal(after.state.records.findLast(r=>r.stepId==="D07_TEST_3").sessionId,"old-session");
+});

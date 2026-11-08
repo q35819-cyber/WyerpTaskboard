@@ -549,6 +549,92 @@ export class TaskStepCheckpoint {
             state.cursors.test_ai = "Q01_ADMISSION";
           }
         }
+        // Reopen unfinished D08 only after a committed, authorized controller requeue.
+        if (modern && result === "PASS" && state.cursors.developer_ai === "D08_HANDOFF"
+          && currentClaim?.event_type === "claim" && currentClaim.event_id === eventId
+          && currentClaim.actor_id === actorId && currentClaim.session_id === sessionId
+          && currentClaim.old_status === "待开发" && currentClaim.new_status === "开发中"
+          && task.status === "开发中" && task.sessionId === sessionId
+          && previouslyStarted && !alreadyRestarted
+          && !(await this.taskStore.stopState(projectId, taskId)).stopRequested
+          && await hardDependenciesCompleted(this.taskStore, projectId, task)) {
+          const oldD07 = state.records.findLast(r => r.attempt === state.attempts
+            && r.stepId === "D07_TEST_3" && r.result === "PASS");
+          const oldD01 = state.records.findLast(r => r.attempt === state.attempts
+            && r.stepId === "D01_CLAIM" && r.result === "PASS"
+            && r.actorId === oldD07?.actorId && r.sessionId === oldD07?.sessionId);
+          const oldD07Claim = history.find(e => e.event_id === oldD01?.eventId
+            && e.actor_type === "developer_ai" && ["claim", "takeover"].includes(e.event_type)
+            && e.actor_id === oldD07?.actorId && e.session_id === oldD07?.sessionId);
+          const manualIndex = history.findLastIndex((e, i) => i < currentClaimIndex
+            && e.event_type === "controller_manual_rework_ready_after_verified_roots");
+          const manual = history[manualIndex];
+          const blockedIndex = history.findIndex((e, i) => i < manualIndex
+            && e.event_id === manual?.metadata?.blockedEventId
+            && e.old_status === "开发中" && e.new_status === "阻断"
+            && e.actor_type === "developer_ai");
+          const blocked = history[blockedIndex];
+          const blockingClaim = history.slice(0, blockedIndex).findLast(e =>
+            e.actor_type === "developer_ai" && ["claim", "takeover"].includes(e.event_type)
+            && e.actor_id === blocked?.actor_id && e.session_id === blocked?.session_id);
+          if (oldD07 && oldD01 && oldD07Claim && blocked && blockingClaim
+            && manualIndex > blockedIndex && blockedIndex > history.indexOf(oldD07Claim)
+            && oldD07.sessionId !== sessionId && blocked.session_id !== sessionId
+            && !state.records.some(r => r.attempt === state.attempts
+              && r.stepId === "D08_HANDOFF" && r.result === "PASS")
+            && Date.parse(oldD07Claim.timestamp) <= Date.parse(oldD07.at)
+            && Date.parse(oldD07.at) <= Date.parse(blocked.timestamp)
+            && blockingClaim.new_status === "开发中"
+            && history.slice(blockedIndex + 1, manualIndex).every(e =>
+              !e.old_status || e.old_status === e.new_status)
+            && history.slice(manualIndex + 1, currentClaimIndex).every(e =>
+              !e.old_status || e.old_status === e.new_status)
+            && history.slice(currentClaimIndex + 1).every(e =>
+              !e.old_status || e.old_status === e.new_status)
+            && await verifiedManualRecovery(this.taskStore, projectId, history, manualIndex)) {
+            const roots=await Promise.all(manual.metadata.rootCauseTaskIds.map(async rootId=>{
+              const events=await this.taskStore.taskHistory(projectId,rootId,{all:true});
+              const c07=events.findLast(e=>e.event_type==="delivery_complete"
+                && e.actor_type==="controller_ai" && e.old_status==="交付中"
+                && e.new_status==="已完成" && e.actor_id && e.session_id);
+              if(!c07)return null;
+              const transaction=await this.taskStore.transactions.read(c07.operation_id);
+              return transaction?.state==="committed" && transaction.result?.eventId===c07.event_id
+                && transaction.result.before?.status==="交付中"
+                && transaction.result.after?.status==="已完成"
+                && transaction.event?.project_id===projectId
+                && transaction.event?.task_id===rootId
+                && transaction.event?.event_type==="delivery_complete"
+                && transaction.event?.actor_type===c07.actor_type
+                && transaction.event?.actor_id===c07.actor_id
+                && transaction.event?.session_id===c07.session_id ? c07 : null;
+            }));
+            const rootsVerified=roots.length>0 && roots.every(Boolean)
+              && roots.some(e=>e.event_id===manual.metadata.rootDeliveryEventId);
+            const tx = await Promise.all([oldD07Claim, blockingClaim, blocked, manual, currentClaim]
+              .map(e => this.taskStore.transactions.read(e.operation_id)));
+            const valid = (i, e) => tx[i]?.state === "committed"
+              && tx[i].result?.eventId === e.event_id
+              && tx[i].event?.task_id === taskId && tx[i].event?.project_id === projectId
+              && tx[i].event?.event_type === e.event_type
+              && tx[i].event?.actor_type === e.actor_type
+              && tx[i].event?.actor_id === e.actor_id && tx[i].event?.session_id === e.session_id;
+            if (rootsVerified && valid(0, oldD07Claim) && valid(1, blockingClaim)
+              && valid(2, blocked) && valid(3, manual) && valid(4, currentClaim)
+              && tx[2].result.before?.status === "开发中"
+              && tx[2].result.before?.sessionId === blocked.session_id
+              && tx[2].result.after?.status === "阻断" && !tx[2].result.after?.sessionId
+              && tx[3].result.before?.status === "阻断" && !tx[3].result.before?.sessionId
+              && tx[3].result.after?.status === "待开发" && !tx[3].result.after?.sessionId
+              && tx[4].result.before?.status === "待开发" && !tx[4].result.before?.sessionId
+              && tx[4].result.after?.status === "开发中"
+              && tx[4].result.after?.sessionId === sessionId) {
+              state.attempts += 1;
+              state.cursors.developer_ai = "D01_CLAIM";
+              state.cursors.test_ai = "Q01_ADMISSION";
+            }
+          }
+        }
         if (q04RequeuedTakeover) {
           state.attempts += 1;
           state.cursors.developer_ai = "D01_CLAIM";
