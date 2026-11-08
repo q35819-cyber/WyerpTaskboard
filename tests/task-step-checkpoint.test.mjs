@@ -1865,7 +1865,9 @@ async function modernDeliveryRework(t, options = {}) {
   const row = ["A-10", "F-DELIVERY", "product", "P0", "开发中", "开发AI",
     "developer", "dev", options.oldSession ? "old-session" : "new-session", "2026-11-06T01:00:00Z",
     "现代交付冲突D01返修", "测试计划.md", "cp/A-10.md"];
-  let registry = registryText([row]);
+  let registry = registryText(options.manualRecovery ? [row,
+    ["ROOT-10","F-ROOT","product","P2",options.unfinishedRoot ? "待开发" : "已完成",
+      "开发AI","—","—","—","—","已完成根因","plan.md","cp/ROOT-10.md"]] : [row]);
   if (options.dependency) registry = registry.replace("read/A-10.md", "MISSING-UPSTREAM完成");
   await fs.writeFile(f.registryPath, registry, "utf8");
   const taskStore = await new TaskStore(f.boardRoot).init();
@@ -1897,7 +1899,24 @@ async function modernDeliveryRework(t, options = {}) {
     "controller", "controller-session", "交付中", "交付中",
     { failureStage: "merge", failureCode: options.wrongFailureCode ? "UNRELATED" : "GIT_MERGE_CONFLICT",
       candidateSha: "a".repeat(40) });
-  if (!options.noRework && options.controllerRequeue) {
+  if (options.manualRecovery) {
+    const blocked = await taskStore.updateTask("fixture","A-10",{status:"阻断"},{
+      operationId:"fixture.manual.block."+String(++serial).padStart(8,"0"),
+      expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      eventType:"developer_d09_recovery_blocked",actorType:"developer_ai",
+      actorId:oldDev,sessionId:newSession
+    });
+    await taskStore.updateTask("fixture","A-10",{status:"待开发"},{
+      operationId:"fixture.manual.requeue."+String(++serial).padStart(8,"0"),
+      expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      eventType:"controller_manual_rework_ready_after_verified_roots",
+      actorType:"controller_ai",
+      actorId:"controller",sessionId:"controller-session",
+      metadata:{manualRecoveryUserAuthorized:!options.fakeManual,
+        rootCauseTaskIds:["ROOT-10"],requiresIndependentRetest:true,
+        invalidatesTestEvidence:true,blockedEventId:blocked.eventId}
+    });
+  } else if (!options.noRework && options.controllerRequeue) {
     if (!options.noBlock) await event("controller_c04_candidate_new_main_merge_conflict",
       "controller_ai", "controller", "controller-session", "交付中", "阻断", {
         failureEventId: options.wrongFailurePointer ? "evt_fake" : failure?.event_id,
@@ -1927,7 +1946,13 @@ async function modernDeliveryRework(t, options = {}) {
       originalControllerActorId: "controller", originalControllerSessionId: "controller-session"
     });
   const newActor = options.wrongNewActor ? "someone-else" : options.controllerRequeue ? "new-developer" : oldDev;
-  const newClaim = await event("claim", "developer_ai", newActor, newSession, "待开发", "开发中");
+  const newClaim = options.manualRecovery ? await taskStore.updateTask("fixture","A-10",{
+    status:"开发中",assignee:newActor,sessionWindowName:"dev",sessionId:newSession
+  },{
+    operationId:"fixture.manual.claim."+String(++serial).padStart(8,"0"),
+    expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    eventType:"claim",actorType:"developer_ai",actorId:newActor,sessionId:newSession
+  }) : await event("claim","developer_ai",newActor,newSession,"待开发","开发中");
   if (options.stop) await event("stop_request", "user", "user", "", "开发中", "开发中");
   const state = {
     version: 1, projectId: "fixture", taskId: "A-10", flowVersion: "role-steps-v2",
@@ -2210,5 +2235,118 @@ test("modern Q04 takeover D01 rejects missing history, missing permission, wrong
     }), e => ["CHECKPOINT_STEP_ORDER", "CHECKPOINT_PREDECESSOR_REQUIRED",
       "CHECKPOINT_SESSION_MISMATCH"].includes(e.code), name);
     assert.equal((await x.cp.show("fixture", "A-10")).sha256, before.sha256, name);
+  }
+});
+
+async function manualRecoveredD09Fixture(t, options={}) {
+  const x=await modernDeliveryRework(t,{...options,manualRecovery:true});
+  const actorId="dev-manual-takeover",sessionId="dev-manual-takeover-session";
+  const claimed=(await x.taskStore.getTask("fixture","A-10")).task;
+  const revision=(await x.taskStore.snapshot("fixture")).registryRevision;
+  const suspicionOperationId="fixture.manual.takeover.suspect."+String(sequence++).padStart(8,"0");
+  const suspect=await x.taskStore.appendTaskEvent("fixture","A-10",{
+    operationId:suspicionOperationId,eventType:"suspected_disconnect",
+    actorType:"developer_ai",actorId,sessionId,
+    metadata:{evidenceOrigin:"executor_live_inspection",
+      observedAssignee:claimed.assignee,observedSessionId:claimed.sessionId,
+      observedRegistryRevision:revision}
+  });
+  const authorizationOperationId="fixture.manual.takeover.allowed."+String(sequence++).padStart(8,"0");
+  if(!options.noAuthorization)await x.taskStore.appendTaskEvent("fixture","A-10",{
+    operationId:authorizationOperationId,eventType:"takeover_allowed",
+    actorType:"developer_ai",actorId,sessionId,metadata:{
+      explicitUserOverride:true,authorizationSource:"chat_user_instruction_cooperative",
+      authorizationScope:"project",authorizationQuote:"符合条件直接接管",
+      authorizationForwardedBy:actorId,authorizationForwardingSessionId:sessionId,
+      authorizedFromStatus:"开发中",authorizedFromSessionId:claimed.sessionId,
+      authorizedRegistryRevision:options.wrongRegistry ? "invalid" : revision,
+      suspicionOperationId:options.wrongSuspect ? "wrong" : suspicionOperationId
+    }
+  });
+  const transfer=await x.taskStore.updateTask("fixture","A-10",{
+    status:"开发中",assignee:actorId,sessionWindowName:"takeover",sessionId
+  },{
+    operationId:"fixture.manual.takeover."+String(sequence++).padStart(8,"0"),
+    expectedRevision:(await x.taskStore.snapshot("fixture")).registryRevision,
+    eventType:"takeover",actorType:"developer_ai",actorId,sessionId,
+    metadata:{authorizationOperationId,
+      previousAssignee:claimed.assignee,
+      previousSessionId:options.wrongPreviousSession ? "forged-session" : claimed.sessionId}
+  });
+  if(options.stop)await x.taskStore.appendTaskEvent("fixture","A-10",{
+    operationId:"fixture.manual.stop."+String(sequence++).padStart(8,"0"),
+    eventType:"stop_request",actorType:"user",actorId:"user",note:"用户STOP"
+  });
+  return {...x,actorId,sessionId,transfer,suspect};
+}
+
+test("P0 trusted manual D09 recovery then developer takeover reopens one fresh D01/D02",async t=>{
+  const x=await manualRecoveredD09Fixture(t);
+  const old=await x.cp.show("fixture","A-10");
+  assert.equal(old.state.cursors.developer_ai,"D09_NEXT");
+  await assert.rejects(step(x.cp,"developer_ai","D01_CLAIM",{
+    actorId:"developer",sessionId:x.newSession,eventId:x.newClaim.eventId
+  }),e=>["CHECKPOINT_STEP_ORDER","CHECKPOINT_SESSION_MISMATCH"].includes(e.code));
+  assert.equal((await x.cp.show("fixture","A-10")).sha256,old.sha256);
+  const pass=await step(x.cp,"developer_ai","D01_CLAIM",{
+    actorId:x.actorId,sessionId:x.sessionId,eventId:x.transfer.eventId
+  });
+  assert.equal(pass.state.attempts,old.state.attempts+1);
+  assert.equal(pass.state.cursors.developer_ai,"D02_WORKTREE");
+  assert.equal(pass.state.cursors.test_ai,"Q01_ADMISSION");
+  assert.equal(pass.state.records.filter(r=>r.attempt===1&&r.stepId==="D08_HANDOFF").length,1);
+  await step(x.cp,"developer_ai","D02_WORKTREE",{
+    actorId:x.actorId,sessionId:x.sessionId
+  });
+  await assert.rejects(step(x.cp,"developer_ai","D01_CLAIM",{
+    actorId:x.actorId,sessionId:x.sessionId,eventId:x.transfer.eventId
+  }),e=>e.code==="CHECKPOINT_STEP_ORDER");
+});
+
+test("P0 manual recovery D09 takeover rejects revoked old session, STOP and untrusted chains",async t=>{
+  for(const [label,variant] of [
+    ["no authorization",{noAuthorization:true}],
+    ["wrong prior session",{wrongPreviousSession:true}],
+    ["bad revision",{wrongRegistry:true}],
+    ["wrong suspicion",{wrongSuspect:true}],
+    ["root unfinished",{unfinishedRoot:true}],
+    ["user STOP",{stop:true}]
+  ]){
+    const x=await manualRecoveredD09Fixture(t,variant);
+    const before=await x.cp.show("fixture","A-10");
+    await assert.rejects(step(x.cp,"developer_ai","D01_CLAIM",{
+      actorId:x.actorId,sessionId:x.sessionId,eventId:x.transfer.eventId
+    }),e=>["CHECKPOINT_STEP_ORDER","CHECKPOINT_PREDECESSOR_REQUIRED",
+      "CHECKPOINT_SESSION_MISMATCH"].includes(e.code),label);
+    assert.equal((await x.cp.show("fixture","A-10")).sha256,before.sha256,label);
+  }
+});
+
+test("P0 manual D09 recovery with legitimate ordinary claim starts new D01 and D02",async t=>{
+  const x=await modernDeliveryRework(t,{manualRecovery:true});
+  const before=await x.cp.show("fixture","A-10");
+  assert.equal(before.state.cursors.developer_ai,"D09_NEXT");
+  const pass=await step(x.cp,"developer_ai","D01_CLAIM",{
+    actorId:"developer",sessionId:x.newSession,eventId:x.newClaim.eventId
+  });
+  assert.equal(pass.state.attempts,before.state.attempts+1);
+  assert.equal(pass.state.cursors.developer_ai,"D02_WORKTREE");
+  assert.equal(pass.state.records.filter(r=>r.attempt===1&&r.stepId==="D08_HANDOFF").length,1);
+  await step(x.cp,"developer_ai","D02_WORKTREE",{
+    actorId:"developer",sessionId:x.newSession
+  });
+});
+
+test("P0 manual D09 ordinary claim denies missing root and fake controller approval",async t=>{
+  for(const [name,variation] of [
+    ["unfinished verified root",{unfinishedRoot:true}],
+    ["not user approved",{fakeManual:true}]
+  ]){
+    const x=await modernDeliveryRework(t,{manualRecovery:true,...variation});
+    const before=await x.cp.show("fixture","A-10");
+    await assert.rejects(step(x.cp,"developer_ai","D01_CLAIM",{
+      actorId:"developer",sessionId:x.newSession,eventId:x.newClaim.eventId
+    }),e=>["CHECKPOINT_STEP_ORDER","CHECKPOINT_PREDECESSOR_REQUIRED"].includes(e.code),name);
+    assert.equal((await x.cp.show("fixture","A-10")).sha256,before.sha256,name);
   }
 });
