@@ -1540,6 +1540,33 @@ export async function createTaskboardServer({ rootDir, host = "127.0.0.1", port 
         return send(res, 200, result);
       }
 
+      params = routeMatch(url.pathname, "/api/projects/:projectId/tasks/:taskId/delivery-merge-conflict-rework");
+      if (req.method === "POST" && params) {
+        requireTrustedApiIdentity(identity);
+        const body = await readJson(req);
+        requireOperation(body); requireExpectedRevision(body);
+        const { task } = await contextAndTask(taskStore, params.projectId, params.taskId);
+        if (body.actorType !== "controller_ai") {
+          throw new TaskboardError("只有正式总控可发起交付冲突返修", {
+            code: "DELIVERY_REWORK_CONTROLLER_REQUIRED", status: 409
+          });
+        }
+        requireCurrentExecutionSession(task, body, {
+          actorType: "controller_ai", allowedStatuses: ["交付中"]
+        });
+        const result = await taskStore.updateTask(params.projectId, params.taskId, {
+          status: "待开发"
+        }, {
+          expectedRevision: body.expectedRevision,
+          operationId: body.operationId,
+          eventType: "delivery_merge_conflict_rework",
+          ...actorOptions(identity, body),
+          note: String(body.note || "真实合并冲突，退原开发重新自测及独测").slice(0, 1000),
+          metadata: { candidateSha: body.candidateSha, mainSha: body.mainSha }
+        });
+        return send(res, 200, result);
+      }
+
       params = routeMatch(url.pathname, "/api/projects/:projectId/tasks/:taskId/claim");
       if (req.method === "POST" && params) {
         requireTrustedApiIdentity(identity);
