@@ -482,21 +482,35 @@ function renderRelatedTasks(task){
   for(const ref of refs)els.relatedTasksText.append(relatedTaskNode(ref,task.id));
   if(!issue&&!refs.length)els.relatedTasksText.textContent="—";
 }
-async function copyTaskId(taskId,projectId,epoch){
-  if(!taskId||!sameProject(projectId,epoch))return;
+async function copyTaskId(taskId,button,projectId,epoch){
+  if(!taskId||!sameProject(projectId,epoch)||button.disabled)return false;
+  button.disabled=true;
   try{
     if(!navigator.clipboard?.writeText)throw Error("clipboard unavailable");
     await navigator.clipboard.writeText(taskId);
     if(sameProject(projectId,epoch))toast("任务编号已复制");
+    return true;
   }catch{
-    if(sameProject(projectId,epoch))window.prompt("剪贴板不可用，请手动复制任务编号",taskId);
-  }
+    if(!sameProject(projectId,epoch))return false;
+    const parent=button.parentElement;
+    let input=parent?.querySelector?.(".copy-task-id-fallback");
+    if(!input&&parent){
+      input=document.createElement("input");input.type="text";input.readOnly=true;
+      input.className="copy-task-id-fallback";
+      input.setAttribute("aria-label","手动复制任务编号");
+      input.addEventListener("click",event=>event.stopPropagation());
+      parent.append(input);
+    }
+    if(input){input.value=taskId;input.focus();input.select();}
+    toast("自动复制失败，请手动复制已选中的任务编号",true);
+    return false;
+  }finally{button.disabled=false;}
 }
 function copyTaskButton(taskId,projectId,epoch){
   const button=document.createElement("button");
   button.type="button";button.className="copy-task-id";button.textContent="复制";
   button.title="复制任务编号："+taskId;button.setAttribute("aria-label","复制任务编号："+taskId);
-  button.addEventListener("click",event=>{event.stopPropagation();void copyTaskId(taskId,projectId,epoch)});
+  button.addEventListener("click",event=>{event.stopPropagation();void copyTaskId(taskId,button,projectId,epoch)});
   return button;
 }
 function taskCard(task){
@@ -1006,7 +1020,7 @@ els.boardViewBtn.addEventListener("click",()=>{state.view="board";render()});
 els.listViewBtn.addEventListener("click",()=>{state.view="list";render()});
 els.closePlanDialogBtn.addEventListener("click",()=>els.planDialog.close());
 els.closeDialogBtn.addEventListener("click",()=>els.taskDialog.close());
-els.copyDetailTaskId.addEventListener("click",event=>{event.stopPropagation();if(state.selectedTask&&state.selectedTaskProjectId===state.projectId)void copyTaskId(state.selectedTask.id,state.projectId,state.projectEpoch)});
+els.copyDetailTaskId.addEventListener("click",event=>{event.stopPropagation();if(state.selectedTask&&state.selectedTaskProjectId===state.projectId)void copyTaskId(state.selectedTask.id,els.copyDetailTaskId,state.projectId,state.projectEpoch)});
 els.taskDialog.addEventListener("close",()=>{state.dependencyTrail=[];state.detailEpoch++});
 els.dependencyBackBtn.addEventListener("click",()=>{
   const path=state.dependencyTrail;if(path.length>1)void openTask(path[path.length-2],true);

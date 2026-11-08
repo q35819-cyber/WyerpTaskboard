@@ -41,7 +41,9 @@ async function cardRenderer() {
     append(...nodes){for(const n of nodes)n.parentElement=this;this.children.push(...nodes)},
     replaceChildren(...nodes){this.children=[];this.append(...nodes)},
     setAttribute(name,value){(this.attributes??={})[name]=value},
-    addEventListener(name,callback){this.listeners[name]=callback}
+    addEventListener(name,callback){this.listeners[name]=callback},
+    querySelector(selector){return this.children.find(x=>selector==='.copy-task-id-fallback'&&x.className==='copy-task-id-fallback')||null},
+    focus(){this.focused=true},select(){this.selected=true}
   });
   const context={
     document:{createElement:makeElement},
@@ -257,7 +259,8 @@ test("R2 actual async openTask supports four-level drilldown, back, branches, cl
     "writeTargetsText","relatedArtifactsText","userAcceptanceActions","detailMeta","sessionInfo","prioritySelect",
     "reviewNote","resumeBtn","allowTakeoverBtn","revokeTakeoverBtn"];
   const els=Object.fromEntries(keys.map(k=>[k,node(k)]));
-  const ctx={state,els,document:{createElement:node},api:async url=>{
+  const ctx={state,els,document:{createElement:node},copied:[],
+    navigator:{clipboard:{writeText:async id=>{ctx.copied.push(id)}}},api:async url=>{
     const id=decodeURIComponent(url.split("/tasks/")[1]);
     const result=tasks.find(x=>x.id===id);if(!result)throw Error("missing task");
     return result;
@@ -268,6 +271,11 @@ test("R2 actual async openTask supports four-level drilldown, back, branches, cl
   vm.runInNewContext(helpers+"\n"+opener+"\n"+listeners+"\nthis.navigate=openTask;",ctx);
   for(const [index,id] of ids.slice(0,4).entries())await ctx.navigate(id,index>0);
   assert.equal(state.selectedTask.id,ids[3],"registered predecessor opens even when filtered out");
+  let propagationStopped=false;
+  els.copyDetailTaskId.listeners.click({stopPropagation(){propagationStopped=true}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(propagationStopped,true);
+  assert.deepEqual(ctx.copied,[ids[3]],"detail button copies selected task ID");
   assert.equal(state.dependencyTrail.join("|"),ids.slice(0,4).join("|"));
   assert.equal(els.dependencyBackBtn.hidden,false);
   els.dependencyBackBtn.listeners.click();
@@ -357,13 +365,26 @@ test("copy task ID uses full value and does not open card, with manual fallback"
   ctx.navigator.clipboard.writeText=async()=>{throw Error("permission denied")};
   button.listeners.click({stopPropagation(){}});
   await new Promise(resolve=>setImmediate(resolve));
-  assert.equal(ctx.manualCopies.length,1);assert.equal(ctx.manualCopies[0].id,id);
-  assert.equal(ctx.messages.length,0);
+  const fallback=card.children.find(x=>x.className==='copy-task-id-fallback');
+  assert.equal(fallback.value,id);assert.equal(fallback.readOnly,true);
+  assert.equal(fallback.focused,true);assert.equal(fallback.selected,true);
+  assert.equal(ctx.messages.includes('任务编号已复制'),false);
+  let stoppedFallback=false;fallback.listeners.click({stopPropagation(){stoppedFallback=true}});
+  assert.equal(stoppedFallback,true);
   ctx.state.projectId="other";button.listeners.click({stopPropagation(){}});
   await new Promise(resolve=>setImmediate(resolve));
-  assert.equal(ctx.manualCopies.length,1);
+  assert.equal(card.children.filter(x=>x.className==='copy-task-id-fallback').length,1);
+  ctx.state.projectId="demo";ctx.messages.length=0;
+  let resolveWrite,calls=0;
+  ctx.navigator.clipboard.writeText=()=>{calls++;return new Promise(resolve=>{resolveWrite=resolve})};
+  button.listeners.click({stopPropagation(){}});button.listeners.click({stopPropagation(){}});
+  assert.equal(calls,1,"rapid double click must only write once");
+  ctx.state.projectEpoch++;resolveWrite();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(ctx.messages.includes("任务编号已复制"),false,"stale async success may not toast");
   const html=await fs.readFile("web/index.html","utf8");
   const css=await fs.readFile("web/styles.css","utf8");
   assert.match(html,/id="copyDetailTaskId"[^>]*aria-label="复制任务编号"/);
   assert.match(css,/\.copy-task-id\{[^}]*min-width:40px;min-height:40px/);
+  assert.match(css,/\.copy-task-id-fallback\{[^}]*min-height:40px/);
 });
