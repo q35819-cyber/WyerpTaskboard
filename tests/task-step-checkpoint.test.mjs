@@ -601,13 +601,24 @@ test("Q02 recovery rejects fake controller restoration and true QA FAIL without 
         operationId:"fixture.q02negative.fail.controllerblock",eventType:"controller_block",
         actorType:"controller_ai",actorId:"controller",sessionId:"controller-session"});
     }
-    await taskStore.updateTask("fixture","A-10",{status:"待复测"},{
-      expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+    const beforeRequeue=await taskStore.snapshot("fixture");
+    const beforeCheckpoint=await cp.show("fixture","A-10");
+    const requeue=()=>taskStore.updateTask("fixture","A-10",{status:"待复测"},{
+      expectedRevision:beforeRequeue.registryRevision,
       operationId:"fixture.q02negative."+mode+".requeue",
       eventType:realBlock?"fake_requeue":"controller_requeue",
       actorType:realBlock?"developer_ai":"controller_ai",
       actorId:realBlock?"developer":"controller",
       sessionId:realBlock?"developer_ai.session":"controller-session"});
+    if(realBlock){
+      await assert.rejects(requeue(),e=>e.status===403 && e.code==="BLOCKED_SESSION_REVOKED");
+      const after=await taskStore.snapshot("fixture");
+      assert.equal(after.registryRevision,beforeRequeue.registryRevision);
+      assert.equal(after.tasks.find(t=>t.id==="A-10").status,"阻断");
+      assert.equal((await cp.show("fixture","A-10")).sha256,beforeCheckpoint.sha256);
+      return;
+    }
+    await requeue();
     const qa2=await taskStore.updateTask("fixture","A-10",
       {status:"复测中",assignee:"qa-new",sessionWindowName:"qa-new",sessionId:"qa-new-session"},
       {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
@@ -768,11 +779,18 @@ test("QA recovery refuses BLOCK requeued by non-controller and refuses real fail
       metadata:{atomicLifecycle:true,testResult:verdict,reportPath:"reports/qa-verdict.md"}
     });
     if(verdict==="blocked") {
-      await taskStore.updateTask("fixture","A-10",{status:"待复测"},{
-        expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
+      const prior=await taskStore.snapshot("fixture");
+      const beforeCheckpoint=await cp.show("fixture","A-10");
+      await assert.rejects(taskStore.updateTask("fixture","A-10",{status:"待复测"},{
+        expectedRevision:prior.registryRevision,
         operationId:"fixture.block-negative.requeue",eventType:"fake_requeue",
         actorType:"developer_ai",actorId:"developer",sessionId:"developer_ai.session"
-      });
+      }),e=>e.status===403 && e.code==="BLOCKED_SESSION_REVOKED");
+      const after=await taskStore.snapshot("fixture");
+      assert.equal(after.registryRevision,prior.registryRevision);
+      assert.equal(after.tasks.find(t=>t.id==="A-10").status,"阻断");
+      assert.equal((await cp.show("fixture","A-10")).sha256,beforeCheckpoint.sha256);
+      continue;
     } else {
       // Malformed historical requeue event must never erase a genuine FAIL.
       await taskStore.appendTaskEvent("fixture","A-10",{
