@@ -45,6 +45,9 @@ async function cardRenderer() {
   });
   const context={
     document:{createElement:makeElement},
+    navigator:{clipboard:{writeText:async(id)=>{context.copied.push(id)}}},
+    window:{prompt:(title,id)=>{context.manualCopies.push({title,id})}},
+    copied:[],manualCopies:[],messages:[],toast:(msg)=>context.messages.push(msg),
     state:{projectId:"demo",projectEpoch:1,filtered:[],dependencyTrail:[],snapshot:{tasks:[]}},
     els:{taskTableBody:{rows:[],replaceChildren(...rows){this.rows=rows}},readDependenciesText:makeElement("p"),dependencyTrail:makeElement("nav"),dependencyBackBtn:makeElement("button")},
     taskTitle:t=>t.id,priorityLabel:t=>t,mainPlan:()=>null,planName:()=>"",
@@ -249,7 +252,7 @@ test("R2 actual async openTask supports four-level drilldown, back, branches, cl
     priority:"P1",track:"product",plannedRole:"开发AI",readDependencies:index===0?ids[1]+"完成；"+ids[4]+"完成":index<3?ids[index+1]+"完成":""}));
   const state={projectId:"demo",projectEpoch:1,detailEpoch:0,dependencyTrail:[],selectedTask:null,selectedTaskProjectId:null,
     snapshot:{tasks},filtered:[tasks[0]],userMessages:[],userMessagePage:1};
-  const keys=["dependencyBackBtn","dependencyTrail","closeDialogBtn","taskDialog","detailTaskId","detailTitle","taskPlanList",
+  const keys=["dependencyBackBtn","dependencyTrail","closeDialogBtn","copyDetailTaskId","taskDialog","detailTaskId","detailTitle","taskPlanList",
     "responsibilityText","currentProgressText","userAssistanceText","traceabilityText","readDependenciesText",
     "writeTargetsText","relatedArtifactsText","userAcceptanceActions","detailMeta","sessionInfo","prioritySelect",
     "reviewNote","resumeBtn","allowTakeoverBtn","revokeTakeoverBtn"];
@@ -335,4 +338,32 @@ test("R2 long IDs retain full click, tooltip, aria and four-level return path",a
   ctx.els.dependencyTrail.children[1].listeners.click();
   assert.deepEqual(ctx.navCalls.at(-1),{id:ids[1],nested:true});
   assert.deepEqual([...ctx.nextTrail(trail,ids[4],true)],ids.slice(0,4).concat(ids[4]));
+});
+
+test("copy task ID uses full value and does not open card, with manual fallback",async()=>{
+  const ctx=await cardRenderer();
+  const id="WTB-P1-BOARD-TASK-ID-QUICK-COPY-20261106-T1";
+  const card=ctx.renderCard({id,track:"product",priority:"P1",status:"待开发"});
+  const button=card.children.find(x=>x.className==="copy-task-id");
+  assert.equal(button.tag,"button");
+  assert.equal(button.type,"button");
+  assert.equal(button.attributes["aria-label"],"复制任务编号："+id);
+  let stopped=false;button.listeners.click({stopPropagation(){stopped=true}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(stopped,true);assert.deepEqual(ctx.copied,[id]);
+  assert.deepEqual(ctx.messages,["任务编号已复制"]);
+  assert.equal(ctx.navCalls.length,0);
+  ctx.messages.length=0;
+  ctx.navigator.clipboard.writeText=async()=>{throw Error("permission denied")};
+  button.listeners.click({stopPropagation(){}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(ctx.manualCopies.length,1);assert.equal(ctx.manualCopies[0].id,id);
+  assert.equal(ctx.messages.length,0);
+  ctx.state.projectId="other";button.listeners.click({stopPropagation(){}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(ctx.manualCopies.length,1);
+  const html=await fs.readFile("web/index.html","utf8");
+  const css=await fs.readFile("web/styles.css","utf8");
+  assert.match(html,/id="copyDetailTaskId"[^>]*aria-label="复制任务编号"/);
+  assert.match(css,/\.copy-task-id\{[^}]*min-width:40px;min-height:40px/);
 });

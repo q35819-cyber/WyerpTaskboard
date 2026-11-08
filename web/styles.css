@@ -162,6 +162,13 @@ button.related-task-status{cursor:pointer}
 .related-more{font-size:11px;color:#475467}
 
 
+.task-card > .task-id{padding-right:48px}
+.copy-task-id{min-width:40px;min-height:40px;padding:7px 6px;font-size:12px;line-height:1.2;border:1px solid #b2ddff;border-radius:8px;background:#eff8ff;color:#175cd3;flex:none}
+.copy-task-id:focus-visible{outline:3px solid #84adff;outline-offset:2px}
+.task-card > .copy-task-id{position:absolute;top:7px;right:7px}
+#taskDialog .task-dialog-heading{position:relative}
+#taskDialog #detailTaskId{padding-right:48px}
+#taskDialog .detail-copy{position:absolute;right:0;top:0}
 /* Keep every dependency ID on a separate line; ellipsis is visual only. */
 .task-card .task-id{display:block;max-width:100%;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dependency-card-row{display:grid;grid-template-columns:minmax(0,1fr);gap:5px;max-width:100%;min-width:0;margin:8px 0}

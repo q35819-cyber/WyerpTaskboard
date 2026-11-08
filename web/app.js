@@ -15,7 +15,7 @@ const els=Object.fromEntries([
   "projectRegistryInput","refreshBtn","aiSettingsBtn","aiSettingsDialog","aiSettingsForm","closeAiSettingsBtn","cancelAiSettingsBtn","developerModel","developerReasoning","testModel","testReasoning","scanIntervalMinutes","maxRequestsPerChat","contextWarningAt","timeoutRetryLimit","anomalyWindowMinutes","anomalyLimit","roleSwitchLimit","appVersion","projectHealth","projectService","projectServiceStatus","projectStartRestartBtn","projectStopServiceBtn","scanStatus","summary","searchInput","planFilter","trackFilter",
   "priorityFilter","statusFilter","archiveFilter","boardViewBtn","listViewBtn","boardView","listView","taskTableBody",
   "planDialog","planDialogTitle","planDialogPath","planNavigator","planLocationStatus","planIndexList","planDocumentContent","closePlanDialogBtn",
-  "taskDialog","closeDialogBtn","detailTaskId","detailTitle","dependencyBackBtn","dependencyTrail","userMessagePanel","userMessageCount","userMessageList",
+  "taskDialog","closeDialogBtn","copyDetailTaskId","detailTaskId","detailTitle","dependencyBackBtn","dependencyTrail","userMessagePanel","userMessageCount","userMessageList",
   "taskPlanList","responsibilityText","currentProgressText","userAssistanceText","traceabilityText","readDependenciesText","relatedTasksText","writeTargetsText","relatedArtifactsText","detailMeta",
   "sessionInfo","testResourceSummary","testResourceList","prioritySelect","savePriorityBtn","stopBtn","resumeBtn","suspectDisconnectBtn","allowTakeoverBtn",
   "revokeTakeoverBtn","reviewNote","commentBtn","userAcceptanceActions","acceptBtn","rejectReason","rejectBtn","reloadHistoryBtn","historyList"
@@ -482,6 +482,23 @@ function renderRelatedTasks(task){
   for(const ref of refs)els.relatedTasksText.append(relatedTaskNode(ref,task.id));
   if(!issue&&!refs.length)els.relatedTasksText.textContent="—";
 }
+async function copyTaskId(taskId,projectId,epoch){
+  if(!taskId||!sameProject(projectId,epoch))return;
+  try{
+    if(!navigator.clipboard?.writeText)throw Error("clipboard unavailable");
+    await navigator.clipboard.writeText(taskId);
+    if(sameProject(projectId,epoch))toast("任务编号已复制");
+  }catch{
+    if(sameProject(projectId,epoch))window.prompt("剪贴板不可用，请手动复制任务编号",taskId);
+  }
+}
+function copyTaskButton(taskId,projectId,epoch){
+  const button=document.createElement("button");
+  button.type="button";button.className="copy-task-id";button.textContent="复制";
+  button.title="复制任务编号："+taskId;button.setAttribute("aria-label","复制任务编号："+taskId);
+  button.addEventListener("click",event=>{event.stopPropagation();void copyTaskId(taskId,projectId,epoch)});
+  return button;
+}
 function taskCard(task){
   const card=document.createElement("article");card.className="task-card card-stage-"+cardStage(task).replaceAll("_","-")+(task.track==="bugfix"?" bug-card":"");
   if(task.presentation?.latestUserMessage?.replied){
@@ -507,7 +524,7 @@ function taskCard(task){
     const disconnect=document.createElement("div");disconnect.className="card-disconnect";
     disconnect.textContent="疑似失联（请核对正式接管条件）";stageLine.append(disconnect);
   }
-  card.append(id,h4,badges,stageLine,planRow,responsibility,progress);
+  card.append(id,copyTaskButton(task.id,state.projectId,state.projectEpoch),h4,badges,stageLine,planRow,responsibility,progress);
   const pending=taskDependencies(task).filter(ref=>ref.id&&ref.task?.status!=="已完成");
   if(pending.length){
     const links=document.createElement("div");links.className="dependency-card-row";
@@ -989,6 +1006,7 @@ els.boardViewBtn.addEventListener("click",()=>{state.view="board";render()});
 els.listViewBtn.addEventListener("click",()=>{state.view="list";render()});
 els.closePlanDialogBtn.addEventListener("click",()=>els.planDialog.close());
 els.closeDialogBtn.addEventListener("click",()=>els.taskDialog.close());
+els.copyDetailTaskId.addEventListener("click",event=>{event.stopPropagation();if(state.selectedTask&&state.selectedTaskProjectId===state.projectId)void copyTaskId(state.selectedTask.id,state.projectId,state.projectEpoch)});
 els.taskDialog.addEventListener("close",()=>{state.dependencyTrail=[];state.detailEpoch++});
 els.dependencyBackBtn.addEventListener("click",()=>{
   const path=state.dependencyTrail;if(path.length>1)void openTask(path[path.length-2],true);
