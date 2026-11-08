@@ -135,6 +135,26 @@ async function hardDependenciesCompleted(taskStore, projectId, task) {
   return ids.every((id) => snapshot.tasks.some((entry) =>
     entry.id === id && entry.status === "已完成"));
 }
+async function verifiedManualRecovery(store, projectId, history, index) {
+  const manual = history[index];
+  if (!manual || manual.event_type !== "controller_manual_rework_ready_after_verified_roots"
+    || manual.actor_type !== "controller_ai" || !manual.actor_id || !manual.session_id
+    || manual.old_status !== "阻断" || manual.new_status !== "待开发"
+    || manual.metadata?.manualRecoveryUserAuthorized !== true
+    || manual.metadata?.requiresIndependentRetest !== true
+    || manual.metadata?.invalidatesTestEvidence !== true) return false;
+  const blocked = history.slice(0,index).find(e =>
+    e.event_id === manual.metadata.blockedEventId && e.new_status === "阻断");
+  const roots = manual.metadata.rootCauseTaskIds;
+  if (!blocked || !Array.isArray(roots) || roots.length === 0
+    || !history.slice(0,index).some(e =>
+      e.event_type === "controller_dispatch" && e.actor_type === "controller_ai")) return false;
+  const tx = await store.transactions.read(manual.operation_id);
+  if (tx?.state !== "committed" || tx.result?.eventId !== manual.event_id) return false;
+  const { tasks } = await store.snapshot(projectId);
+  return roots.every(id => typeof id === "string" && id
+    && tasks.some(e => e.id === id && e.status === "已完成"));
+}
 async function committedAutoPreparation(store, projectId, taskId, history, claimIndex) {
   if (claimIndex < 0 || history.slice(0, claimIndex).some((event) =>
     event.actor_type === "developer_ai" && ["claim", "takeover"].includes(event.event_type))) return false;
@@ -348,6 +368,7 @@ export class TaskStepCheckpoint {
         entry.actor_type === "developer_ai" && ["claim", "takeover"].includes(entry.event_type));
       const currentClaimIndex = history.indexOf(currentClaim);
       let q04RequeuedTakeover = false;
+      let manualRequeuedTakeover = false;
       if (stepId === "D01_CLAIM" && state.cursors.developer_ai !== "D01_CLAIM") {
         const lastFailIndex = history.findLastIndex((entry) =>
           entry.event_type === "test_result" && entry.actor_type === "test_ai"
@@ -452,6 +473,82 @@ export class TaskStepCheckpoint {
           && previouslyStarted && !alreadyRestarted
           && !(await this.taskStore.stopState(projectId, taskId)).stopRequested
           && await hardDependenciesCompleted(this.taskStore, projectId, task);
+        // A committed controller manual recovery followed by a genuine takeover may
+        // reopen an old D09 cursor. A new claim alone is insufficient for this path.
+        if (modern && result === "PASS" && state.cursors.developer_ai === "D09_NEXT"
+          && currentClaim?.event_type === "takeover" && currentClaim.event_id === eventId
+          && currentClaim.actor_id === actorId && currentClaim.session_id === sessionId
+          && currentClaim.old_status === "开发中" && currentClaim.new_status === "开发中"
+          && task.status === "开发中" && task.sessionId === sessionId
+          && previouslyStarted && !alreadyRestarted
+          && state.records.some(r => r.stepId === "D08_HANDOFF"
+            && r.result === "PASS" && r.attempt === state.attempts)
+          && !(await this.taskStore.stopState(projectId, taskId)).stopRequested
+          && await hardDependenciesCompleted(this.taskStore, projectId, task)) {
+          const priorIndex = history.findLastIndex((e,i) => i < currentClaimIndex
+            && e.event_type === "claim" && e.actor_type === "developer_ai");
+          const prior = history[priorIndex];
+          const manualIndex = history.findLastIndex((e,i) => i < priorIndex
+            && e.event_type === "controller_manual_rework_ready_after_verified_roots"
+            && e.actor_type === "controller_ai");
+          const manual = history[manualIndex];
+          const allowed = history.slice(priorIndex + 1,currentClaimIndex).findLast(e =>
+            e.event_type === "takeover_allowed" && e.actor_type === "developer_ai"
+            && e.operation_id === currentClaim.metadata?.authorizationOperationId
+            && e.actor_id === actorId && e.session_id === sessionId);
+          const suspected = history.slice(priorIndex + 1,currentClaimIndex).findLast(e =>
+            e.event_type === "suspected_disconnect" && e.actor_type === "developer_ai"
+            && e.operation_id === allowed?.metadata?.suspicionOperationId
+            && e.actor_id === actorId && e.session_id === sessionId);
+          const trustedManual = await verifiedManualRecovery(this.taskStore,projectId,history,manualIndex);
+          const trustedTransfer = prior?.old_status === "待开发"
+            && prior.new_status === "开发中" && prior.session_id !== sessionId
+            && prior.session_id === currentClaim.metadata?.previousSessionId
+            && currentClaim.metadata?.previousSessionId === allowed?.metadata?.authorizedFromSessionId
+            && allowed?.metadata?.authorizedFromStatus === "开发中"
+            && allowed?.metadata?.authorizedRegistryRevision === currentClaim.registry_revision_before
+            && suspected?.metadata?.observedSessionId === prior.session_id
+            && suspected?.metadata?.observedRegistryRevision === allowed.metadata.authorizedRegistryRevision
+            && allowed.metadata?.explicitUserOverride === true
+            && ["chat_user_instruction_cooperative", "browser_user_session"]
+              .includes(allowed.metadata?.authorizationSource)
+            && ["task", "project"].includes(allowed.metadata?.authorizationScope)
+            && Boolean(allowed.metadata?.authorizationQuote)
+            && history.indexOf(suspected) < history.indexOf(allowed)
+            && history.indexOf(allowed) < currentClaimIndex
+            && !history.slice(manualIndex + 1,currentClaimIndex).some((e,i) =>
+              e.old_status !== e.new_status && manualIndex + 1 + i !== priorIndex);
+          if (trustedManual && trustedTransfer) {
+            manualRequeuedTakeover = true;
+            state.attempts += 1;
+            state.cursors.developer_ai = "D01_CLAIM";
+            state.cursors.test_ai = "Q01_ADMISSION";
+          }
+        }
+        // Manual recovery can reopen D09 directly on a fresh, genuine developer claim.
+        if (modern && result === "PASS" && state.cursors.developer_ai === "D09_NEXT"
+          && currentClaim?.event_type === "claim" && currentClaim.event_id === eventId
+          && currentClaim.actor_id === actorId && currentClaim.session_id === sessionId
+          && currentClaim.old_status === "待开发" && currentClaim.new_status === "开发中"
+          && task.status === "开发中" && task.sessionId === sessionId
+          && previouslyStarted && !alreadyRestarted
+          && state.records.some(r => r.stepId === "D08_HANDOFF"
+            && r.result === "PASS" && r.attempt === state.attempts)
+          && !(await this.taskStore.stopState(projectId, taskId)).stopRequested
+          && await hardDependenciesCompleted(this.taskStore, projectId, task)) {
+          const manualIndex = history.findLastIndex((e,i) => i < currentClaimIndex
+            && e.event_type === "controller_manual_rework_ready_after_verified_roots");
+          const oldDev = history.slice(0,manualIndex).findLast(e =>
+            e.actor_type === "developer_ai" && ["claim","takeover"].includes(e.event_type));
+          if (oldDev && oldDev.session_id !== sessionId
+            && await verifiedManualRecovery(this.taskStore,projectId,history,manualIndex)
+            && history.slice(manualIndex+1,currentClaimIndex).every(e =>
+              e.old_status === e.new_status)) {
+            state.attempts += 1;
+            state.cursors.developer_ai = "D01_CLAIM";
+            state.cursors.test_ai = "Q01_ADMISSION";
+          }
+        }
         if (q04RequeuedTakeover) {
           state.attempts += 1;
           state.cursors.developer_ai = "D01_CLAIM";
@@ -812,7 +909,7 @@ export class TaskStepCheckpoint {
           authorizedTakeover = priorDeveloperIndex >= 0 && allowedIndex >= 0
             && suspicionIndex >= 0 && !revoked
             && String(authorization?.metadata?.authorizationQuote || "").trim().length > 0
-            && (dispatchIndex > priorDeveloperIndex || q04RequeuedTakeover)
+            && (dispatchIndex > priorDeveloperIndex || q04RequeuedTakeover || manualRequeuedTakeover)
             && history[priorDeveloperIndex].session_id === authorityEvent.metadata?.previousSessionId
             && authorityEvent.old_status === authorityEvent.new_status
             && ["开发中", "修复中"].includes(authorityEvent.old_status);
