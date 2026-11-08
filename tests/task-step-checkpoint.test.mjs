@@ -379,6 +379,122 @@ test("takeover revokes the old developer Session for PASS and PROGRESS; new owne
   assert.equal(resumed.state.lastAction.actorId,"replacement");
   assert.equal(resumed.state.cursors.developer_ai,"D05_TEST_1");
 });
+async function d04InheritedAfterTakeover(t, { auth = "valid", wrongPrevious = false,
+  stop = false, alteredD04 = false } = {}) {
+  const { f, taskStore } = await fixture(t);
+  const cp = await new TaskStepCheckpoint(f.boardRoot, { taskStore }).init();
+  await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.d04.dispatch." + String(sequence++).padStart(8, "0"),
+    eventType: "controller_dispatch", actorType: "controller_ai",
+    actorId: "controller", sessionId: "controller-session"
+  });
+  const oldClaim = await claimDev(taskStore);
+  await step(cp, "developer_ai", "D01_CLAIM", { eventId: oldClaim.eventId });
+  for (const name of ROLE_STAGE_STEPS.developer_ai.slice(1, 6))
+    await step(cp, "developer_ai", name);
+  const revision = (await taskStore.snapshot("fixture")).registryRevision;
+  const suspectOp = "fixture.d04.suspect." + String(sequence++).padStart(8, "0");
+  await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: suspectOp, eventType: "suspected_disconnect",
+    actorType: "developer_ai", actorId: "replacement", sessionId: "replacement-session",
+    metadata: { observedSessionId: "developer_ai.session", observedAssignee: "developer",
+      observedRegistryRevision: revision }
+  });
+  const allowOp = "fixture.d04.allow." + String(sequence++).padStart(8, "0");
+  if (auth !== "missing") await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: allowOp, eventType: "takeover_allowed", actorType: "developer_ai",
+    actorId: "replacement", sessionId: "replacement-session",
+    metadata: { authorizationSource: auth === "forged" ? "developer_note" : "chat_user_instruction_cooperative",
+      authorizationScope: "project", authorizationQuote: "符合条件直接接管", explicitUserOverride: true,
+      authorizationForwardedBy: "replacement", authorizationForwardingSessionId: "replacement-session",
+      authorizedFromAssignee: "developer", authorizedFromSessionId: "developer_ai.session",
+      authorizedFromStatus: "开发中", authorizedRegistryRevision: revision,
+      suspicionOperationId: suspectOp }
+  });
+  if (auth === "revoked") await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.d04.revoke." + String(sequence++).padStart(8, "0"),
+    eventType: "takeover_revoked", actorType: "developer_ai",
+    actorId: "replacement", sessionId: "replacement-session",
+    metadata: { authorizationOperationId: allowOp }
+  });
+  const transfer = await taskStore.updateTask("fixture", "A-10", {
+    status: "开发中", assignee: "replacement", sessionWindowName: "replacement",
+    sessionId: "replacement-session"
+  }, {
+    operationId: "fixture.d04.takeover." + String(sequence++).padStart(8, "0"),
+    expectedRevision: (await taskStore.snapshot("fixture")).registryRevision,
+    eventType: "takeover", actorType: "developer_ai", actorId: "replacement",
+    sessionId: "replacement-session",
+    metadata: { authorizationOperationId: allowOp,
+      previousAssignee: "developer",
+      previousSessionId: wrongPrevious ? "wrong-session" : "developer_ai.session" }
+  });
+  await assert.rejects(step(cp, "developer_ai", "D07_TEST_3"),
+    e => e.code === "CHECKPOINT_SESSION_MISMATCH");
+  await step(cp, "developer_ai", "D07_TEST_3", {
+    actorId: "replacement", sessionId: "replacement-session"
+  });
+  if (alteredD04) {
+    const filename = path.join(f.projectRoot, "cp", "A-10.md");
+    const raw = await fs.readFile(filename, "utf8");
+    const before = await cp.show("fixture", "A-10");
+    const damaged = structuredClone(before.state);
+    const d04 = damaged.records.find(r => r.stepId === "D04_IMPLEMENT");
+    d04.attempt = 0;
+    await fs.writeFile(filename, raw.replace(
+      JSON.stringify(before.state, null, 2), JSON.stringify(damaged, null, 2)), "utf8");
+  }
+  if (stop) await taskStore.appendTaskEvent("fixture", "A-10", {
+    operationId: "fixture.d04.stop." + String(sequence++).padStart(8, "0"),
+    eventType: "stop_request", actorType: "user", actorId: "user",
+    note: "真实用户STOP"
+  });
+  taskStore.ruleGateEnabled = async () => true;
+  return { cp, taskStore, transfer };
+}
+
+test("D08 inherits old D04 only after real atomic developer takeover and revoked old session", async t => {
+  const x = await d04InheritedAfterTakeover(t);
+  const actor = { eventType: "handoff", actorType: "developer_ai",
+    actorId: "replacement", sessionId: "replacement-session" };
+  await x.cp.assertTransitionEvidence("fixture", "A-10", actor);
+  x.taskStore.ruleGateEnabled = async () => false;
+  const handed = await x.taskStore.updateTask("fixture", "A-10", {
+    status: "待独测", assignee: "", sessionWindowName: "", sessionId: ""
+  }, {
+    operationId: "fixture.d04.handoff." + String(sequence++).padStart(8, "0"),
+    expectedRevision: (await x.taskStore.snapshot("fixture")).registryRevision,
+    eventType: "handoff", actorType: "developer_ai", actorId: "replacement",
+    sessionId: "replacement-session",
+    metadata: { atomicLifecycle: true, completedFromStatus: "开发中",
+      handoffTarget: "待独测", commitSha: "a".repeat(40) }
+  });
+  x.taskStore.ruleGateEnabled = async () => true;
+  // Fixture lacks full production rule docs; D04 provenance guards still run.
+  x.taskStore.assertRuleReadForMutation = async () => {};
+  const result = await step(x.cp, "developer_ai", "D08_HANDOFF", {
+    actorId: "replacement", sessionId: "replacement-session", eventId: handed.eventId
+  });
+  assert.equal(result.state.cursors.developer_ai, "D09_NEXT");
+  assert.equal(result.state.records.find(r => r.stepId === "D04_IMPLEMENT").sessionId, "developer_ai.session");
+  assert.equal(result.state.records.find(r => r.stepId === "D08_HANDOFF").sessionId, "replacement-session");
+});
+
+test("D04 takeover inheritance rejects missing or forged grant, wrong old session, STOP and stale attempt", async t => {
+  for (const variant of [
+    { auth: "missing" }, { auth: "forged" }, { auth: "revoked" }, { wrongPrevious: true },
+    { stop: true }, { alteredD04: true }
+  ]) {
+    const x = await d04InheritedAfterTakeover(t, variant);
+    const before = await x.cp.show("fixture", "A-10");
+    await assert.rejects(x.cp.assertTransitionEvidence("fixture", "A-10", {
+      eventType: "handoff", actorType: "developer_ai",
+      actorId: "replacement", sessionId: "replacement-session"
+    }), e => e.code === "CHECKPOINT_REUSE_REQUIRED", JSON.stringify(variant));
+    assert.equal((await x.cp.show("fixture", "A-10")).sha256, before.sha256);
+  }
+});
+
 test("missing D08 recovers only from a genuine latest handoff bound to the owner before QA claim", async(t) => {
   const {cp,taskStore}=await fixture(t);
   await controllerReady(taskStore,cp);

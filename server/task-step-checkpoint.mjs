@@ -126,6 +126,47 @@ async function verifyReuse(store, projectId, taskId, actorId, sessionId, attempt
   }
   return SHA(await fs.readFile(proofFile));
 }
+async function canReuseD04(store, projectId, taskId, state, history, d04, actorId, sessionId) {
+  if (!d04 || d04.result !== "PASS" || d04.attempt !== state.attempts) return false;
+  const current = history.findLast(e => e.actor_type === "developer_ai"
+    && ["claim", "takeover"].includes(e.event_type));
+  if (current?.actor_id !== actorId || current.session_id !== sessionId) return false;
+  if (d04.actorId === actorId && d04.sessionId === sessionId)
+    return !d04.reuseProofSha || d04.claimEventId === current.event_id;
+  if (current.event_type !== "takeover" || current.old_status !== current.new_status
+    || !["开发中", "修复中"].includes(current.new_status)
+    || current.metadata?.previousSessionId !== d04.sessionId
+    || !(Date.parse(d04.at) >= 0 && Date.parse(d04.at) < Date.parse(current.timestamp))
+    || (await store.stopState(projectId, taskId)).stopRequested) return false;
+  const index = history.indexOf(current);
+  const former = history.slice(0, index).findLast(e => e.actor_type === "developer_ai"
+    && ["claim", "takeover"].includes(e.event_type));
+  if (!former || former.actor_id !== d04.actorId || former.session_id !== d04.sessionId
+    || (d04.reuseProofSha && d04.claimEventId !== former.event_id)) return false;
+  const allowed = history.slice(history.indexOf(former) + 1, index).findLast(e =>
+    e.event_type === "takeover_allowed" && e.actor_type === "developer_ai"
+    && e.operation_id === current.metadata?.authorizationOperationId
+    && e.actor_id === actorId && e.session_id === sessionId);
+  const auth = allowed?.metadata || {};
+  const suspect = history.slice(history.indexOf(former) + 1, history.indexOf(allowed)).findLast(e =>
+    e.event_type === "suspected_disconnect" && e.operation_id === auth.suspicionOperationId
+    && e.actor_type === "developer_ai" && e.actor_id === actorId && e.session_id === sessionId);
+  return Boolean(allowed && suspect
+    && auth.authorizedFromSessionId === former.session_id
+    && auth.authorizedFromAssignee === current.metadata?.previousAssignee
+    && auth.authorizedFromStatus === current.old_status
+    && auth.authorizedRegistryRevision === current.registry_revision_before
+    && suspect.metadata?.observedSessionId === former.session_id
+    && suspect.metadata?.observedAssignee === auth.authorizedFromAssignee
+    && suspect.metadata?.observedRegistryRevision === auth.authorizedRegistryRevision
+    && !history.slice(history.indexOf(allowed) + 1, index).some(e => e.event_type === "takeover_revoked")
+    && ["task", "project"].includes(auth.authorizationScope)
+    && ["browser_user_session", "chat_user_instruction_cooperative"].includes(auth.authorizationSource)
+    && (auth.authorizationSource !== "chat_user_instruction_cooperative"
+      || (Boolean(String(auth.authorizationQuote || "").trim())
+        && auth.explicitUserOverride === true && auth.authorizationForwardedBy === actorId
+        && auth.authorizationForwardingSessionId === sessionId)));
+}
 async function hardDependenciesCompleted(taskStore, projectId, task) {
   const ids = String(task.readDependencies || "").split(/[；;]/)
     .map((item) => item.replaceAll("`", "").trim().match(/^([A-Za-z0-9][A-Za-z0-9._-]{0,127})\s*完成$/)?.[1])
@@ -295,7 +336,8 @@ export class TaskStepCheckpoint {
     if (eventType === "handoff" && await this.taskStore.ruleGateEnabled(projectId)) {
       const d04 = state.records.findLast((r) => r.stepId === "D04_IMPLEMENT"
         && r.result === "PASS" && r.attempt === state.attempts);
-      if (!d04 || d04.actorId !== actorId || d04.sessionId !== sessionId)
+      const history = await this.taskStore.taskHistory(projectId, taskId, { all: true });
+      if (!(await canReuseD04(this.taskStore, projectId, taskId, state, history, d04, actorId, sessionId)))
         throw invalid("CHECKPOINT_REUSE_REQUIRED", "正式交独测前缺少本轮开发检索");
       if (d04.reuseProofSha) {
         const root = (await this.taskStore.projects.context(projectId)).rootRealPath;
@@ -1026,8 +1068,8 @@ export class TaskStepCheckpoint {
         if (stepId === "D08_HANDOFF") {
           const d04 = state.records.findLast((r) => r.stepId === "D04_IMPLEMENT"
             && r.result === "PASS" && r.attempt === state.attempts);
-          if (!d04 || d04.actorId !== actorId || d04.sessionId !== sessionId
-            || (d04.reuseProofSha && d04.claimEventId !== claim?.event_id))
+          if (!(await canReuseD04(this.taskStore, projectId, taskId,
+            state, history, d04, actorId, sessionId)))
             throw invalid("CHECKPOINT_REUSE_REQUIRED", "D08缺少本轮D04实际检索证据");
           if (d04.reuseProofSha) {
             const root = (await this.taskStore.projects.context(projectId)).rootRealPath;

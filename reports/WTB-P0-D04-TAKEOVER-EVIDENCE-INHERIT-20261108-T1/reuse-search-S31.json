@@ -1,0 +1,45 @@
+{
+  "taskId": "WTB-P0-D04-TAKEOVER-EVIDENCE-INHERIT-20261108-T1",
+  "actorId": "dev-gpt6-d04-evidence-inherit-s31",
+  "sessionId": "wc_sess_r-ERycKTzpNEVrUJ",
+  "attempt": 1,
+  "claimEventId": "evt_b1aafda3d7b2cd0fe30cf93c",
+  "searchedAt": "2026-11-08T16:12:46.890Z",
+  "query": "existing TaskStepCheckpoint D04 reuse and authenticated developer takeover D08",
+  "checks": {
+    "source": "server/task-step-checkpoint.mjs",
+    "tests": "tests/task-step-checkpoint.test.mjs",
+    "dependencies": "AGENTS.md",
+    "technicalNotes": "WORKFLOW.md",
+    "historyCommit": "949d5cbaeeb03b95c024f32806507f052bca68ba",
+    "libraryIndex": "../开源参考源码/00_公共开源库索引.md",
+    "libraryStatus": "checked",
+    "libraryExamples": [
+      "../开源参考源码/00_公共开源库索引.md",
+      "../开源参考源码/dsh-drawai/src/drawing-queue.js"
+    ]
+  },
+  "candidates": [
+    {
+      "path": "server/task-step-checkpoint.mjs",
+      "symbol": "assertTransitionEvidence",
+      "decision": "reuse",
+      "reason": "复用既有正式handoff断点门禁，只补合法原子接管后的D04身份链验证，不增加身份框架",
+      "license": "project-owned"
+    },
+    {
+      "path": "server/task-step-checkpoint.mjs",
+      "symbol": "verifyReuse",
+      "decision": "reuse",
+      "reason": "沿用实际检索报告的原SHA/文件范围和Git核验，不删除既有负向检查",
+      "license": "project-owned"
+    },
+    {
+      "path": "tests/task-step-checkpoint.test.mjs",
+      "symbol": "takeover revokes the old developer Session",
+      "decision": "reuse",
+      "reason": "沿用原Session撤权测试并追加合法继承正反向回归",
+      "license": "project-owned"
+    }
+  ]
+}
