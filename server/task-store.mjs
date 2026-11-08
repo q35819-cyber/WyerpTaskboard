@@ -246,6 +246,17 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
   const d01Blocked = blocked?.event_type === "developer_d01_missing_controller_dispatch_block";
   const d09Blocked = blocked?.event_type === "developer_step_cursor_blocked";
   const verifiedDevBlock = Object.hasOwn(VERIFIED_DEV_BLOCK_FIXES, blocked?.event_type || "");
+  // Original authorization must belong to the current developer claim cycle.
+  const originalAuthorizationFor = (claim) => {
+    const index = history.indexOf(claim);
+    if (index < 0) return null;
+    const priorOwner = history.slice(0, index).findLastIndex((event) =>
+      event.actor_type === "developer_ai" && ["claim", "takeover"].includes(event.event_type));
+    return history.slice(priorOwner + 1, index).findLast((event) =>
+      event.actor_type === "controller_ai" && event.actor_id && event.session_id
+      && ["controller_dispatch", "task_created"].includes(event.event_type));
+  };
+  let recoveryAuthorization = null;
   const d08PendingBlocked = blocked?.event_type === "developer_d08_pending_requirement_scope_gate_blocked";
   const d01ReentryBlocked = blocked?.event_type === "developer_d01_reentry_checkpoint_order_blocked";
   if (d01ReentryBlocked) {
@@ -352,9 +363,10 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
     const dispatch = history.slice(blockIndex + 1).find((event) =>
       event.event_type === (d01ReentryBlocked ? "controller_blocker_resolution_plan" : "controller_dispatch")
       && event.actor_type === "controller_ai" && event.actor_id && event.session_id);
+    const originalAuthorization = d01ReentryBlocked ? null : originalAuthorizationFor(claim);
     if (blocked.old_status !== "开发中" || blocked.actor_type !== "developer_ai"
       || !claim || claim.actor_id !== blocked.actor_id || claim.session_id !== blocked.session_id
-      || !dispatch || history.slice(blockIndex + 1).some((event) =>
+      || (!originalAuthorization && !dispatch) || history.slice(blockIndex + 1).some((event) =>
         ["claim", "takeover"].includes(event.event_type) && event.actor_type === "developer_ai")) return null;
     if (blocked.event_type === "blocked") {
       const failure = history.slice(history.indexOf(claim) + 1, blockIndex).find((event) =>
@@ -406,6 +418,7 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
       actorType: "scanner", actorId: "task-scan", sessionId: "task-scan"
     });
     if (messages.requiresAcknowledgement || messages.messages?.at(-1)?.replies?.length === 0) return null;
+    recoveryAuthorization = originalAuthorization || dispatch;
   }
   if (d09Blocked) {
     const blockIndex = history.indexOf(blocked);
@@ -423,6 +436,7 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
     const dispatch = history.slice(blockIndex + 1).find((event) =>
       event.event_type === "controller_dispatch" && event.actor_type === "controller_ai"
       && event.actor_id && event.session_id);
+    const originalAuthorization = originalAuthorizationFor(claim);
     const fix = tasks.find((item) =>
       item.id === "WTB-P0-LEGACY-D09-REENTRY-BUG-20261105-T1");
     const fixHistory = fix?.status === "已完成"
@@ -436,7 +450,7 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
     const release = delivered?.metadata || {};
     if (blocked.old_status !== "开发中" || blocked.actor_type !== "developer_ai"
       || !claim || !failure || failure.actor_id !== blocked.actor_id
-      || failure.session_id !== blocked.session_id || !dispatch
+      || failure.session_id !== blocked.session_id || (!originalAuthorization && !dispatch)
       || history.slice(blockIndex + 1).some((event) =>
         event.event_type === "claim" && event.actor_type === "developer_ai")
       || !qaPass || !delivered.actor_id || !delivered.session_id
@@ -444,7 +458,7 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
       || release.candidateCommitSha !== qaPass.metadata.commitSha
       || !/^[a-f0-9]{40}$/i.test(release.mergeCommitSha || "")
       || release.remoteMainSha !== release.mergeCommitSha
-      || Date.parse(dispatch.timestamp) <= Date.parse(delivered.timestamp)) return null;
+      || (!originalAuthorization && Date.parse(dispatch.timestamp) <= Date.parse(delivered.timestamp))) return null;
     try {
       if ((await runGit(context.rootRealPath,
         ["merge-base", "--is-ancestor", release.mergeCommitSha, "HEAD"])).code !== 0) return null;
@@ -453,19 +467,21 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
       actorType: "scanner", actorId: "task-scan", sessionId: "task-scan"
     });
     if (messages.requiresAcknowledgement || messages.messages?.at(-1)?.replies?.length === 0) return null;
+    recoveryAuthorization = originalAuthorization || dispatch;
   }
   if (d01Blocked) {
     const blockIndex = history.indexOf(blocked);
     const oldClaimIndex = history.findLastIndex((event, index) => index < blockIndex
       && event.event_type === "claim" && event.actor_type === "developer_ai");
     const oldClaim = history[oldClaimIndex];
-    const newDispatch = history.slice(blockIndex + 1).some((event) =>
+    const newDispatch = history.slice(blockIndex + 1).find((event) =>
       event.event_type === "controller_dispatch" && event.actor_type === "controller_ai"
       && Boolean(event.actor_id) && Boolean(event.session_id));
+    const originalAuthorization = originalAuthorizationFor(oldClaim);
     if (blocked.old_status !== "开发中" || blocked.actor_type !== "developer_ai"
       || !blocked.session_id || !oldClaim || oldClaim.new_status !== "开发中"
       || oldClaim.actor_id !== blocked.actor_id || oldClaim.session_id !== blocked.session_id
-      || !newDispatch || history.slice(oldClaimIndex + 1, blockIndex).some((event) =>
+      || (!originalAuthorization && !newDispatch) || history.slice(oldClaimIndex + 1, blockIndex).some((event) =>
         event.event_type === "controller_dispatch" && event.actor_type === "controller_ai")
       || history.slice(blockIndex + 1).some((event) =>
         event.event_type === "claim" && event.actor_type === "developer_ai")) return null;
@@ -473,6 +489,7 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
       actorType: "scanner", actorId: "task-scan", sessionId: "task-scan"
     });
     if (messages.messages?.at(-1)?.replies?.length === 0) return null;
+    recoveryAuthorization = originalAuthorization || newDispatch;
   }
   if (developerPause) {
     if (blocked.actor_type !== "developer_ai" || blocked.old_status !== "开发中") return null;
@@ -541,7 +558,8 @@ async function eligibleTemporaryUnblock(store, projectId, task, tasks, context) 
       throw error;
     }
   }
-  return { target, blockedEventId: blocked.event_id };
+  return { target, blockedEventId: blocked.event_id,
+    authorizationEventId: recoveryAuthorization?.event_id || null };
 }
 
 function autoUnblockOperationId(projectId, taskId, blockedEventId) {
@@ -1079,7 +1097,8 @@ export class TaskStore {
           operationId, expectedRevision: snapshot.registryRevision,
           eventType: "auto_unblock", actorType: "system", actorId: "task-scan",
           note: "可信临时阻断条件已重新验证并自动恢复原合法阶段",
-          metadata: { blockedEventId: eligible.blockedEventId, restoreStatus: eligible.target }
+          metadata: { blockedEventId: eligible.blockedEventId, restoreStatus: eligible.target,
+            authorizationEventId: eligible.authorizationEventId }
         });
         if (!result.idempotentReplay) restored.push(task.id);
       } catch (error) {
@@ -1142,7 +1161,8 @@ export class TaskStore {
       if (eventType === "auto_unblock") {
         const allowed = await eligibleTemporaryUnblock(this, projectId, currentTask, parsed.tasks, context);
         if (actorType !== "system" || !allowed || patch.status !== allowed.target ||
-          metadata?.blockedEventId !== allowed.blockedEventId) {
+          metadata?.blockedEventId !== allowed.blockedEventId ||
+          metadata?.authorizationEventId !== allowed.authorizationEventId) {
           throw new TaskboardError("临时阻断未满足机器核验条件", {
             code: "AUTO_UNBLOCK_NOT_READY", status: 409
           });
