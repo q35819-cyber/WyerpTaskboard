@@ -766,8 +766,17 @@ export class TaskStepCheckpoint {
         const firstStep = modern ? "C00_A_REQUIREMENTS" : "C01_SCAN";
         const controllerStart = state.records.find((entry) =>
           entry.stepId === firstStep && entry.result === "PASS" && entry.attempt === state.attempts);
-        if (!controllerStart || (!lastTakeover && (controllerStart.actorId !== actorId || controllerStart.sessionId !== sessionId))) {
-          throw invalid("CHECKPOINT_SESSION_MISMATCH", "总控换窗口须先进行合法接管", 403);
+        if (!controllerStart || (!lastTakeover && (controllerStart.actorId !== actorId || controllerStart.sessionId !== sessionId))
+          || (lastTakeover && (lastTakeover.actor_id !== actorId || lastTakeover.session_id !== sessionId))) {
+          throw invalid("CHECKPOINT_SESSION_MISMATCH", "总控换窗口须先进行合法接管；旧Session已失权", 403);
+        }
+        if (modern && ["C05_POSTMERGE", "C06_CLEANUP"].includes(stepId) && lastTakeover
+          && lastTakeover.metadata?.inflightControllerTakeover === true
+          && (task.status !== "交付中" || task.sessionId !== sessionId
+            || !state.records.some(r => r.stepId === "C04_MERGE_MAIN"
+              && r.result === "PASS" && r.eventId === lastTakeover.metadata.c04EventId
+              && r.attempt === state.attempts))) {
+          throw invalid("CHECKPOINT_C04_REQUIRED", "新总控只能接续可信已合并C04，不可跳级", 409);
         }
       }
       if (modern && actorType === "controller_ai" && stepId === "C04_MERGE_MAIN" && result === "PASS") {
