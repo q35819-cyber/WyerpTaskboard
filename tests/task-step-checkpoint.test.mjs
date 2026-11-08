@@ -570,7 +570,7 @@ test("new QA Q01 reopens only with a real controller-requeued Q02 BLOCK or finis
   }));
 });
 
-test("Q02 recovery rejects fake controller restoration and true QA FAIL without repair", async(t) => {
+test("Q02 recovery allows real controller BLOCK requeue but rejects QA FAIL without repair", async(t) => {
   await Promise.all(["fake-controller", "unrepaired-fail"].map(async (mode) => {
     const {cp,taskStore}=await fixture(t);
     await claimDev(taskStore);
@@ -604,21 +604,27 @@ test("Q02 recovery rejects fake controller restoration and true QA FAIL without 
     await taskStore.updateTask("fixture","A-10",{status:"待复测"},{
       expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
       operationId:"fixture.q02negative."+mode+".requeue",
-      eventType:realBlock?"fake_requeue":"controller_requeue",
-      actorType:realBlock?"developer_ai":"controller_ai",
-      actorId:realBlock?"developer":"controller",
-      sessionId:realBlock?"developer_ai.session":"controller-session"});
+      eventType:"controller_requeue",
+      actorType:"controller_ai",actorId:"controller",sessionId:"controller-session"});
     const qa2=await taskStore.updateTask("fixture","A-10",
       {status:"复测中",assignee:"qa-new",sessionWindowName:"qa-new",sessionId:"qa-new-session"},
       {expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
         operationId:"fixture.q02negative."+mode+".qa2",eventType:"claim",
         actorType:"test_ai",actorId:"qa-new",sessionId:"qa-new-session"});
     const previous=await cp.show("fixture","A-10");
-    await assert.rejects(step(cp,"test_ai","Q01_ADMISSION",{
-      actorId:"qa-new",sessionId:"qa-new-session",eventId:qa2.eventId
-    }),e=>e.code==="CHECKPOINT_STEP_ORDER");
-    assert.equal((await cp.show("fixture","A-10")).sha256,previous.sha256);
-    assert.equal((await cp.show("fixture","A-10")).state.attempts,previous.state.attempts);
+    if(realBlock){
+      const recovered=await step(cp,"test_ai","Q01_ADMISSION",{
+        actorId:"qa-new",sessionId:"qa-new-session",eventId:qa2.eventId
+      });
+      assert.equal(recovered.state.cursors.test_ai,"Q02_TEST");
+      assert.equal(recovered.state.attempts,previous.state.attempts+1);
+    }else{
+      await assert.rejects(step(cp,"test_ai","Q01_ADMISSION",{
+        actorId:"qa-new",sessionId:"qa-new-session",eventId:qa2.eventId
+      }),e=>e.code==="CHECKPOINT_STEP_ORDER");
+      assert.equal((await cp.show("fixture","A-10")).sha256,previous.sha256);
+      assert.equal((await cp.show("fixture","A-10")).state.attempts,previous.state.attempts);
+    }
   }));
 });
 
@@ -739,7 +745,7 @@ test("independent BLOCK followed by real controller requeue permits new QA to re
   assert.equal(marker.result,"RECOVERED");
   assert.equal(result.state.records.filter(r=>/^D0[1-8]_/.test(r.stepId)).length,0);
 });
-test("QA recovery refuses BLOCK requeued by non-controller and refuses real failed test verdict",async(t)=>{
+test("QA recovery refuses BLOCK without controller requeue and refuses real failed test verdict",async(t)=>{
   for(const verdict of ["blocked","fail"]){
     const {cp,taskStore}=await fixture(t);
     await claimDev(taskStore);
@@ -768,11 +774,17 @@ test("QA recovery refuses BLOCK requeued by non-controller and refuses real fail
       metadata:{atomicLifecycle:true,testResult:verdict,reportPath:"reports/qa-verdict.md"}
     });
     if(verdict==="blocked") {
-      await taskStore.updateTask("fixture","A-10",{status:"待复测"},{
+      const before=await cp.show("fixture","A-10");
+      await assert.rejects(taskStore.updateTask("fixture","A-10",{
+        status:"复测中",assignee:"qa2",sessionWindowName:"qa2",sessionId:"qa2-session"
+      },{
         expectedRevision:(await taskStore.snapshot("fixture")).registryRevision,
-        operationId:"fixture.block-negative.requeue",eventType:"fake_requeue",
-        actorType:"developer_ai",actorId:"developer",sessionId:"developer_ai.session"
-      });
+        operationId:"fixture.block-negative.no-controller",eventType:"claim",
+        actorType:"test_ai",actorId:"qa2",sessionId:"qa2-session"
+      }),e=>e.code==="INVALID_STATUS_TRANSITION");
+      assert.equal((await cp.show("fixture","A-10")).sha256,before.sha256);
+      assert.equal((await taskStore.getTask("fixture","A-10")).task.status,"阻断");
+      continue;
     } else {
       // Malformed historical requeue event must never erase a genuine FAIL.
       await taskStore.appendTaskEvent("fixture","A-10",{
